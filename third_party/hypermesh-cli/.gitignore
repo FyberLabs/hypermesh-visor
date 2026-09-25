@@ -1,0 +1,7 @@
+/bin/
+/dist/
+/hypermesh
+/hm
+*.test
+*.out
+coverage.out
