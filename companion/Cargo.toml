@@ -1,0 +1,17 @@
+[package]
+name = "hypermesh-companion"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Linux desktop companion for Hypermesh"
+publish = false
+
+[[bin]]
+name = "hypermesh-companion"
+path = "src/main.rs"
+
+[dependencies]
+hypermesh-session = { path = "../session" }
+png = "0.17"
+serde_json = "1"
+x11rb = "0.13"

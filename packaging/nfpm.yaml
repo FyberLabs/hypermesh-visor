@@ -1,6 +1,8 @@
-# Package metadata for hypermesh-visor. The release workflow fills VERSION,
-# NFPM_ARCH (amd64 or arm64), and BINARY. nfpm maps those Debian arch names
-# onto x86_64 and aarch64 for the RPM.
+# Package metadata for hypermesh-visor. The release workflow fills VERSION and
+# NFPM_ARCH (amd64 or arm64). nfpm maps those Debian arch names onto x86_64
+# and aarch64 for the RPM. The published asset names stay
+# hypermesh-visor-<arch>, .deb, and .rpm. The raw asset is still the visor
+# binary. The packages also install the CLI and the desktop companion.
 name: hypermesh-visor
 arch: ${NFPM_ARCH}
 platform: linux
@@ -10,11 +12,34 @@ release: "1"
 section: utils
 priority: optional
 maintainer: Fyber Labs <github@fyberlabs.com>
-description: Linux desktop visor for Hypermesh
+description: Linux desktop visor, CLI, and companion for Hypermesh
 homepage: https://github.com/FyberLabs/hypermesh-visor
 contents:
-  - src: ${BINARY}
+  - src: ${VISOR_BIN}
     dst: /usr/bin/hypermesh-visor
     expand: true
     file_info:
       mode: 0755
+  - src: ${COMPANION_BIN}
+    dst: /usr/bin/hypermesh-companion
+    expand: true
+    file_info:
+      mode: 0755
+  - src: ${CLI_BIN}
+    dst: /usr/bin/hypermesh
+    expand: true
+    file_info:
+      mode: 0755
+  - src: ${HM_BIN}
+    dst: /usr/bin/hm
+    expand: true
+    file_info:
+      mode: 0755
+  - src: packaging/hypermesh-companion.desktop
+    dst: /usr/share/applications/hypermesh-companion.desktop
+    file_info:
+      mode: 0644
+  - src: packaging/hypermesh-companion.desktop
+    dst: /etc/xdg/autostart/hypermesh-companion.desktop
+    file_info:
+      mode: 0644

@@ -37,7 +37,19 @@ The release asset names do not include the version. `v0.1.0` publishes:
 
 The version is inside the package. The download page uses these same filenames.
 
-The packages install `/usr/bin/hypermesh-visor` and do not start a service. Run that binary as the logged-in user. Builds run on Ubuntu 24.04, the same userspace generation as the AGX JetPack 7 image.
+The packages install `/usr/bin/hypermesh-visor`, `/usr/bin/hypermesh`, `/usr/bin/hm`, and `/usr/bin/hypermesh-companion`. They do not start the visor. The companion is started for a graphical login from `/etc/xdg/autostart`. Run the visor as the logged-in user. Builds run on Ubuntu 24.04, the same userspace generation as the AGX JetPack 7 image.
+
+The raw release assets `hypermesh-visor-x86_64` and `hypermesh-visor-aarch64` stay the visor binary. The `.deb` and `.rpm` names are unchanged and are the packages that contain the visor, the CLI, and the companion.
+
+## Desktop companion
+
+`hypermesh-companion` is a Linux-only bug on the desktop. It draws the beetle sprites in `companion/assets`, bobs them, and blinks by covering the eyes. While a visor session is open it paints that session's purpose and the current verb (`view`, `watch`, `listen`, `mouse`, or `type`) under the bug in a built-in bitmap face. It does not copy the screen into the window. With no session the bug is idle. Clicking it opens a short menu: a terminal running `hypermesh`, login, billing (`https://hyperme.sh/#pricing`), renting (`https://hyperme.sh/#offers`), the desk (`https://portal.test.hyperme.sh/dashboard/hypermesh`), and Eyes follow. Eyes follow is off unless that menu row turns it on. The choice is stored in `~/.config/hypermesh/companion.toml` as `eyes_follow_pointer`. While a session is open and the option is on, the pupils track the pointer and the purpose and verb stay on the label. Idle eyes do not follow the pointer.
+
+Sign in opens your browser; after you approve, Hypermesh stores your session in your system keychain. On a machine without a browser, use `hypermesh login --device`.
+
+The public Keycloak client is `hypermesh-native` in realm `controlplane` at `https://auth.test.hyperme.sh`. It has no client secret. It must allow the loopback redirect `http://127.0.0.1/callback` with any port (register that URI with no port; do not pin port 3000), require PKCE S256, and enable the device authorization grant. Sign-in requests the `openid` scope only. The refresh token is the normal SSO-session token, stored once under keychain service `hypermesh` and account `session`, which the CLI and the companion both read. Access tokens stay in memory. When the Keycloak session ends, Hypermesh clears that entry and asks you to sign in again. `hypermesh logout` revokes the refresh token and deletes the entry. The companion still only `GET`s `http://127.0.0.1:9847/companion` and does not put the session in the visor vault.
+
+The window uses X11, including XWayland. It needs `DISPLAY`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:9847/session \

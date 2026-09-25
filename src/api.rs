@@ -21,7 +21,7 @@ use zeroize::Zeroize;
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
 use crate::input::{plan_type, MouseOp, PlanError, TypeBody};
-use crate::session::Session;
+use crate::session::{Session, Verb};
 use crate::vault::{SecretRequest, Vault, VaultError};
 
 pub struct AppState {
@@ -46,10 +46,46 @@ impl AppState {
     fn has_session(&self, id: Uuid) -> bool {
         lock(&self.sessions).contains_key(&id)
     }
+
+    fn mark_verb(&self, id: Uuid, verb: Verb) -> bool {
+        let mut sessions = lock(&self.sessions);
+        let Some(session) = sessions.get_mut(&id) else {
+            return false;
+        };
+        session.mark_verb(verb);
+        true
+    }
+
+    /// Purpose and current verb for the desktop companion.
+    /// The CLI auth key is not a session secret and is not included.
+    fn companion_session(&self) -> Option<CompanionSession> {
+        let sessions = lock(&self.sessions);
+        let session = sessions.values().max_by_key(|session| session.touched())?;
+        Some(CompanionSession {
+            id: session.id(),
+            purpose: session.purpose().to_string(),
+            verb: session.verb().map(Verb::as_str),
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct CompanionBody {
+    open: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session: Option<CompanionSession>,
+}
+
+#[derive(Serialize)]
+struct CompanionSession {
+    id: Uuid,
+    purpose: String,
+    verb: Option<&'static str>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/companion", get(companion))
         .route("/session", post(open_session))
         .route("/session/:id", delete(close_session))
         .route("/session/:id/view", post(view))
@@ -128,6 +164,14 @@ async fn open_session(
     Ok((StatusCode::CREATED, Json(opened)))
 }
 
+async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
+    let session = state.companion_session();
+    Json(CompanionBody {
+        open: session.is_some(),
+        session,
+    })
+}
+
 async fn close_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -144,7 +188,7 @@ async fn view(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
-    if !state.has_session(id) {
+    if !state.mark_verb(id, Verb::View) {
         return Err(ApiError::missing());
     }
     let desktop = Arc::clone(&state.desktop);
@@ -168,7 +212,7 @@ async fn watch(
     Query(query): Query<WatchQuery>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
-    if !state.has_session(id) {
+    if !state.mark_verb(id, Verb::Watch) {
         return Err(ApiError::missing());
     }
     let (tx, rx) = tokio::sync::mpsc::channel(4);
@@ -264,7 +308,7 @@ async fn listen(
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     let id = parse_id(&id)?;
-    if !state.has_session(id) {
+    if !state.mark_verb(id, Verb::Listen) {
         return Err(ApiError::missing());
     }
     let desktop = Arc::clone(&state.desktop);
@@ -321,7 +365,7 @@ async fn mouse(
     Json(op): Json<MouseOp>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
-    if !state.has_session(id) {
+    if !state.mark_verb(id, Verb::Mouse) {
         return Err(ApiError::missing());
     }
     let desktop = Arc::clone(&state.desktop);
@@ -344,8 +388,9 @@ async fn type_keys(
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
     let secret = {
-        let sessions = lock(&state.sessions);
-        let session = sessions.get(&id).ok_or_else(ApiError::missing)?;
+        let mut sessions = lock(&state.sessions);
+        let session = sessions.get_mut(&id).ok_or_else(ApiError::missing)?;
+        session.mark_verb(Verb::Type);
         match &body.secret {
             Some(name) => Some(
                 session
@@ -647,6 +692,44 @@ mod tests {
         assert_eq!(value["skills"][0]["name"], "typing");
         assert!(value.get("secrets").is_none());
         assert!(!text.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn companion_shows_purpose_and_verb_without_secrets() {
+        let addr = spawn(FakeDesktop::new()).await;
+        let (status, _, body) = send(addr, "GET", "/companion", None).await;
+        assert_eq!(status, 200);
+        let idle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(idle["open"], false);
+        assert!(idle.get("session").is_none());
+
+        let (_, _, id) = open_session_id(
+            addr,
+            serde_json::json!([{"name": "password", "source": "local", "value": "hunter2"}]),
+        )
+        .await;
+        let (status, _, body) = send(addr, "GET", "/companion", None).await;
+        assert_eq!(status, 200);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("hunter2"));
+        assert!(!text.contains("api_key"));
+        let open: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(open["open"], true);
+        assert_eq!(open["session"]["id"], id.to_string());
+        assert_eq!(open["session"]["purpose"], "drive the desktop");
+        assert!(open["session"]["verb"].is_null());
+
+        let (status, _, _) = send(addr, "POST", &format!("/session/{id}/view"), None).await;
+        assert_eq!(status, 200);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let active: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(active["session"]["verb"], "view");
+
+        let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let closed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(closed["open"], false);
     }
 
     #[tokio::test]

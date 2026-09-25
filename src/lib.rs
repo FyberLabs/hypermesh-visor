@@ -15,3 +15,20 @@ mod vault;
 pub use api::{serve, AppState};
 pub use bind::parse_listen;
 pub use desktop::{current_euid, Desktop, FixtureDesktop, LinuxDesktop};
+pub use hypermesh_session::{refresh_token, MemoryStore, SessionStore};
+
+#[cfg(test)]
+mod session_key {
+    use super::*;
+    use hypermesh_session::SessionStore;
+
+    #[test]
+    fn visor_reads_the_shared_refresh_token() {
+        let store = MemoryStore::new();
+        assert_eq!(refresh_token(&store).unwrap(), None);
+        store.put_refresh_token("refresh-1").unwrap();
+        assert_eq!(refresh_token(&store).unwrap().as_deref(), Some("refresh-1"));
+        let shown = format!("{store:?}");
+        assert!(!shown.contains("refresh-1"));
+    }
+}

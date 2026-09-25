@@ -27,15 +27,18 @@ jobs:
       - name: Install packagers
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu rpm
+          sudo apt-get install -y gcc-aarch64-linux-gnu rpm golang-go
           curl -fsSL -o /tmp/nfpm.tar.gz \
             https://github.com/goreleaser/nfpm/releases/download/v2.47.0/nfpm_2.47.0_Linux_x86_64.tar.gz
           tar -C /tmp -xzf /tmp/nfpm.tar.gz nfpm
           sudo install -m 0755 /tmp/nfpm /usr/local/bin/nfpm
           nfpm --version
 
+      - name: Check embedded includes
+        run: bash ci/check-includes.sh
+
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked --workspace
 
       - name: Package
         run: bash packaging/package.sh

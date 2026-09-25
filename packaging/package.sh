@@ -13,6 +13,16 @@ if ! command -v nfpm >/dev/null 2>&1; then
   echo "nfpm is required (https://github.com/goreleaser/nfpm)" >&2
   exit 1
 fi
+if ! command -v go >/dev/null 2>&1; then
+  echo "go is required to bundle hypermesh-cli" >&2
+  exit 1
+fi
+
+cli_src="${HYPERMESH_CLI_SRC:-$root/third_party/hypermesh-cli}"
+if [[ ! -f "$cli_src/go.mod" ]]; then
+  echo "hypermesh-cli sources not found at $cli_src" >&2
+  exit 1
+fi
 
 cargo_version=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
 if [[ -z "$cargo_version" ]]; then
@@ -93,11 +103,29 @@ for target in "${targets[@]}"; do
   fi
 
   rustup target add "$target" >/dev/null
-  cargo build --release --locked --target "$target"
+  cargo build --release --locked --target "$target" --workspace
 
   built="target/${target}/release/hypermesh-visor"
+  companion="target/${target}/release/hypermesh-companion"
   raw="dist/hypermesh-visor-${asset_arch}"
   install -m 0755 "$built" "$raw"
+  if [[ ! -x "$companion" ]]; then
+    echo "missing companion binary $companion" >&2
+    exit 1
+  fi
+
+  case "$asset_arch" in
+    x86_64) goarch=amd64 ;;
+    aarch64) goarch=arm64 ;;
+  esac
+  cli_bin="target/nfpm/hypermesh-${asset_arch}"
+  hm_bin="target/nfpm/hm-${asset_arch}"
+  mkdir -p target/nfpm
+  (
+    cd "$cli_src"
+    CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" go build -mod=readonly -trimpath -o "$root/$cli_bin" ./cmd/hypermesh
+    CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" go build -mod=readonly -trimpath -o "$root/$hm_bin" ./cmd/hm
+  )
 
   if ! file -b "$raw" | grep -q "$elf_needle"; then
     echo "$raw is not a $elf_needle ELF" >&2
@@ -107,9 +135,11 @@ for target in "${targets[@]}"; do
 
   deb="dist/hypermesh-visor-${asset_arch}.deb"
   rpm="dist/hypermesh-visor-${asset_arch}.rpm"
-  BINARY="$raw" VERSION="$version" NFPM_ARCH="$deb_arch" \
+  VISOR_BIN="$raw" COMPANION_BIN="$companion" CLI_BIN="$cli_bin" HM_BIN="$hm_bin" \
+    VERSION="$version" NFPM_ARCH="$deb_arch" \
     nfpm package --config packaging/nfpm.yaml --packager deb --target "$deb"
-  BINARY="$raw" VERSION="$version" NFPM_ARCH="$deb_arch" \
+  VISOR_BIN="$raw" COMPANION_BIN="$companion" CLI_BIN="$cli_bin" HM_BIN="$hm_bin" \
+    VERSION="$version" NFPM_ARCH="$deb_arch" \
     nfpm package --config packaging/nfpm.yaml --packager rpm --target "$rpm"
 
   got_deb_arch=$(dpkg-deb -f "$deb" Architecture)
@@ -119,10 +149,19 @@ for target in "${targets[@]}"; do
     echo "unexpected deb metadata for $deb: $got_deb_name $got_deb_arch $got_deb_home" >&2
     exit 1
   fi
-  if ! dpkg-deb -c "$deb" | grep -q ' \./usr/bin/hypermesh-visor$'; then
-    echo "$deb does not install /usr/bin/hypermesh-visor" >&2
-    exit 1
-  fi
+  listing=$(dpkg-deb -c "$deb")
+  for path in \
+    './usr/bin/hypermesh-visor' \
+    './usr/bin/hypermesh-companion' \
+    './usr/bin/hypermesh' \
+    './usr/bin/hm' \
+    './etc/xdg/autostart/hypermesh-companion.desktop'
+  do
+    if ! grep -q " ${path}\$" <<<"$listing"; then
+      echo "$deb does not install ${path#./}" >&2
+      exit 1
+    fi
+  done
 
   if command -v rpm >/dev/null 2>&1; then
     got_rpm=$(rpm -qp --queryformat '%{NAME} %{ARCH} %{URL}' "$rpm")

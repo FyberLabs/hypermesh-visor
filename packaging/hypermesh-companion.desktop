@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Hypermesh
+Comment=Hypermesh desktop companion
+Exec=/usr/bin/hypermesh-companion
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
