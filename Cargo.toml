@@ -1,0 +1,29 @@
+[package]
+name = "hypermesh-visor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Linux desktop visor for Hypermesh"
+publish = false
+
+[dependencies]
+axum = "0.7"
+base64 = "0.22"
+bytes = "1"
+http-body-util = "0.1"
+libc = "0.2"
+libloading = "0.8"
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tokio-stream = "0.1"
+uuid = { version = "1", features = ["v4", "serde"] }
+x11rb = { version = "0.13", features = ["xtest"] }
+zbus = "4.4"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+http = "1"
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
