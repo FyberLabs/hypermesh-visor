@@ -13,7 +13,8 @@ use crate::AuthError;
 
 pub const PUBLIC_CLIENT_ID: &str = "hypermesh-native";
 pub const ISSUER: &str = "https://auth.test.hyperme.sh/realms/controlplane";
-pub const SCOPE: &str = "openid offline_access";
+/// SSO-session scope only. Offline tokens outlive the Keycloak session.
+pub const SCOPE: &str = "openid";
 pub const LOGIN_TIMEOUT: Duration = Duration::from_secs(180);
 pub const SIGNED_IN_SENTENCE: &str = "You're signed in to Hypermesh. You can close this tab.";
 
@@ -147,6 +148,33 @@ pub fn refresh(endpoints: &Endpoints, refresh_token: &str) -> Result<Tokens, Aut
             ("client_id", endpoints.client_id.as_str()),
         ],
     )
+}
+
+/// Refresh the in-memory access token. A normal refresh token is bound to the
+/// Keycloak SSO session. When that session has ended, the keychain entry is
+/// removed so the next command asks the user to sign in again.
+pub fn refresh_session<S: SessionStore>(
+    store: &S,
+    endpoints: &Endpoints,
+) -> Result<Tokens, AuthError> {
+    let Some(refresh_token) = store.refresh_token()? else {
+        return Err(AuthError::NoSession);
+    };
+    match refresh(endpoints, &refresh_token) {
+        Ok(tokens) => {
+            if let Some(next) = tokens.refresh_token.as_deref() {
+                if next != refresh_token {
+                    store.put_refresh_token(next)?;
+                }
+            }
+            Ok(tokens)
+        }
+        Err(AuthError::Oauth(error)) if error == "invalid_grant" => {
+            let _ = store.delete();
+            Err(AuthError::SessionEnded)
+        }
+        Err(other) => Err(other),
+    }
 }
 
 pub fn revoke(endpoints: &Endpoints, refresh_token: &str) -> Result<(), AuthError> {
@@ -796,6 +824,50 @@ mod tests {
         assert!(matches!(err, AuthError::Expired));
         assert_eq!(clock.slept, vec![Duration::from_secs(5)]);
         assert!(!err.to_string().contains("device-3"));
+    }
+
+    #[test]
+    fn scope_is_openid_for_the_sso_session() {
+        assert_eq!(SCOPE, "openid");
+        let url = authorization_url(
+            &Endpoints::panopticon(),
+            "http://127.0.0.1:9/callback",
+            "st",
+            "ch",
+        );
+        assert!(url.contains("scope=openid"));
+        assert!(!url.contains("offline_access"));
+    }
+
+    #[test]
+    fn ended_session_clears_the_keychain_entry() {
+        let mock = scripted_device(&[r#"{"error":"invalid_grant"}"#]);
+        let store = MemoryStore::new();
+        store.put_refresh_token("refresh-live").unwrap();
+        let err = refresh_session(&store, &mock.endpoints).unwrap_err();
+        assert!(matches!(err, AuthError::SessionEnded));
+        assert_eq!(err.to_string(), "Your sign-in ended. Sign in again.");
+        assert!(!err.to_string().contains("refresh-live"));
+        assert_eq!(store.refresh_token().unwrap(), None);
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let down = Endpoints {
+            authorize_url: format!("http://{addr}/auth"),
+            token_url: format!("http://{addr}/token"),
+            device_url: format!("http://{addr}/device"),
+            revoke_url: format!("http://{addr}/revoke"),
+            client_id: PUBLIC_CLIENT_ID.into(),
+        };
+        let store = MemoryStore::new();
+        store.put_refresh_token("refresh-live").unwrap();
+        let err = refresh_session(&store, &down).unwrap_err();
+        assert!(!matches!(err, AuthError::SessionEnded));
+        assert_eq!(
+            store.refresh_token().unwrap().as_deref(),
+            Some("refresh-live")
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@ This file restates the product lock. Do not invent a second one.
 
 Sign in opens your browser; after you approve, Hypermesh stores your session in your system keychain. On a machine without a browser, use `hypermesh login --device`.
 
-The human session is a Keycloak public client (`hypermesh-native`) using authorization code + PKCE, or the device authorization grant. The refresh token is stored in the OS keychain (service `hypermesh`, account `session`). Access tokens stay in memory. Logout revokes and deletes the entry. No client secret. No token file.
+The human session is a Keycloak public client (`hypermesh-native`) using authorization code + PKCE, or the device authorization grant. The scope is `openid` only. The refresh token is the normal SSO-session token, stored in the OS keychain (service `hypermesh`, account `session`). It is not an offline token. Access tokens stay in memory. When refresh fails because the session ended, the CLI clears the keychain entry. Logout revokes and deletes the entry. No client secret. No token file.
 
 `HYPERMESH_API_KEY`, when set, is sent as `X-Api-Key` and is not written down. Reject `hm_dev_`, `hm_rtr_`, and `hm_site_` as that automation identity.
 

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -16,12 +17,15 @@ import (
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/FyberLabs/hypermesh-cli/internal/session"
 )
 
 const (
-	PublicClientID   = "hypermesh-native"
-	Issuer           = "https://auth.test.hyperme.sh/realms/controlplane"
-	Scope            = "openid offline_access"
+	PublicClientID = "hypermesh-native"
+	Issuer         = "https://auth.test.hyperme.sh/realms/controlplane"
+	// Scope is the SSO session only. Offline tokens outlive that session.
+	Scope            = "openid"
 	SignedInSentence = "You're signed in to Hypermesh. You can close this tab."
 	LoginTimeout     = 180 * time.Second
 	deviceGrant      = "urn:ietf:params:oauth:grant-type:device_code"
@@ -57,6 +61,14 @@ type Tokens struct {
 	RefreshToken string
 	ExpiresIn    time.Duration
 }
+
+// ErrNoRefreshToken is returned when the token endpoint omits a refresh token.
+var ErrNoRefreshToken = errors.New("Keycloak did not return a refresh token. The public client must issue a refresh token for this sign-in session.")
+
+// ErrSessionEnded is returned when Keycloak rejects the refresh token because
+// the SSO session is over. The keychain entry is deleted before this is returned
+// from RefreshSession.
+var ErrSessionEnded = errors.New("Your sign-in ended. Sign in again.")
 
 func (t Tokens) String() string {
 	return "oauth.Tokens{redacted}"
@@ -250,13 +262,46 @@ func Refresh(client *http.Client, ep Endpoints, refreshToken string) (Tokens, er
 	form.Set("refresh_token", refreshToken)
 	form.Set("client_id", ep.ClientID)
 	tokens, oauthErr, err := postToken(client, ep.TokenURL, form)
+	if oauthErr == "invalid_grant" {
+		return Tokens{}, ErrSessionEnded
+	}
 	if oauthErr != "" {
 		return Tokens{}, fmt.Errorf("sign-in failed (%s)", oauthErr)
+	}
+	if err != nil {
+		return Tokens{}, err
 	}
 	if tokens.RefreshToken == "" {
 		tokens.RefreshToken = refreshToken
 	}
-	return tokens, err
+	return tokens, nil
+}
+
+// RefreshSession loads the keychain refresh token and exchanges it for an
+// access token. invalid_grant means the SSO session ended: the entry is
+// deleted and the caller is told to sign in again.
+func RefreshSession(client *http.Client, ep Endpoints, store session.Store) (Tokens, error) {
+	refreshToken, err := store.Refresh()
+	if err != nil {
+		return Tokens{}, err
+	}
+	if refreshToken == "" {
+		return Tokens{}, fmt.Errorf("sign in first: hypermesh login")
+	}
+	tokens, err := Refresh(client, ep, refreshToken)
+	if errors.Is(err, ErrSessionEnded) {
+		_ = store.Delete()
+		return Tokens{}, err
+	}
+	if err != nil {
+		return Tokens{}, err
+	}
+	if tokens.RefreshToken != "" && tokens.RefreshToken != refreshToken {
+		if err := store.PutRefresh(tokens.RefreshToken); err != nil {
+			return Tokens{}, err
+		}
+	}
+	return tokens, nil
 }
 
 func Revoke(client *http.Client, ep Endpoints, refreshToken string) error {

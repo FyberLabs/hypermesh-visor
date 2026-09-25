@@ -12,9 +12,9 @@ mod store;
 pub use oauth::{
     accept_callback, authorization_url, bind_loopback, callback_code, display_available,
     exchange_code, first_tenant, logout, open_system_browser, poll_device, prepare_browser_login,
-    redirect_uri, refresh, revoke, sign_in, start_device, store_refresh, BrowserLogin, Clock,
-    DeviceCodes, Endpoints, SystemClock, Tokens, ISSUER, LOGIN_TIMEOUT, PUBLIC_CLIENT_ID, SCOPE,
-    SIGNED_IN_SENTENCE,
+    redirect_uri, refresh, refresh_session, revoke, sign_in, start_device, store_refresh,
+    BrowserLogin, Clock, DeviceCodes, Endpoints, SystemClock, Tokens, ISSUER, LOGIN_TIMEOUT,
+    PUBLIC_CLIENT_ID, SCOPE, SIGNED_IN_SENTENCE,
 };
 pub use pkce::{challenge_s256, new_state, new_verifier};
 pub use store::{KeyringStore, MemoryStore, SessionStore, ACCOUNT, SERVICE};
@@ -30,6 +30,7 @@ pub enum AuthError {
     NoKeychain,
     NoSession,
     NoRefreshToken,
+    SessionEnded,
     BrowserUnavailable(String),
 }
 
@@ -53,8 +54,9 @@ impl std::fmt::Display for AuthError {
             ),
             Self::NoSession => f.write_str("not signed in"),
             Self::NoRefreshToken => f.write_str(
-                "Keycloak did not return a refresh token. The public client must allow refresh tokens and the offline_access scope.",
+                "Keycloak did not return a refresh token. The public client must issue a refresh token for this sign-in session.",
             ),
+            Self::SessionEnded => f.write_str("Your sign-in ended. Sign in again."),
             Self::BrowserUnavailable(detail) => {
                 write!(f, "could not open a browser ({detail})")
             }
@@ -73,6 +75,14 @@ mod tests {
         let text = AuthError::NoKeychain.to_string();
         assert!(text.contains("keychain"));
         assert!(text.contains("will not store your session in a file"));
+    }
+
+    #[test]
+    fn missing_refresh_token_does_not_ask_for_an_offline_token() {
+        let text = AuthError::NoRefreshToken.to_string();
+        assert!(text.contains("refresh token"));
+        assert!(!text.contains("offline"));
+        assert_eq!(SCOPE, "openid");
     }
 }
 

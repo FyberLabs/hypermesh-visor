@@ -26,7 +26,7 @@ type KeyringStore struct{}
 
 func (KeyringStore) PutRefresh(token string) error {
 	if token == "" {
-		return fmt.Errorf("Keycloak did not return a refresh token. The public client must allow refresh tokens and the offline_access scope")
+		return fmt.Errorf("Keycloak did not return a refresh token. The public client must issue a refresh token for this sign-in session.")
 	}
 	if err := keyring.Set(Service, Account, token); err != nil {
 		return noKeychain(err)

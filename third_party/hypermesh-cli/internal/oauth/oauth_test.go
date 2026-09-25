@@ -3,6 +3,7 @@ package oauth
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -11,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/FyberLabs/hypermesh-cli/internal/session"
 )
 
 func TestChallengeS256RFC7636(t *testing.T) {
@@ -102,6 +105,61 @@ func TestDevicePollPendingSlowDownExpired(t *testing.T) {
 		if strings.Contains(body, "client_secret") {
 			t.Fatal("client secret was sent")
 		}
+	}
+}
+
+func TestScopeIsOpenIDOnly(t *testing.T) {
+	if Scope != "openid" || strings.Contains(Scope, "offline") {
+		t.Fatalf("scope %q", Scope)
+	}
+	raw := AuthorizationURL(Panopticon(), "http://127.0.0.1:9/callback", "st", "ch")
+	if !strings.Contains(raw, "scope=openid") || strings.Contains(raw, "offline_access") {
+		t.Fatal(raw)
+	}
+	if strings.Contains(ErrNoRefreshToken.Error(), "offline") {
+		t.Fatal(ErrNoRefreshToken)
+	}
+}
+
+func TestRefreshSessionEndedClearsTheEntry(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":"invalid_grant"}`)
+	}))
+	defer srv.Close()
+	store := &session.Memory{}
+	if err := store.PutRefresh("refresh-live"); err != nil {
+		t.Fatal(err)
+	}
+	ep := Endpoints{TokenURL: srv.URL, ClientID: PublicClientID}
+	_, err := RefreshSession(srv.Client(), ep, store)
+	if !errors.Is(err, ErrSessionEnded) {
+		t.Fatalf("err %v", err)
+	}
+	if !strings.Contains(err.Error(), "Sign in again") || strings.Contains(err.Error(), "refresh-live") {
+		t.Fatal(err)
+	}
+	got, err := store.Refresh()
+	if err != nil || got != "" {
+		t.Fatalf("entry %q %v", got, err)
+	}
+
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"error":"server_error"}`)
+	}))
+	defer down.Close()
+	if err := store.PutRefresh("refresh-live"); err != nil {
+		t.Fatal(err)
+	}
+	ep.TokenURL = down.URL
+	_, err = RefreshSession(down.Client(), ep, store)
+	if err == nil || errors.Is(err, ErrSessionEnded) {
+		t.Fatalf("err %v", err)
+	}
+	got, err = store.Refresh()
+	if err != nil || got != "refresh-live" {
+		t.Fatalf("entry %q %v", got, err)
 	}
 }
 

@@ -61,7 +61,7 @@ func signIn(stdout, stderr io.Writer, store session.Store, ep oauth.Endpoints, c
 		return err
 	}
 	if tokens.RefreshToken == "" || tokens.RefreshToken == tokens.AccessToken {
-		return fmt.Errorf("Keycloak did not return a refresh token. The public client must allow refresh tokens and the offline_access scope")
+		return oauth.ErrNoRefreshToken
 	}
 	if err := store.PutRefresh(tokens.RefreshToken); err != nil {
 		return err

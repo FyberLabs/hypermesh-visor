@@ -84,30 +84,15 @@ func (c *Client) ensureAccess() error {
 	if c.Session == nil {
 		return fmt.Errorf("sign in first: hypermesh login")
 	}
-	refresh, err := c.Session.Refresh()
-	if err != nil {
-		return err
-	}
-	if refresh == "" {
-		if strings.TrimSpace(c.APIKey) != "" {
-			return nil
-		}
-		return fmt.Errorf("sign in first: hypermesh login")
-	}
 	if c.HTTP == nil {
 		c.HTTP = &http.Client{Timeout: 30 * time.Second}
 	}
-	tokens, err := oauth.Refresh(c.HTTP, c.OAuth, refresh)
+	tokens, err := oauth.RefreshSession(c.HTTP, c.OAuth, c.Session)
 	if err != nil {
 		return err
 	}
 	c.AccessToken = tokens.AccessToken
 	c.AccessUntil = time.Now().Add(tokens.ExpiresIn)
-	if tokens.RefreshToken != "" && tokens.RefreshToken != refresh {
-		if err := c.Session.PutRefresh(tokens.RefreshToken); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
