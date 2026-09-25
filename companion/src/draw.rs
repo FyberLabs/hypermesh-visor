@@ -147,7 +147,7 @@ pub fn render(
     if let Pose::Active { purpose, verb } = pose {
         let lines = [
             format!("purpose: {}", sanitize(purpose)),
-            format!("verb: {}", verb.as_deref().unwrap_or("\u2014")),
+            format!("verb: {}", verb.as_deref().unwrap_or("—")),
         ];
         let card = text_card(width, 3, &lines, [7, 25, 61, 255], [255, 255, 255, 255]);
         blocks.push(Block {
@@ -466,7 +466,7 @@ fn sanitize(value: &str) -> String {
         }
     }
     if value.chars().count() > 72 {
-        out.push('\u2026');
+        out.push('…');
     }
     out
 }
