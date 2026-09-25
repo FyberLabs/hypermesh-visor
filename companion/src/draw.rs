@@ -17,6 +17,27 @@ fn asset(text: &str) -> Vec<u8> {
 
 const TARGET_WIDTH: u32 = 400;
 
+const IDLE_SPRITE: &[&str] = &[
+    include_str!("../assets/bug-idle/00.b64"),
+    include_str!("../assets/bug-idle/01.b64"),
+    include_str!("../assets/bug-idle/02.b64"),
+    include_str!("../assets/bug-idle/03.b64"),
+    include_str!("../assets/bug-idle/04.b64"),
+    include_str!("../assets/bug-idle/05.b64"),
+    include_str!("../assets/bug-idle/06.b64"),
+];
+
+const ACTIVE_SPRITE: &[&str] = &[
+    include_str!("../assets/bug-active/00.b64"),
+    include_str!("../assets/bug-active/01.b64"),
+    include_str!("../assets/bug-active/02.b64"),
+    include_str!("../assets/bug-active/03.b64"),
+    include_str!("../assets/bug-active/04.b64"),
+    include_str!("../assets/bug-active/05.b64"),
+    include_str!("../assets/bug-active/06.b64"),
+    include_str!("../assets/bug-active/07.b64"),
+];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
     ToggleMenu,
@@ -71,16 +92,18 @@ pub struct Sprites {
     active_eyes: Vec<Rect>,
 }
 
+fn bundled(parts: &[&str]) -> Vec<u8> {
+    let mut joined = String::new();
+    for part in parts {
+        joined.push_str(part);
+    }
+    asset(&joined)
+}
+
 impl Sprites {
     pub fn load() -> Self {
-        let idle = scale_width(
-            &decode_png(&asset(include_str!("../assets/bug-idle.png.b64"))),
-            TARGET_WIDTH,
-        );
-        let active = scale_width(
-            &decode_png(&asset(include_str!("../assets/bug-active.png.b64"))),
-            TARGET_WIDTH,
-        );
+        let idle = scale_width(&decode_png(&bundled(IDLE_SPRITE)), TARGET_WIDTH);
+        let active = scale_width(&decode_png(&bundled(ACTIVE_SPRITE)), TARGET_WIDTH);
         let idle_eyes = find_eyes(&idle);
         let active_eyes = find_eyes(&active);
         Self {
@@ -124,7 +147,7 @@ pub fn render(
     if let Pose::Active { purpose, verb } = pose {
         let lines = [
             format!("purpose: {}", sanitize(purpose)),
-            format!("verb: {}", verb.as_deref().unwrap_or("—")),
+            format!("verb: {}", verb.as_deref().unwrap_or("\u2014")),
         ];
         let card = text_card(width, 3, &lines, [7, 25, 61, 255], [255, 255, 255, 255]);
         blocks.push(Block {
@@ -443,7 +466,7 @@ fn sanitize(value: &str) -> String {
         }
     }
     if value.chars().count() > 72 {
-        out.push('…');
+        out.push('\u2026');
     }
     out
 }
