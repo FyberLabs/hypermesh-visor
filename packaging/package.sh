@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Build release binaries and pack .deb and .rpm for each requested target.
-# With no arguments, builds x86_64 and aarch64. A tag publish uses the
-# Cargo.toml version; every other build uses <version>~ci.<sha> and is not a release.
+# With no arguments, builds x86_64 and aarch64. Filenames have no version so a
+# tag release matches the download page. The package version still comes from
+# the tag, which must match Cargo.toml. Every other build uses <version>~ci.<sha>
+# inside the package and is not a release.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -63,7 +65,7 @@ for target in "${targets[@]}"; do
     x86_64-unknown-linux-gnu)
       deb_arch=amd64
       rpm_arch=x86_64
-      asset_arch=amd64
+      asset_arch=x86_64
       linker_var=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER
       linker_bin=x86_64-linux-gnu-gcc
       elf_needle="x86-64"
@@ -71,7 +73,7 @@ for target in "${targets[@]}"; do
     aarch64-unknown-linux-gnu)
       deb_arch=arm64
       rpm_arch=aarch64
-      asset_arch=arm64
+      asset_arch=aarch64
       linker_var=CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
       linker_bin=aarch64-linux-gnu-gcc
       elf_needle="ARM aarch64"
@@ -94,7 +96,7 @@ for target in "${targets[@]}"; do
   cargo build --release --locked --target "$target"
 
   built="target/${target}/release/hypermesh-visor"
-  raw="dist/hypermesh-visor_${version}_linux_${asset_arch}"
+  raw="dist/hypermesh-visor-${asset_arch}"
   install -m 0755 "$built" "$raw"
 
   if ! file -b "$raw" | grep -q "$elf_needle"; then
@@ -103,8 +105,8 @@ for target in "${targets[@]}"; do
     exit 1
   fi
 
-  deb="dist/hypermesh-visor_${version}_${deb_arch}.deb"
-  rpm="dist/hypermesh-visor-${version}-1.${rpm_arch}.rpm"
+  deb="dist/hypermesh-visor-${asset_arch}.deb"
+  rpm="dist/hypermesh-visor-${asset_arch}.rpm"
   BINARY="$raw" VERSION="$version" NFPM_ARCH="$deb_arch" \
     nfpm package --config packaging/nfpm.yaml --packager deb --target "$deb"
   BINARY="$raw" VERSION="$version" NFPM_ARCH="$deb_arch" \

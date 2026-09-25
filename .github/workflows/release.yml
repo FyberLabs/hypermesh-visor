@@ -64,5 +64,12 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/hypermesh-visor-x86_64
+            dist/hypermesh-visor-x86_64.deb
+            dist/hypermesh-visor-x86_64.rpm
+            dist/hypermesh-visor-aarch64
+            dist/hypermesh-visor-aarch64.deb
+            dist/hypermesh-visor-aarch64.rpm
+            dist/checksums.txt
           fail_on_unmatched_files: true

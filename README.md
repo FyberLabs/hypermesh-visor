@@ -25,15 +25,17 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-`v0.1.0` publishes these files:
+The release asset names do not include the version. `v0.1.0` publishes:
 
-- `hypermesh-visor_0.1.0_linux_amd64` — x86_64 binary
-- `hypermesh-visor_0.1.0_linux_arm64` — aarch64 binary, including the AGX
-- `hypermesh-visor_0.1.0_amd64.deb`
-- `hypermesh-visor_0.1.0_arm64.deb`
-- `hypermesh-visor-0.1.0-1.x86_64.rpm`
-- `hypermesh-visor-0.1.0-1.aarch64.rpm`
+- `hypermesh-visor-x86_64`
+- `hypermesh-visor-x86_64.deb`
+- `hypermesh-visor-x86_64.rpm`
+- `hypermesh-visor-aarch64`
+- `hypermesh-visor-aarch64.deb`
+- `hypermesh-visor-aarch64.rpm`
 - `checksums.txt` — SHA-256 of those files
+
+The version is inside the package. The download page uses these same filenames.
 
 The packages install `/usr/bin/hypermesh-visor` and do not start a service. Run that binary as the logged-in user. Builds run on Ubuntu 24.04, the same userspace generation as the AGX JetPack 7 image.
 
