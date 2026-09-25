@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/FyberLabs/hypermesh-cli/internal/api"
@@ -45,7 +46,7 @@ func TestLoadFileAndEnvOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.APIBase != "https://api.example.test" || cfg.APIKey != "file_key" || cfg.TenantID != "file-tenant" {
+	if cfg.APIBase != "https://api.example.test" || cfg.APIKey != "" || cfg.TenantID != "file-tenant" {
 		t.Fatalf("file load %+v", cfg)
 	}
 	t.Setenv(EnvAPIBase, "https://api.override.test")
@@ -59,38 +60,38 @@ func TestLoadFileAndEnvOverride(t *testing.T) {
 	}
 }
 
-func TestWriteLoginPermissionsAndRejectHostKey(t *testing.T) {
+func TestWriteProfileDoesNotCreateACredentialFile(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{Dir: dir, APIBase: api.DefaultAPIBase, ChatBase: api.DefaultChatBase}
-	if err := cfg.WriteLogin("hm_dev_nope", "ten", ""); err == nil {
-		t.Fatal("accepted host key")
-	}
-	if err := cfg.WriteLogin("org_renter_key", "ten-1", "user-1"); err != nil {
+	if err := os.WriteFile(CredentialsPath(dir), []byte("api_key = \"leftover\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	st, err := os.Stat(CredentialsPath(dir))
-	if err != nil {
+	if err := cfg.WriteProfile("ten-1", "user-1"); err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode().Perm() != 0o600 {
-		t.Fatalf("credentials mode %o", st.Mode().Perm())
+	if _, err := os.Stat(CredentialsPath(dir)); !os.IsNotExist(err) {
+		t.Fatalf("credentials still present: %v", err)
 	}
 	loaded, err := LoadFrom(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.APIKey != "org_renter_key" || loaded.TenantID != "ten-1" || loaded.RenterUserID != "user-1" {
+	if loaded.APIKey != "" || loaded.TenantID != "ten-1" || loaded.RenterUserID != "user-1" {
 		t.Fatalf("%+v", loaded)
 	}
-	if loaded.APIBase != api.DefaultAPIBase {
-		t.Fatalf("api base %s", loaded.APIBase)
+	raw, err := os.ReadFile(ConfigPath(dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "leftover") || strings.Contains(string(raw), "refresh") {
+		t.Fatalf("profile leaked a secret: %s", raw)
 	}
 }
 
 func TestLogoutRemovesCredentials(t *testing.T) {
 	dir := t.TempDir()
 	cfg := Config{Dir: dir}
-	if err := cfg.WriteLogin("org_k", "t", ""); err != nil {
+	if err := os.WriteFile(CredentialsPath(dir), []byte("api_key = \"org_k\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := cfg.Logout(); err != nil {

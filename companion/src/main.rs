@@ -1,5 +1,5 @@
-//! Linux desktop companion. A bug on the desktop, the CLI, and browser login.
-//! The auth key is stored for hypermesh-cli. It is not put in the visor vault.
+//! Linux desktop companion. A bug on the desktop.
+//! Sign-in stores a refresh token in the system keychain, not in the visor vault.
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("the desktop companion is Linux only");

@@ -9,6 +9,8 @@ import (
 
 	"github.com/FyberLabs/hypermesh-cli/internal/api"
 	"github.com/FyberLabs/hypermesh-cli/internal/config"
+	"github.com/FyberLabs/hypermesh-cli/internal/oauth"
+	"github.com/FyberLabs/hypermesh-cli/internal/session"
 )
 
 // ExitFailure is the only non-zero status this process returns.
@@ -44,7 +46,10 @@ func New(name string) *cobra.Command {
 				cfg.ChatBase = r.chatBase
 			}
 			r.cfg = cfg
-			r.client = api.NewClient(cfg.APIBase, cfg.ChatBase, cfg.APIKey, cfg.TenantID)
+			client := api.NewClient(cfg.APIBase, cfg.ChatBase, cfg.APIKey, cfg.TenantID)
+			client.Session = session.KeyringStore{}
+			client.OAuth = oauth.Panopticon()
+			r.client = client
 			return nil
 		},
 	}
@@ -52,6 +57,8 @@ func New(name string) *cobra.Command {
 	root.PersistentFlags().StringVar(&r.apiBase, "api-base", "", "override HYPERMESH_API_BASE")
 	root.PersistentFlags().StringVar(&r.chatBase, "chat-base", "", "override HYPERMESH_CHAT_BASE")
 
+	root.AddCommand(newLoginCmd(r))
+	root.AddCommand(newLogoutCmd(r))
 	root.AddCommand(newAuthCmd(r))
 	root.AddCommand(newCatalogCmd(r))
 	root.AddCommand(newClassesCmd(r))

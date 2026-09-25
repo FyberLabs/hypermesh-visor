@@ -2,16 +2,19 @@ package cli
 
 import (
 	"fmt"
+	"net/http"
 
 	"github.com/spf13/cobra"
 
 	"github.com/FyberLabs/hypermesh-cli/internal/api"
+	"github.com/FyberLabs/hypermesh-cli/internal/oauth"
+	"github.com/FyberLabs/hypermesh-cli/internal/session"
 )
 
 func newAuthCmd(r *run) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "auth",
-		Short: "Renter API key login (purpose: renter)",
+		Short: "Sign in, show the session, or log out",
 	}
 	cmd.AddCommand(newAuthLoginCmd(r))
 	cmd.AddCommand(newAuthWhoamiCmd(r))
@@ -20,36 +23,15 @@ func newAuthCmd(r *run) *cobra.Command {
 }
 
 func newAuthLoginCmd(r *run) *cobra.Command {
-	var apiKey, tenantID, renterUserID string
+	var device bool
 	cmd := &cobra.Command{
 		Use:   "login",
-		Short: "Store an org API key and tenant id (credentials 0600)",
+		Short: "Sign in (same as `hypermesh login`)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := api.ValidateRenterKey(apiKey); err != nil {
-				return err
-			}
-			if err := r.cfg.WriteLogin(apiKey, tenantID, renterUserID); err != nil {
-				return err
-			}
-			out := map[string]any{
-				"ok":             true,
-				"tenant_id":      tenantID,
-				"config_dir":     r.cfg.Dir,
-				"credentials":    "0600",
-				"renter_user_id": renterUserID,
-			}
-			if r.json {
-				return r.printJSON(out)
-			}
-			fmt.Fprintf(cmd.OutOrStdout(), "logged in tenant %s\ncredentials %s (0600)\n", tenantID, r.cfg.Dir)
-			return nil
+			return signIn(cmd.OutOrStdout(), cmd.ErrOrStderr(), session.KeyringStore{}, oauth.Panopticon(), http.DefaultClient, device, oauth.DisplayAvailable(), oauth.OpenSystemBrowser, r.cfg.ForgetPlaintextCredentials, r.noteTenant)
 		},
 	}
-	cmd.Flags().StringVar(&apiKey, "api-key", "", "org API key from api-keys (purpose: renter)")
-	cmd.Flags().StringVar(&tenantID, "tenant-id", "", "tenant id sent as X-Tenant-ID")
-	cmd.Flags().StringVar(&renterUserID, "renter-user-id", "", "uuid used as renter_user_id on checkout")
-	_ = cmd.MarkFlagRequired("api-key")
-	_ = cmd.MarkFlagRequired("tenant-id")
+	cmd.Flags().BoolVar(&device, "device", false, "print a device code instead of opening a browser")
 	return cmd
 }
 
@@ -65,6 +47,11 @@ func newAuthWhoamiCmd(r *run) *cobra.Command {
 					keyErr = err.Error()
 				}
 			}
+			refresh, sessionErr := (session.KeyringStore{}).Refresh()
+			if sessionErr != nil && !keyOK {
+				return sessionErr
+			}
+			sessionSet := sessionErr == nil && refresh != ""
 			out := map[string]any{
 				"api_base":       r.cfg.APIBase,
 				"chat_base":      r.cfg.ChatBase,
@@ -72,13 +59,23 @@ func newAuthWhoamiCmd(r *run) *cobra.Command {
 				"renter_user_id": r.cfg.RenterUserID,
 				"api_key_set":    keyOK,
 				"api_key":        api.MaskKey(r.cfg.APIKey),
+				"session":        sessionSet,
 				"config_dir":     r.cfg.Dir,
 			}
 			if keyErr != "" {
 				out["api_key_error"] = keyErr
 			}
+			if sessionErr != nil {
+				out["session_error"] = "No system keychain is available. Hypermesh will not store your session in a file."
+			}
 			if r.json {
-				return r.printJSON(out)
+				if err := r.printJSON(out); err != nil {
+					return err
+				}
+				if keyErr != "" {
+					return fmt.Errorf("%s", keyErr)
+				}
+				return nil
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "api_base\t%s\n", r.cfg.APIBase)
 			fmt.Fprintf(cmd.OutOrStdout(), "chat_base\t%s\n", r.cfg.ChatBase)
@@ -88,6 +85,11 @@ func newAuthWhoamiCmd(r *run) *cobra.Command {
 				fmt.Fprintf(cmd.OutOrStdout(), "api_key\t%s\n", api.MaskKey(r.cfg.APIKey))
 			} else {
 				fmt.Fprintln(cmd.OutOrStdout(), "api_key\t(not set)")
+			}
+			if sessionSet {
+				fmt.Fprintln(cmd.OutOrStdout(), "session\tkeychain")
+			} else {
+				fmt.Fprintln(cmd.OutOrStdout(), "session\t(not signed in)")
 			}
 			if keyErr != "" {
 				return fmt.Errorf("%s", keyErr)
@@ -100,9 +102,9 @@ func newAuthWhoamiCmd(r *run) *cobra.Command {
 func newAuthLogoutCmd(r *run) *cobra.Command {
 	return &cobra.Command{
 		Use:   "logout",
-		Short: "Remove stored credentials",
+		Short: "Revoke the session and remove it from the keychain",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := r.cfg.Logout(); err != nil {
+			if err := signOut(session.KeyringStore{}, oauth.Panopticon(), http.DefaultClient, r.cfg.ForgetPlaintextCredentials); err != nil {
 				return err
 			}
 			if r.json {

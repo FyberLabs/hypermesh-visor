@@ -74,17 +74,6 @@ func LoadFrom(dir string) (Config, error) {
 	} else if !os.IsNotExist(err) {
 		return Config{}, fmt.Errorf("read %s: %w", ConfigPath(dir), err)
 	}
-	if raw, err := os.ReadFile(CredentialsPath(dir)); err == nil {
-		m, err := parseTOML(raw)
-		if err != nil {
-			return Config{}, fmt.Errorf("parse %s: %w", CredentialsPath(dir), err)
-		}
-		if v := m["api_key"]; v != "" {
-			cfg.APIKey = v
-		}
-	} else if !os.IsNotExist(err) {
-		return Config{}, fmt.Errorf("read %s: %w", CredentialsPath(dir), err)
-	}
 	applyEnv(&cfg)
 	return cfg, nil
 }
@@ -137,10 +126,7 @@ func applyEnv(cfg *Config) {
 	}
 }
 
-func (c Config) WriteLogin(apiKey, tenantID, renterUserID string) error {
-	if err := api.ValidateRenterKey(apiKey); err != nil {
-		return err
-	}
+func (c Config) WriteProfile(tenantID, renterUserID string) error {
 	if strings.TrimSpace(tenantID) == "" {
 		return fmt.Errorf("tenant id is required")
 	}
@@ -166,11 +152,11 @@ func (c Config) WriteLogin(apiKey, tenantID, renterUserID string) error {
 	if err := os.WriteFile(ConfigPath(c.Dir), encodeTOML(cfgMap), 0o644); err != nil {
 		return err
 	}
-	cred := encodeTOML(map[string]string{"api_key": apiKey})
-	if err := os.WriteFile(CredentialsPath(c.Dir), cred, 0o600); err != nil {
-		return err
-	}
-	return os.Chmod(CredentialsPath(c.Dir), 0o600)
+	return c.ForgetPlaintextCredentials()
+}
+
+func (c Config) ForgetPlaintextCredentials() error {
+	return c.Logout()
 }
 
 func (c Config) Logout() error {

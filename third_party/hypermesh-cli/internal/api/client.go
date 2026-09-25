@@ -8,6 +8,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/FyberLabs/hypermesh-cli/internal/oauth"
+	"github.com/FyberLabs/hypermesh-cli/internal/session"
 )
 
 const HeaderAPIKey = "X-Api-Key"
@@ -16,11 +19,15 @@ const HeaderLeaseID = "X-Hypermesh-Lease-Id"
 const HeaderLeaseIDAlt = "X-Lease-Id"
 
 type Client struct {
-	HTTP     *http.Client
-	APIBase  string
-	ChatBase string
-	APIKey   string
-	TenantID string
+	HTTP        *http.Client
+	APIBase     string
+	ChatBase    string
+	APIKey      string
+	TenantID    string
+	AccessToken string
+	AccessUntil time.Time
+	Session     session.Store
+	OAuth       oauth.Endpoints
 }
 
 func NewClient(apiBase, chatBase, apiKey, tenantID string) *Client {
@@ -52,8 +59,13 @@ func (e *HTTPError) Error() string {
 }
 
 func (c *Client) requireRenterAuth() error {
-	if err := ValidateRenterKey(c.APIKey); err != nil {
+	if err := c.ensureAccess(); err != nil {
 		return err
+	}
+	if c.AccessToken == "" {
+		if err := ValidateRenterKey(c.APIKey); err != nil {
+			return err
+		}
 	}
 	if strings.TrimSpace(c.TenantID) == "" {
 		return fmt.Errorf("tenant id is required (X-Tenant-ID)")
@@ -61,8 +73,48 @@ func (c *Client) requireRenterAuth() error {
 	return nil
 }
 
+func (c *Client) ensureAccess() error {
+	// An environment API key is the automation path. It does not read the keychain.
+	if strings.TrimSpace(c.APIKey) != "" {
+		return nil
+	}
+	if c.AccessToken != "" && time.Now().Before(c.AccessUntil.Add(-15*time.Second)) {
+		return nil
+	}
+	if c.Session == nil {
+		return fmt.Errorf("sign in first: hypermesh login")
+	}
+	refresh, err := c.Session.Refresh()
+	if err != nil {
+		return err
+	}
+	if refresh == "" {
+		if strings.TrimSpace(c.APIKey) != "" {
+			return nil
+		}
+		return fmt.Errorf("sign in first: hypermesh login")
+	}
+	if c.HTTP == nil {
+		c.HTTP = &http.Client{Timeout: 30 * time.Second}
+	}
+	tokens, err := oauth.Refresh(c.HTTP, c.OAuth, refresh)
+	if err != nil {
+		return err
+	}
+	c.AccessToken = tokens.AccessToken
+	c.AccessUntil = time.Now().Add(tokens.ExpiresIn)
+	if tokens.RefreshToken != "" && tokens.RefreshToken != refresh {
+		if err := c.Session.PutRefresh(tokens.RefreshToken); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (c *Client) applyRenterHeaders(req *http.Request) {
-	if c.APIKey != "" {
+	if c.AccessToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.AccessToken)
+	} else if c.APIKey != "" {
 		req.Header.Set(HeaderAPIKey, c.APIKey)
 	}
 	if c.TenantID != "" {

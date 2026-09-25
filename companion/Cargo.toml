@@ -11,9 +11,7 @@ name = "hypermesh-companion"
 path = "src/main.rs"
 
 [dependencies]
-base64 = "0.22"
+hypermesh-session = { path = "../session" }
 png = "0.17"
 serde_json = "1"
-sha2 = "0.10"
-ureq = { version = "2.12", default-features = false, features = ["tls"] }
 x11rb = "0.13"

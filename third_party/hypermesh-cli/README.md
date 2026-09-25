@@ -31,24 +31,22 @@ Private module: use a GitHub account that can read this repo.
 
 ## Auth
 
-One org API key from api-keys (`purpose: renter`) hits both `api.test` and `chat.test`. Headers: `X-Api-Key` and `X-Tenant-ID`.
-
-Do not use `hm_dev_`, `hm_rtr_`, or `hm_site_` keys. Those are host, router, and site credentials.
+Sign in opens your browser; after you approve, Hypermesh stores your session in your system keychain. On a machine without a browser, use `hypermesh login --device`.
 
 ```bash
-hypermesh auth login \
-  --api-key "$HYPERMESH_API_KEY" \
-  --tenant-id "$HYPERMESH_TENANT_ID" \
-  --renter-user-id "$HYPERMESH_RENTER_USER_ID"
-
+hypermesh login
+hypermesh login --device
 hypermesh auth whoami
-hypermesh auth logout
+hypermesh logout
 ```
 
-Files:
+The refresh token is one keychain entry (service `hypermesh`, account `session`). The CLI and the desktop companion read that same entry. Access tokens stay in memory and are refreshed when a command needs them. Logout revokes the refresh token and deletes the entry. Hypermesh does not write a token file.
+
+`HYPERMESH_API_KEY` is an automation override sent as `X-Api-Key`. It is not stored. Do not use `hm_dev_`, `hm_rtr_`, or `hm_site_` keys. Those are host, router, and site credentials.
+
+Non-secret profile:
 
 - `~/.config/hypermesh/config.toml`
-- `~/.config/hypermesh/credentials` (mode `0600`)
 
 Defaults (override with env or `--api-base` / `--chat-base`):
 
@@ -114,7 +112,7 @@ Lease status: `offered` → `paid` → `starting` → `active` → `ended` | `fa
 - Your Model / BYOM / box rent / load
 - Host enroll, `device_secret`, WireGuard keys, host IPs
 - MHS, clustering, public tok/s
-- A second login (OIDC, SIWE) in this binary
+- SIWE in this binary
 - Invented catalog ids beyond `llama-3.1-8b-q4` as the Phase 1 default
 - Crypto / USDC pay, fake pay, or payment bypass
 
@@ -122,7 +120,8 @@ Lease status: `offered` → `paid` → `starting` → `active` → `ended` | `fa
 
 | Command | Route |
 |---|---|
-| `auth login\|whoami\|logout` | local config |
+| `login` / `login --device` / `logout` | Keycloak public client, refresh token in the OS keychain |
+| `auth whoami` | local config and whether the keychain session is present |
 | `catalog` / `catalog show` | `GET /api/v1/hypermesh/catalog` |
 | `classes` | `GET /api/v1/hypermesh/classes` |
 | `hosts` | `GET /api/v1/hypermesh/renter/hosts` |

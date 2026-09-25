@@ -8,13 +8,15 @@ use std::time::Duration;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent, ColormapAlloc,
-    ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask,
-    ImageFormat, ImageOrder, PropMode, VisualClass, WindowClass,
+    ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, EventMask, ImageFormat,
+    ImageOrder, PropMode, VisualClass, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
-use crate::auth::{self, Endpoints, Pose};
+use hypermesh_session::{self, KeyringStore};
+
+use crate::auth::{self, Pose};
 use crate::credentials;
 use crate::draw::{self, Action, Scene, Sprites};
 use crate::pages;
@@ -65,7 +67,12 @@ fn show(mut app: App) -> Result<(), String> {
         app.eyes_follow,
         None,
     );
-    let (x, y) = place(screen.width_in_pixels, screen.height_in_pixels, scene.width, scene.height);
+    let (x, y) = place(
+        screen.width_in_pixels,
+        screen.height_in_pixels,
+        scene.width,
+        scene.height,
+    );
     conn.create_window(
         depth,
         window,
@@ -218,27 +225,39 @@ fn start_login(status: Arc<Mutex<String>>, busy: Arc<Mutex<bool>>) {
     }
     *status.lock().unwrap() = "waiting for the browser".into();
     std::thread::spawn(move || {
-        let login = auth::begin_login();
-        let start_url = login.start_url.clone();
-        let result = auth::finish_login(
-            &Endpoints::default(),
-            &login,
-            &credentials::config_dir(),
-            || {
-                open_url(&start_url)
-                    .map_err(|err| credentials::StoreError(err.to_string()))
+        let result = hypermesh_session::sign_in(
+            &KeyringStore,
+            &hypermesh_session::Endpoints::panopticon(),
+            false,
+            hypermesh_session::display_available(),
+            |url| hypermesh_session::open_system_browser(url),
+            |device| {
+                *status.lock().unwrap() =
+                    format!("Enter {} at {}", device.user_code, device.verification_uri);
+            },
+            |access| {
+                if let Ok(tenant) = hypermesh_session::first_tenant(pages::API_BASE, access) {
+                    let _ = credentials::write_profile(&credentials::config_dir(), &tenant, "");
+                }
+                Ok(())
             },
         );
         match result {
-            Ok(()) => *status.lock().unwrap() = "logged in".into(),
-            Err(err) => *status.lock().unwrap() = err.0,
+            Ok(()) => {
+                let _ = credentials::forget_plaintext_credentials(&credentials::config_dir());
+                *status.lock().unwrap() = "logged in".into();
+            }
+            Err(err) => *status.lock().unwrap() = err.to_string(),
         }
         *busy.lock().unwrap() = false;
     });
 }
 
 fn open_url(url: &str) -> std::io::Result<()> {
-    std::process::Command::new("xdg-open").arg(url).spawn().map(|_| ())
+    std::process::Command::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
 }
 
 fn open_cli() -> std::io::Result<()> {
@@ -328,10 +347,7 @@ fn window_visual(conn: &RustConnection, screen_num: usize) -> (u8, u32, u32, u32
     )
 }
 
-fn argb_visual(
-    conn: &RustConnection,
-    screen_num: usize,
-) -> Option<(u8, u32, u32, u32, u32)> {
+fn argb_visual(conn: &RustConnection, screen_num: usize) -> Option<(u8, u32, u32, u32, u32)> {
     let screen = &conn.setup().roots[screen_num];
     for depth in &screen.allowed_depths {
         if depth.depth != 32 {
@@ -429,7 +445,17 @@ fn put_scene(
     Ok(())
 }
 
-fn pack(r: u8, g: u8, b: u8, a: u8, red: u32, green: u32, blue: u32, lsb: bool, bpp: usize) -> [u8; 4] {
+fn pack(
+    r: u8,
+    g: u8,
+    b: u8,
+    a: u8,
+    red: u32,
+    green: u32,
+    blue: u32,
+    lsb: bool,
+    bpp: usize,
+) -> [u8; 4] {
     let shift = |mask: u32| mask.trailing_zeros();
     let mut pixel = 0u32;
     if red != 0 {

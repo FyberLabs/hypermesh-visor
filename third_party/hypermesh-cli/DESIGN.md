@@ -11,16 +11,19 @@ This file restates the product lock. Do not invent a second one.
 
 ## Auth
 
-One org API key from api-keys (`purpose: renter`) for both control plane and router.
+Sign in opens your browser; after you approve, Hypermesh stores your session in your system keychain. On a machine without a browser, use `hypermesh login --device`.
+
+The human session is a Keycloak public client (`hypermesh-native`) using authorization code + PKCE, or the device authorization grant. The refresh token is stored in the OS keychain (service `hypermesh`, account `session`). Access tokens stay in memory. Logout revokes and deletes the entry. No client secret. No token file.
+
+`HYPERMESH_API_KEY`, when set, is sent as `X-Api-Key` and is not written down. Reject `hm_dev_`, `hm_rtr_`, and `hm_site_` as that automation identity.
 
 | Header | Value |
 |---|---|
-| `X-Api-Key` | renter org key |
+| `Authorization` | `Bearer` access token from the keychain session |
+| `X-Api-Key` | automation key from the environment, when there is no session |
 | `X-Tenant-ID` | tenant id |
 
-Reject `hm_dev_`, `hm_rtr_`, and `hm_site_` as renter identity.
-
-No OIDC dance in the CLI. No SIWE. No WireGuard.
+No SIWE. No WireGuard.
 
 ## Bases
 
@@ -29,7 +32,7 @@ No OIDC dance in the CLI. No SIWE. No WireGuard.
 | `HYPERMESH_API_BASE` | `https://api.test.hyperme.sh` |
 | `HYPERMESH_CHAT_BASE` | `https://chat.test.hyperme.sh` |
 
-Config: `~/.config/hypermesh/config.toml`. Credentials file `~/.config/hypermesh/credentials` mode `0600`. Override directory with `HYPERMESH_CONFIG_DIR`.
+Config: `~/.config/hypermesh/config.toml` (no token). Refresh token: OS keychain service `hypermesh`, account `session`. Override the config directory with `HYPERMESH_CONFIG_DIR`.
 
 ## Locked routes
 

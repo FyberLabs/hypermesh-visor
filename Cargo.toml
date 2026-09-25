@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "companion"]
+members = [".", "companion", "session"]
 resolver = "2"
 
 [package]
@@ -26,6 +26,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 x11rb = { version = "0.13", features = ["xtest"] }
 zbus = "4.4"
 zeroize = { version = "1", features = ["derive"] }
+
+hypermesh-session = { path = "session" }
 
 [dev-dependencies]
 http = "1"
