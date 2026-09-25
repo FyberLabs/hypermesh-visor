@@ -34,6 +34,9 @@ jobs:
           sudo install -m 0755 /tmp/nfpm /usr/local/bin/nfpm
           nfpm --version
 
+      - name: Check embedded includes
+        run: bash ci/check-includes.sh
+
       - name: Test
         run: cargo test --locked --workspace
 

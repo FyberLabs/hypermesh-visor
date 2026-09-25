@@ -10,4 +10,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Check embedded includes
+        run: bash ci/check-includes.sh
       - run: cargo test --locked --workspace

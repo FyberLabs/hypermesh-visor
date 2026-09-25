@@ -5,80 +5,13 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-
 use crate::auth::Pose;
-
-fn asset(text: &str) -> Vec<u8> {
-    let bytes: Vec<u8> = text.bytes().filter(|byte| !byte.is_ascii_whitespace()).collect();
-    STANDARD.decode(bytes).expect("bundled asset")
-}
 
 const TARGET_WIDTH: u32 = 400;
 
-const IDLE_SPRITE: &[&str] = &[
-    include_str!("../assets/bug-idle/00.b64"),
-    include_str!("../assets/bug-idle/01.b64"),
-    include_str!("../assets/bug-idle/02.b64"),
-    include_str!("../assets/bug-idle/03.b64"),
-    include_str!("../assets/bug-idle/04.b64"),
-    include_str!("../assets/bug-idle/05.b64"),
-    include_str!("../assets/bug-idle/06.b64"),
-    include_str!("../assets/bug-idle/07.b64"),
-    include_str!("../assets/bug-idle/08.b64"),
-    include_str!("../assets/bug-idle/09.b64"),
-    include_str!("../assets/bug-idle/10.b64"),
-    include_str!("../assets/bug-idle/11.b64"),
-    include_str!("../assets/bug-idle/12.b64"),
-    include_str!("../assets/bug-idle/13.b64"),
-    include_str!("../assets/bug-idle/14.b64"),
-    include_str!("../assets/bug-idle/15.b64"),
-    include_str!("../assets/bug-idle/16.b64"),
-    include_str!("../assets/bug-idle/17.b64"),
-    include_str!("../assets/bug-idle/18.b64"),
-    include_str!("../assets/bug-idle/19.b64"),
-    include_str!("../assets/bug-idle/20.b64"),
-    include_str!("../assets/bug-idle/21.b64"),
-    include_str!("../assets/bug-idle/22.b64"),
-    include_str!("../assets/bug-idle/23.b64"),
-    include_str!("../assets/bug-idle/24.b64"),
-    include_str!("../assets/bug-idle/25.b64"),
-];
-
-const ACTIVE_SPRITE: &[&str] = &[
-    include_str!("../assets/bug-active/00.b64"),
-    include_str!("../assets/bug-active/01.b64"),
-    include_str!("../assets/bug-active/02.b64"),
-    include_str!("../assets/bug-active/03.b64"),
-    include_str!("../assets/bug-active/04.b64"),
-    include_str!("../assets/bug-active/05.b64"),
-    include_str!("../assets/bug-active/06.b64"),
-    include_str!("../assets/bug-active/07.b64"),
-    include_str!("../assets/bug-active/08.b64"),
-    include_str!("../assets/bug-active/09.b64"),
-    include_str!("../assets/bug-active/10.b64"),
-    include_str!("../assets/bug-active/11.b64"),
-    include_str!("../assets/bug-active/12.b64"),
-    include_str!("../assets/bug-active/13.b64"),
-    include_str!("../assets/bug-active/14.b64"),
-    include_str!("../assets/bug-active/15.b64"),
-    include_str!("../assets/bug-active/16.b64"),
-    include_str!("../assets/bug-active/17.b64"),
-    include_str!("../assets/bug-active/18.b64"),
-    include_str!("../assets/bug-active/19.b64"),
-    include_str!("../assets/bug-active/20.b64"),
-    include_str!("../assets/bug-active/21.b64"),
-    include_str!("../assets/bug-active/22.b64"),
-    include_str!("../assets/bug-active/23.b64"),
-    include_str!("../assets/bug-active/24.b64"),
-    include_str!("../assets/bug-active/25.b64"),
-    include_str!("../assets/bug-active/26.b64"),
-    include_str!("../assets/bug-active/27.b64"),
-    include_str!("../assets/bug-active/28.b64"),
-    include_str!("../assets/bug-active/29.b64"),
-    include_str!("../assets/bug-active/30.b64"),
-];
+// Drawn by companion/assets/render_sprites.py and committed so a clean checkout builds.
+const IDLE_PNG: &[u8] = include_bytes!("../assets/bug-idle.png");
+const ACTIVE_PNG: &[u8] = include_bytes!("../assets/bug-active.png");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -134,18 +67,10 @@ pub struct Sprites {
     active_eyes: Vec<Rect>,
 }
 
-fn bundled(parts: &[&str]) -> Vec<u8> {
-    let mut joined = String::new();
-    for part in parts {
-        joined.push_str(part);
-    }
-    asset(&joined)
-}
-
 impl Sprites {
     pub fn load() -> Self {
-        let idle = scale_width(&decode_png(&bundled(IDLE_SPRITE)), TARGET_WIDTH);
-        let active = scale_width(&decode_png(&bundled(ACTIVE_SPRITE)), TARGET_WIDTH);
+        let idle = scale_width(&decode_png(IDLE_PNG), TARGET_WIDTH);
+        let active = scale_width(&decode_png(ACTIVE_PNG), TARGET_WIDTH);
         let idle_eyes = find_eyes(&idle);
         let active_eyes = find_eyes(&active);
         Self {
