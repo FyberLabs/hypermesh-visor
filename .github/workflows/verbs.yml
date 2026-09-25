@@ -1,0 +1,22 @@
+name: verbs
+
+on:
+  pull_request:
+  push:
+
+jobs:
+  verbs:
+    name: five verbs
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Drive view, watch, listen, mouse, and type
+        run: bash ci/verbs.sh

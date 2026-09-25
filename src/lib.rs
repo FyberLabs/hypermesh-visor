@@ -14,4 +14,4 @@ mod vault;
 
 pub use api::{serve, AppState};
 pub use bind::parse_listen;
-pub use desktop::{current_euid, LinuxDesktop};
+pub use desktop::{current_euid, Desktop, FixtureDesktop, LinuxDesktop};

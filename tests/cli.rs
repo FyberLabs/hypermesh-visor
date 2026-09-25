@@ -16,6 +16,14 @@ fn help_mentions_the_daemon() {
 }
 
 #[test]
+fn fixture_needs_a_log_path() {
+    let output = bin().arg("--fixture").output().unwrap();
+    assert!(!output.status.success());
+    let err = String::from_utf8(output.stderr).unwrap();
+    assert!(err.contains("--fixture"));
+}
+
+#[test]
 fn rejects_a_non_loopback_listen_address() {
     let output = bin().args(["--listen", "0.0.0.0:9"]).output().unwrap();
     assert!(!output.status.success());
