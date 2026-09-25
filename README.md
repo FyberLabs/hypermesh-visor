@@ -37,7 +37,17 @@ The release asset names do not include the version. `v0.1.0` publishes:
 
 The version is inside the package. The download page uses these same filenames.
 
-The packages install `/usr/bin/hypermesh-visor` and do not start a service. Run that binary as the logged-in user. Builds run on Ubuntu 24.04, the same userspace generation as the AGX JetPack 7 image.
+The packages install `/usr/bin/hypermesh-visor`, `/usr/bin/hypermesh`, `/usr/bin/hm`, and `/usr/bin/hypermesh-companion`. They do not start the visor. The companion is started for a graphical login from `/etc/xdg/autostart`. Run the visor as the logged-in user. Builds run on Ubuntu 24.04, the same userspace generation as the AGX JetPack 7 image.
+
+The raw release assets `hypermesh-visor-x86_64` and `hypermesh-visor-aarch64` stay the visor binary. The `.deb` and `.rpm` names are unchanged and are the packages that contain the visor, the CLI, and the companion.
+
+## Desktop companion
+
+`hypermesh-companion` is a Linux-only bug on the desktop. It draws the beetle sprites in `companion/assets`, bobs them, and blinks by covering the eyes. While a visor session is open it paints that session's purpose and the current verb (`view`, `watch`, `listen`, `mouse`, or `type`) under the bug in a built-in bitmap face. It does not copy the screen into the window. With no session the bug is idle. Clicking it opens a short menu: a terminal running `hypermesh`, login, billing (`https://hyperme.sh/#pricing`), renting (`https://hyperme.sh/#offers`), the desk (`https://portal.test.hyperme.sh/dashboard/hypermesh`), and Eyes follow. Eyes follow is off unless that menu row turns it on. The choice is stored in `~/.config/hypermesh/companion.toml` as `eyes_follow_pointer`. While a session is open and the option is on, the pupils track the pointer and the purpose and verb stay on the label. Idle eyes do not follow the pointer.
+
+Login opens `https://hyperme.sh/oauth/desktop`, which redirects the browser to the existing Keycloak authorization endpoint. Keycloak sends the code to `http://127.0.0.1:3000/callback`. The companion exchanges that code and asks `POST /api/v1/api-keys` for a renter key. The key is written to `~/.config/hypermesh/credentials` (mode `0600`) and the tenant id to `~/.config/hypermesh/config.toml`, which is where `hypermesh auth` reads them. `HYPERMESH_CONFIG_DIR` and `XDG_CONFIG_HOME` override the directory. That file is not the visor session vault. The companion never posts the key, or a supervisor API key, to the visor. It only `GET`s `http://127.0.0.1:9847/companion`.
+
+The window uses X11, including XWayland. It needs `DISPLAY`.
 
 ```bash
 curl -s -X POST http://127.0.0.1:9847/session \
