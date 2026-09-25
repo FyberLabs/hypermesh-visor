@@ -1,0 +1,19 @@
+[package]
+name = "hypermesh-companion"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Linux desktop companion for Hypermesh"
+publish = false
+
+[[bin]]
+name = "hypermesh-companion"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+png = "0.17"
+serde_json = "1"
+sha2 = "0.10"
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+x11rb = "0.13"

@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "companion"]
+resolver = "2"
+
 [package]
 name = "hypermesh-visor"
 version = "0.1.0"
