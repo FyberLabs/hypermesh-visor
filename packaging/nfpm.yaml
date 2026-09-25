@@ -1,0 +1,20 @@
+# Package metadata for hypermesh-visor. The release workflow fills VERSION,
+# NFPM_ARCH (amd64 or arm64), and BINARY. nfpm maps those Debian arch names
+# onto x86_64 and aarch64 for the RPM.
+name: hypermesh-visor
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+version_schema: none
+release: "1"
+section: utils
+priority: optional
+maintainer: Fyber Labs <github@fyberlabs.com>
+description: Linux desktop visor for Hypermesh
+homepage: https://github.com/FyberLabs/hypermesh-visor
+contents:
+  - src: ${BINARY}
+    dst: /usr/bin/hypermesh-visor
+    expand: true
+    file_info:
+      mode: 0755
