@@ -1,7 +1,10 @@
 mod audio;
+mod fixture;
 pub(crate) mod pixels;
 mod wayland;
 mod x11;
+
+pub use fixture::FixtureDesktop;
 
 use std::sync::Mutex;
 
