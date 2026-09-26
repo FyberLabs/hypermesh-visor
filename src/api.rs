@@ -38,8 +38,20 @@ impl AppState {
         Self::assemble(desktop, watch_poll, prompt::PromptPass::unconfigured())
     }
 
-    /// `door` is the cloud-agent pass-through. The desktop daemon uses
-    /// [`prompt::PromptPass::unconfigured`] and does not call a model.
+    pub fn with_orchestrator(
+        desktop: Arc<dyn Desktop>,
+        watch_poll: Duration,
+        config: prompt::DoorConfig,
+    ) -> Result<Self, String> {
+        Ok(Self::assemble(
+            desktop,
+            watch_poll,
+            prompt::PromptPass::open(&config)?,
+        ))
+    }
+
+    /// `door` is one cloud-agent pass-through. The desktop daemon uses
+    /// [`prompt::PromptPass::unconfigured`] unless a supervisor URL is set.
     pub fn with_prompt_door(
         desktop: Arc<dyn Desktop>,
         watch_poll: Duration,
@@ -78,11 +90,25 @@ impl AppState {
         true
     }
 
-    fn deliver_stream(&self, id: Uuid, body: &str) -> Result<String, StreamError> {
-        let mut sessions = lock(&self.sessions);
-        let session = sessions.get_mut(&id).ok_or(StreamError::Closed)?;
-        let acks = stream::deliver(session, body)?;
-        stream::render(&acks)
+    fn deliver_stream(&self, id: Uuid, body: &str, api_key: &str) -> Result<String, StreamError> {
+        let (parked, mut secrets) = {
+            let mut sessions = lock(&self.sessions);
+            let session = sessions.get_mut(&id).ok_or(StreamError::Closed)?;
+            let parked = stream::deliver(session, body)?;
+            let secrets = stream::vault_needles(session);
+            (parked, secrets)
+        };
+        let prompts = parked
+            .prompts
+            .iter()
+            .map(|prompt| (prompt.prompt.clone(), prompt.model.clone()))
+            .collect::<Vec<_>>();
+        self.prompts
+            .drive_parked(&prompts, &parked.file_texts, api_key, &secrets);
+        for secret in &mut secrets {
+            secret.zeroize();
+        }
+        stream::render(&parked.acks)
     }
 
     fn session_inbox(&self, id: Uuid) -> Option<stream::Inbox> {
@@ -543,7 +569,7 @@ async fn session_stream(
             return Err(ApiError::bad("stream body is not utf-8"));
         }
     };
-    let rendered = match state.deliver_stream(id, &text) {
+    let rendered = match state.deliver_stream(id, &text, &api_key) {
         Ok(rendered) => rendered,
         Err(err) => {
             api_key.zeroize();
@@ -665,7 +691,7 @@ impl ApiError {
     fn from_prompt(err: PromptError) -> Self {
         let status = match &err {
             PromptError::MissingKey | PromptError::InvalidKey { .. } => StatusCode::UNAUTHORIZED,
-            PromptError::EmptyPrompt => StatusCode::BAD_REQUEST,
+            PromptError::EmptyPrompt | PromptError::UnknownModel => StatusCode::BAD_REQUEST,
             PromptError::Door(_) => StatusCode::BAD_GATEWAY,
         };
         Self {
@@ -1174,7 +1200,10 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].api_key, "org_fixture_ok");
         assert_eq!(calls[0].prompt, "count the sheep");
-        assert_eq!(calls[0].model, None);
+        assert_eq!(
+            calls[0].model.as_deref(),
+            Some(crate::prompt::DEFAULT_CATALOG_ID)
+        );
 
         let (status, _, body) = send(addr, "GET", "/audit", None).await;
         assert_eq!(status, 200);
@@ -1185,6 +1214,7 @@ mod tests {
         assert_eq!(audit[0]["passed_through"], true);
         assert_eq!(audit[0]["outcome"], "forwarded");
         assert_eq!(audit[0]["response"], "baa");
+        assert_eq!(audit[0]["model"], crate::prompt::DEFAULT_CATALOG_ID);
     }
 
     #[tokio::test]
@@ -1403,6 +1433,9 @@ mod tests {
         assert!(inbox["secrets"].as_array().unwrap().is_empty());
         assert!(!String::from_utf8_lossy(&body).contains("stream-secret-value"));
         assert!(!String::from_utf8_lossy(&body).contains("org_fixture_ok"));
+
+        let (_, _, body) = send(addr, "GET", "/audit", None).await;
+        assert_eq!(body.as_ref(), b"[]");
     }
 
     #[tokio::test]
@@ -1439,5 +1472,67 @@ mod tests {
         assert_eq!(inbox["files"][0]["bytes"], 5);
         assert_eq!(inbox["files"][0]["content_base64"], "aGVsbG8=");
         assert_eq!(inbox["secrets"][0]["handle"], "token");
+    }
+
+    #[tokio::test]
+    async fn unknown_model_is_rejected_before_the_door() {
+        let door = crate::prompt::RecordingDoor::ok("baa");
+        let addr = spawn_with_door(door.clone()).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/prompt",
+            Some(
+                r#"{"prompt":"count the sheep","api_key":"org_fixture_ok","model":"not-a-model"}"#
+                    .into(),
+            ),
+        )
+        .await;
+        assert_eq!(status, 400);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("unknown model"));
+        assert!(!text.contains("org_fixture_ok"));
+        assert!(door.calls().is_empty());
+        let (_, _, body) = send(addr, "GET", "/audit", None).await;
+        let audit: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(audit[0]["outcome"], "rejected");
+        assert!(audit[0].get("door").is_none());
+    }
+
+    #[tokio::test]
+    async fn stream_prompt_reaches_the_door_and_stays_on_the_inbox() {
+        let door = crate::prompt::RecordingDoor::ok("baa");
+        let addr = spawn_with_door(door.clone()).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, body) = send_key(
+            addr,
+            "POST",
+            &format!("/session/{id}/stream"),
+            Some("org_fixture_ok"),
+            Some(
+                "{\"kind\":\"prompt\",\"prompt\":\"count the sheep\"}\n{\"kind\":\"file\",\"name\":\"note.txt\",\"content_base64\":\"aGVsbG8=\"}\n"
+                    .into(),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(!String::from_utf8_lossy(&body).contains("org_fixture_ok"));
+        assert_eq!(door.calls().len(), 1);
+        assert_eq!(door.calls()[0].prompt, "count the sheep");
+        assert_eq!(
+            door.calls()[0].model.as_deref(),
+            Some(crate::prompt::DEFAULT_CATALOG_ID)
+        );
+        let (status, body) =
+            send_key(addr, "GET", &format!("/session/{id}/inbox"), None, None).await;
+        assert_eq!(status, 200);
+        let inbox: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(inbox["prompts"][0]["prompt"], "count the sheep");
+        assert!(inbox["prompts"][0].get("model").is_none());
+        assert_eq!(inbox["files"][0]["name"], "note.txt");
+        let (_, _, body) = send(addr, "GET", "/audit", None).await;
+        let audit: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(audit[0]["outcome"], "forwarded");
+        assert_eq!(audit[0]["model"], crate::prompt::DEFAULT_CATALOG_ID);
     }
 }
