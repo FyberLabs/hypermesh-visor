@@ -23,6 +23,7 @@ use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
 use crate::input::{plan_type, MouseOp, PlanError, TypeBody};
 use crate::prompt::{self, AuditRecord, PromptError};
 use crate::session::{Session, Verb};
+use crate::stream::{self, StreamError};
 use crate::vault::{SecretRequest, Vault, VaultError};
 
 pub struct AppState {
@@ -77,6 +78,17 @@ impl AppState {
         true
     }
 
+    fn deliver_stream(&self, id: Uuid, body: &str) -> Result<String, StreamError> {
+        let mut sessions = lock(&self.sessions);
+        let session = sessions.get_mut(&id).ok_or(StreamError::Closed)?;
+        let acks = stream::deliver(session, body)?;
+        stream::render(&acks)
+    }
+
+    fn session_inbox(&self, id: Uuid) -> Option<stream::Inbox> {
+        lock(&self.sessions).get(&id).map(stream::inbox)
+    }
+
     /// Purpose and current verb for the desktop companion.
     /// The CLI auth key is not a session secret and is not included.
     fn companion_session(&self) -> Option<CompanionSession> {
@@ -116,6 +128,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session/:id/type", post(type_keys))
         .route("/prompt", post(submit_prompt))
         .route("/audit", get(list_audit))
+        .route("/session/:id/stream", post(session_stream))
+        .route("/session/:id/inbox", get(session_inbox))
         .with_state(state)
 }
 
@@ -487,6 +501,83 @@ async fn list_audit(State(state): State<Arc<AppState>>) -> Json<Vec<AuditRecord>
     Json(state.prompts.audit())
 }
 
+/// Ongoing input for a session that is already open.
+/// The API key is the `X-Api-Key` header. It is checked before the body is read.
+async fn session_stream(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> Result<Response, ApiError> {
+    let mut api_key = headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    if let Err(err) = stream::gate(&api_key) {
+        api_key.zeroize();
+        return Err(ApiError::from_stream(err));
+    }
+    let id = match parse_id(&id) {
+        Ok(id) => id,
+        Err(err) => {
+            api_key.zeroize();
+            return Err(err);
+        }
+    };
+    if !state.has_session(id) {
+        api_key.zeroize();
+        return Err(ApiError::missing());
+    }
+    let bytes = match axum::body::to_bytes(body, stream::MAX_STREAM_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            api_key.zeroize();
+            return Err(ApiError::bad("stream body is too large"));
+        }
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => {
+            api_key.zeroize();
+            return Err(ApiError::bad("stream body is not utf-8"));
+        }
+    };
+    let rendered = match state.deliver_stream(id, &text) {
+        Ok(rendered) => rendered,
+        Err(err) => {
+            api_key.zeroize();
+            return Err(ApiError::from_stream(err));
+        }
+    };
+    let rendered = redact_key(&rendered, &api_key);
+    api_key.zeroize();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/x-ndjson")
+        .body(Body::from(rendered))
+        .map_err(|_| ApiError::internal("response"))
+}
+
+async fn session_inbox(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<stream::Inbox>, ApiError> {
+    let id = parse_id(&id)?;
+    state
+        .session_inbox(id)
+        .map(Json)
+        .ok_or_else(ApiError::missing)
+}
+
+fn redact_key(text: &str, key: &str) -> String {
+    let key = key.trim();
+    if key.is_empty() {
+        return text.to_string();
+    }
+    text.replace(key, "***")
+}
+
 #[derive(Deserialize)]
 struct WatchQuery {
     #[serde(default)]
@@ -580,6 +671,16 @@ impl ApiError {
         Self {
             status,
             message: err.to_string(),
+        }
+    }
+
+    fn from_stream(err: StreamError) -> Self {
+        match err {
+            StreamError::Key(err) => Self::from_prompt(err),
+            StreamError::Closed => Self::missing(),
+            StreamError::Vault(err) => Self::from_vault(err),
+            StreamError::Empty => Self::bad(err.to_string()),
+            StreamError::Bad(message) => Self::bad(message),
         }
     }
 
@@ -1214,5 +1315,129 @@ mod tests {
             .iter()
             .take(2)
             .all(|row| row["outcome"] == "rejected" && row["passed_through"] == false));
+    }
+
+    async fn send_key(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        api_key: Option<&str>,
+        body: Option<String>,
+    ) -> (u16, Bytes) {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (mut sender, conn) = handshake(TokioIo::new(stream)).await.unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        let payload = body.unwrap_or_default();
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("host", addr.to_string())
+            .header("content-type", "application/x-ndjson");
+        if let Some(api_key) = api_key {
+            request = request.header("x-api-key", api_key);
+        }
+        let request = request.body(Full::new(Bytes::from(payload))).unwrap();
+        let response = sender.send_request(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), response.into_body().collect())
+            .await
+            .expect("body timeout")
+            .unwrap()
+            .to_bytes();
+        (status, bytes)
+    }
+
+    fn stream_body() -> String {
+        "\
+{\"kind\":\"prompt\",\"prompt\":\"count the sheep\",\"api_key\":\"org_fixture_ok\"}
+{\"kind\":\"file\",\"name\":\"note.txt\",\"content_base64\":\"aGVsbG8=\"}
+{\"kind\":\"secret\",\"name\":\"token\",\"source\":\"local\",\"value\":\"stream-secret-value\"}
+"
+        .into()
+    }
+
+    #[tokio::test]
+    async fn stream_rejects_a_key_before_it_accepts_input() {
+        let addr = spawn(FakeDesktop::new()).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let path = format!("/session/{id}/stream");
+        let canary = stream_body();
+
+        let (status, body) = send_key(addr, "POST", &path, None, Some(canary.clone())).await;
+        assert_eq!(status, 401);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("api key is required"));
+        assert!(!text.contains("org_fixture_ok"));
+        assert!(!text.contains("stream-secret-value"));
+        assert!(!text.contains("count the sheep"));
+
+        let (status, body) = send_key(addr, "POST", &path, Some("   "), Some(canary.clone())).await;
+        assert_eq!(status, 401);
+        assert!(String::from_utf8_lossy(&body).contains("api key is required"));
+
+        for key in [
+            "hm_dev_fixture_tail",
+            "hm_rtr_fixture_tail",
+            "hm_site_fixture_tail",
+        ] {
+            let (status, body) =
+                send_key(addr, "POST", &path, Some(key), Some(canary.clone())).await;
+            assert_eq!(status, 401);
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            let prefix = key.split("_fixture").next().unwrap();
+            let prefix = format!("{prefix}_");
+            assert!(text.contains(&prefix));
+            assert!(!text.contains("fixture_tail"));
+            assert!(!text.contains("stream-secret-value"));
+            assert!(!text.contains("count the sheep"));
+        }
+
+        let (status, body) =
+            send_key(addr, "GET", &format!("/session/{id}/inbox"), None, None).await;
+        assert_eq!(status, 200);
+        let inbox: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(inbox["prompts"].as_array().unwrap().is_empty());
+        assert!(inbox["files"].as_array().unwrap().is_empty());
+        assert!(inbox["secrets"].as_array().unwrap().is_empty());
+        assert!(!String::from_utf8_lossy(&body).contains("stream-secret-value"));
+        assert!(!String::from_utf8_lossy(&body).contains("org_fixture_ok"));
+    }
+
+    #[tokio::test]
+    async fn stream_delivers_a_prompt_and_a_file_onto_an_open_session() {
+        let addr = spawn(FakeDesktop::new()).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let path = format!("/session/{id}/stream");
+        let (status, body) = send_key(
+            addr,
+            "POST",
+            &path,
+            Some("org_fixture_ok"),
+            Some(stream_body()),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("org_fixture_ok"));
+        assert!(!text.contains("stream-secret-value"));
+        assert!(text.contains("\"kind\":\"prompt\""));
+        assert!(text.contains("\"name\":\"note.txt\""));
+        assert!(text.contains("\"handle\":\"token\""));
+
+        let (status, body) =
+            send_key(addr, "GET", &format!("/session/{id}/inbox"), None, None).await;
+        assert_eq!(status, 200);
+        let inbox_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!inbox_text.contains("org_fixture_ok"));
+        assert!(!inbox_text.contains("stream-secret-value"));
+        let inbox: serde_json::Value = serde_json::from_str(&inbox_text).unwrap();
+        assert_eq!(inbox["prompts"][0]["prompt"], "count the sheep");
+        assert!(inbox["prompts"][0].get("model").is_none());
+        assert_eq!(inbox["files"][0]["name"], "note.txt");
+        assert_eq!(inbox["files"][0]["bytes"], 5);
+        assert_eq!(inbox["files"][0]["content_base64"], "aGVsbG8=");
+        assert_eq!(inbox["secrets"][0]["handle"], "token");
     }
 }

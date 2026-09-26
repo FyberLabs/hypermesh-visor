@@ -11,6 +11,7 @@ mod harness;
 mod input;
 mod prompt;
 mod session;
+mod stream;
 mod vault;
 
 pub use api::{serve, AppState};

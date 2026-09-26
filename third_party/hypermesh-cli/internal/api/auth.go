@@ -22,6 +22,15 @@ func ValidateRenterKey(key string) error {
 	return nil
 }
 
+// RedactKey removes a fixture or caller key from text that would otherwise be printed.
+func RedactKey(text, key string) string {
+	key = strings.TrimSpace(key)
+	if key == "" || text == "" {
+		return text
+	}
+	return strings.ReplaceAll(text, key, "***")
+}
+
 func MaskKey(key string) string {
 	if key == "" {
 		return ""

@@ -200,6 +200,27 @@ impl Vault {
             .find(|secret| secret.name == name)
             .map(|secret| Zeroizing::new(secret.value.to_vec()))
     }
+
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.secrets.iter().any(|secret| secret.name == name)
+    }
+
+    /// Adds one secret after the session is already open. The value stays in the vault.
+    pub(crate) fn insert(&mut self, request: &SecretRequest) -> Result<String, VaultError> {
+        if request.name.trim().is_empty() {
+            return Err(VaultError::EmptyName);
+        }
+        if self.contains(&request.name) {
+            return Err(VaultError::DuplicateName(request.name.clone()));
+        }
+        let value = materialize(request)?;
+        let name = request.name.clone();
+        self.secrets.push(StoredSecret {
+            name: name.clone(),
+            value,
+        });
+        Ok(name)
+    }
 }
 
 impl Drop for Vault {

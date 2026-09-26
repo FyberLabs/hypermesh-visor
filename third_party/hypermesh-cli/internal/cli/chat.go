@@ -45,16 +45,28 @@ func newChatCmd(r *run) *cobra.Command {
 }
 
 func newPromptCmd(r *run) *cobra.Command {
-	var leaseID, model, message, system string
+	var leaseID, model, message, system, sessionID, visor string
 	var script bool
 	cmd := &cobra.Command{
 		Use:   "prompt [text...]",
 		Short: "Non-interactive Full Model prompt; stdout is only the model text",
-		Long:  "POST {chat base}/v1/chat/completions. With --script, stdout is only the assistant text and the process exits 1 on failure. Diagnostics stay on stderr. Never calls the control-plane 409 stub.",
+		Long:  "POST {chat base}/v1/chat/completions. With --session, POST one prompt on the visor stream (X-Api-Key, and model only when --model is set). With --script, stdout is only the assistant text and the process exits 1 on failure. Diagnostics stay on stderr. Never calls the control-plane 409 stub.",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			text, err := messageOrStdin(message, args)
 			if err != nil {
 				return err
+			}
+			if strings.TrimSpace(sessionID) != "" || strings.TrimSpace(visor) != "" {
+				if strings.TrimSpace(sessionID) == "" {
+					return fmt.Errorf("session id is required")
+				}
+				return runVisorPrompt(r, cmd, visorPromptOpts{
+					SessionID: sessionID,
+					Visor:     visor,
+					Model:     model,
+					ModelSet:  cmd.Flags().Changed("model"),
+					Text:      text,
+				})
 			}
 			return runChat(r, cmd, chatOpts{
 				LeaseID: leaseID,
@@ -66,6 +78,8 @@ func newPromptCmd(r *run) *cobra.Command {
 		},
 	}
 	addChatFlags(cmd, &leaseID, &model, &message, &system, &script)
+	cmd.Flags().StringVar(&sessionID, "session", "", "open visor session that receives this prompt")
+	cmd.Flags().StringVar(&visor, "visor", "", "visor base URL (default http://127.0.0.1:9847 or HYPERMESH_VISOR_URL)")
 	return cmd
 }
 
@@ -104,6 +118,37 @@ func addChatFlags(cmd *cobra.Command, leaseID, model, message, system *string, s
 	cmd.Flags().StringVar(message, "message", "", "user message (omit to read remaining args or stdin)")
 	cmd.Flags().StringVar(system, "system", "", "optional system message")
 	cmd.Flags().BoolVar(script, "script", false, "non-interactive: stdout is only the model text; exit 1 on failure")
+}
+
+type visorPromptOpts struct {
+	SessionID string
+	Visor     string
+	Model     string
+	ModelSet  bool
+	Text      string
+}
+
+func runVisorPrompt(r *run, cmd *cobra.Command, opt visorPromptOpts) error {
+	visor := strings.TrimSpace(opt.Visor)
+	if visor == "" {
+		visor = strings.TrimSpace(os.Getenv("HYPERMESH_VISOR_URL"))
+	}
+	if visor == "" {
+		visor = api.DefaultVisorBase
+	}
+	model := ""
+	if opt.ModelSet {
+		model = opt.Model
+	}
+	raw, err := r.client.PostVisorPrompt(visor, opt.SessionID, opt.Text, model)
+	if err != nil {
+		return fmt.Errorf("%s", api.RedactKey(err.Error(), r.cfg.APIKey))
+	}
+	text := api.RedactKey(string(raw), r.cfg.APIKey)
+	if strings.TrimSpace(text) == "" {
+		return fmt.Errorf("visor stream: empty response")
+	}
+	return writeModelText(cmd.OutOrStdout(), text)
 }
 
 func messageOrStdin(flag string, args []string) (string, error) {
