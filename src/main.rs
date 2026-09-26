@@ -8,6 +8,7 @@ use hypermesh_visor::{
     LinuxDesktop,
 };
 
+#[derive(Debug)]
 struct Options {
     listen: String,
     fixture_log: Option<std::path::PathBuf>,
