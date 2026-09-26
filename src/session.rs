@@ -87,6 +87,10 @@ impl Session {
         &self.mcp
     }
 
+    pub fn mcp_mut(&mut self) -> &mut McpBundle {
+        &mut self.mcp
+    }
+
     pub fn purpose(&self) -> &str {
         &self.harness.purpose
     }

@@ -36,6 +36,53 @@ pub(crate) fn find_keycode(map: &KeyMap, keysym: u32) -> Option<(u8, bool)> {
     None
 }
 
+/// Best-effort focused window WM_CLASS for MCP bindings.
+pub fn focused_wm_class(display: Option<&str>) -> Result<Option<String>, DesktopError> {
+    let (conn, screen_num) = connect(display)?;
+    let root = conn.setup().roots[screen_num].root;
+    let atom_active = intern(&conn, "_NET_ACTIVE_WINDOW")?;
+    let atom_wm_class = intern(&conn, "WM_CLASS")?;
+    let reply = conn
+        .get_property(false, root, atom_active, x11rb::protocol::xproto::AtomEnum::WINDOW, 0, 1)
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?;
+    if reply.value.len() < 4 {
+        return Ok(None);
+    }
+    let window = u32::from_ne_bytes([
+        reply.value[0],
+        reply.value[1],
+        reply.value[2],
+        reply.value[3],
+    ]);
+    if window == 0 {
+        return Ok(None);
+    }
+    let class = conn
+        .get_property(false, window, atom_wm_class, x11rb::protocol::xproto::AtomEnum::STRING, 0, 256)
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?;
+    let raw = String::from_utf8_lossy(&class.value);
+    // WM_CLASS is instance\0class\0 — prefer the class token.
+    let parts: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
+    let name = parts.last().copied().or_else(|| parts.first().copied());
+    Ok(name.map(str::to_string))
+}
+
+fn intern(
+    conn: &RustConnection,
+    name: &str,
+) -> Result<x11rb::protocol::xproto::Atom, DesktopError> {
+    Ok(conn
+        .intern_atom(false, name.as_bytes())
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?
+        .atom)
+}
+
 pub fn capture(display: Option<&str>) -> Result<Frame, DesktopError> {
     let (conn, screen_num) = connect(display)?;
     let screen = &conn.setup().roots[screen_num];

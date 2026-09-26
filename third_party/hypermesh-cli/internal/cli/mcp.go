@@ -20,6 +20,7 @@ func newMCPCmd(r *run) *cobra.Command {
 	cmd.AddCommand(newMCPImportCmd(r))
 	cmd.AddCommand(newMCPDoctorCmd(r))
 	cmd.AddCommand(newMCPListCmd(r))
+	cmd.AddCommand(newMCPBindingsCmd(r))
 	return cmd
 }
 
@@ -374,4 +375,71 @@ func summarizeServer(server mcp.Server) string {
 	default:
 		return server.URL
 	}
+}
+
+func newMCPBindingsCmd(r *run) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "bindings",
+		Short: "Focused-app → MCP server bindings for companion prefer-MCP",
+	}
+	cmd.AddCommand(&cobra.Command{
+		Use:   "ls",
+		Short: "List bindings from mcp-bindings.json",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store := r.mcpStore()
+			file, err := store.LoadBindings()
+			if err != nil {
+				return err
+			}
+			if r.json {
+				return r.printJSON(file)
+			}
+			if len(file.Bindings) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "(no bindings)")
+				return nil
+			}
+			for _, b := range file.Bindings {
+				matcher := firstNonEmpty(b.WMClass, b.AppID, b.Executable)
+				fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\n", b.Server, matcher)
+			}
+			return nil
+		},
+	})
+	var wmClass, appID, executable string
+	add := &cobra.Command{
+		Use:   "add [server]",
+		Short: "Add a binding (needs --wm-class, --app-id, or --executable)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store := r.mcpStore()
+			b := mcp.Binding{
+				Server:     args[0],
+				WMClass:    wmClass,
+				AppID:      appID,
+				Executable: executable,
+			}
+			if err := store.AddBinding(b); err != nil {
+				return err
+			}
+			if r.json {
+				return r.printJSON(map[string]any{"ok": true, "binding": b})
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "bound %s\n", args[0])
+			return nil
+		},
+	}
+	add.Flags().StringVar(&wmClass, "wm-class", "", "X11 WM_CLASS match")
+	add.Flags().StringVar(&appID, "app-id", "", "Wayland/app id match")
+	add.Flags().StringVar(&executable, "executable", "", "executable name match")
+	cmd.AddCommand(add)
+	return cmd
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

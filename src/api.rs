@@ -22,7 +22,10 @@ use zeroize::Zeroize;
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
 use crate::input::{plan_type, MouseOp, PlanError, TypeBody};
-use crate::mcp::{self, McpError, ToolInfo};
+use crate::mcp::{
+    self, companion_mode, load_bindings, resolve_preferred, FocusedApp, McpAuditRow, McpAuditor,
+    McpError, ToolInfo,
+};
 use crate::prompt::{self, AuditRecord, PromptError};
 use crate::session::{Session, Verb};
 use crate::stream::{self, StreamError};
@@ -35,6 +38,7 @@ pub struct AppState {
     prompts: prompt::PromptPass,
     /// Directory for mcp.json / mcp-profiles.json. Defaults to the Hypermesh config dir.
     mcp_dir: PathBuf,
+    mcp_audit: Mutex<McpAuditor>,
 }
 
 impl AppState {
@@ -56,6 +60,7 @@ impl AppState {
             desktop,
             watch_poll,
             prompt::PromptPass::open(&config)?,
+            mcp::config_dir(),
         ))
     }
 
@@ -86,6 +91,7 @@ impl AppState {
             watch_poll,
             prompts,
             mcp_dir,
+            mcp_audit: Mutex::new(McpAuditor::default()),
         }
     }
 
@@ -131,23 +137,37 @@ impl AppState {
         lock(&self.sessions).get(&id).map(stream::inbox)
     }
 
-    /// Purpose and current verb for the desktop companion.
+    /// Purpose, verb, and prefer-MCP mode for the desktop companion.
     /// The CLI auth key is not a session secret and is not included.
     fn companion_session(&self) -> Option<CompanionSession> {
         let sessions = lock(&self.sessions);
         let session = sessions.values().max_by_key(|session| session.touched())?;
         let mcp_servers = session.mcp().server_names();
-        let mcp = if mcp_servers.is_empty() {
-            None
-        } else {
-            Some(mcp_servers[0].clone())
-        };
+        let healthy = session.mcp().healthy_server_names();
+        let focused = self
+            .desktop
+            .focused_app()
+            .ok()
+            .flatten()
+            .filter(|app| !app.is_empty());
+        let bindings = load_bindings(&self.mcp_dir)
+            .unwrap_or_default()
+            .bindings;
+        let preferred = focused
+            .as_ref()
+            .and_then(|app| resolve_preferred(app, &bindings, &healthy));
+        let verb = session.verb().map(Verb::as_str);
+        let mode = companion_mode(preferred.as_deref(), verb);
+        let prefer_mcp = preferred.is_some();
         Some(CompanionSession {
             id: session.id(),
             purpose: session.purpose().to_string(),
-            verb: session.verb().map(Verb::as_str),
-            mcp,
+            verb,
+            mode,
+            mcp: preferred,
             mcp_servers,
+            focused,
+            prefer_mcp,
         })
     }
 }
@@ -164,11 +184,17 @@ struct CompanionSession {
     id: Uuid,
     purpose: String,
     verb: Option<&'static str>,
-    /// Preferred MCP server id when tools are attached (v0: first attached).
+    /// Prefer-MCP display: `mcp:<id>` when a healthy binding matches, else the verb.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    /// Preferred healthy MCP server id for the focused app, when any.
     #[serde(skip_serializing_if = "Option::is_none")]
     mcp: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     mcp_servers: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    focused: Option<FocusedApp>,
+    prefer_mcp: bool,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -183,9 +209,11 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session/:id/type", post(type_keys))
         .route("/prompt", post(submit_prompt))
         .route("/audit", get(list_audit))
+        .route("/mcp-audit", get(list_mcp_audit))
         .route("/session/:id/stream", post(session_stream))
         .route("/session/:id/inbox", get(session_inbox))
         .route("/session/:id/mcp", get(session_mcp))
+        .route("/session/:id/mcp/call", post(mcp_call))
         .with_state(state)
 }
 
@@ -249,7 +277,28 @@ struct SessionMcpBody {
 struct SessionMcpServer {
     name: String,
     transport: String,
+    healthy: bool,
     tools: Vec<ToolInfo>,
+}
+
+#[derive(Deserialize)]
+struct McpCallRequest {
+    server: String,
+    tool: String,
+    /// `approve` or `deny`.
+    decision: String,
+    #[serde(default)]
+    arguments: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct McpCallResponse {
+    server: String,
+    tool: String,
+    decision: String,
+    outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<serde_json::Value>,
 }
 
 async fn open_session(
@@ -300,6 +349,7 @@ async fn session_mcp(
         .map(|server| SessionMcpServer {
             name: server.name.clone(),
             transport: server.transport.clone(),
+            healthy: server.is_healthy(),
             tools: server.tools.clone(),
         })
         .collect();
@@ -307,6 +357,77 @@ async fn session_mcp(
         profile: session.mcp().profile.clone(),
         servers,
     }))
+}
+
+async fn mcp_call(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<McpCallRequest>,
+) -> Result<Json<McpCallResponse>, ApiError> {
+    let id = parse_id(&id)?;
+    let decision = body.decision.trim().to_ascii_lowercase();
+    if decision != "approve" && decision != "deny" {
+        return Err(ApiError::bad("decision must be approve or deny"));
+    }
+    let server = body.server.trim().to_string();
+    let tool = body.tool.trim().to_string();
+    if server.is_empty() || tool.is_empty() {
+        return Err(ApiError::bad("server and tool are required"));
+    }
+
+    if decision == "deny" {
+        lock(&state.mcp_audit).record(McpAuditRow {
+            server: server.clone(),
+            tool: tool.clone(),
+            decision: "deny".into(),
+            outcome: "denied".into(),
+        });
+        return Ok(Json(McpCallResponse {
+            server,
+            tool,
+            decision: "deny".into(),
+            outcome: "denied".into(),
+            result: None,
+        }));
+    }
+
+    // Approve path: call the tool. Arguments are not written to the audit row.
+    let arguments = body.arguments;
+    let call_result = {
+        let mut sessions = lock(&state.sessions);
+        let session = sessions.get_mut(&id).ok_or_else(ApiError::missing)?;
+        session.mcp_mut().call_tool(&server, &tool, arguments)
+    };
+    match call_result {
+        Ok(result) => {
+            lock(&state.mcp_audit).record(McpAuditRow {
+                server: server.clone(),
+                tool: tool.clone(),
+                decision: "approve".into(),
+                outcome: "ok".into(),
+            });
+            Ok(Json(McpCallResponse {
+                server,
+                tool,
+                decision: "approve".into(),
+                outcome: "ok".into(),
+                result: Some(result),
+            }))
+        }
+        Err(err) => {
+            lock(&state.mcp_audit).record(McpAuditRow {
+                server: server.clone(),
+                tool: tool.clone(),
+                decision: "approve".into(),
+                outcome: "failed".into(),
+            });
+            Err(ApiError::from_mcp(err))
+        }
+    }
+}
+
+async fn list_mcp_audit(State(state): State<Arc<AppState>>) -> Json<Vec<McpAuditRow>> {
+    Json(lock(&state.mcp_audit).rows().to_vec())
 }
 
 async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
@@ -839,6 +960,7 @@ mod tests {
         views: AtomicUsize,
         audio_opens: AtomicUsize,
         root: AtomicBool,
+        focus: Mutex<Option<FocusedApp>>,
     }
 
     impl FakeDesktop {
@@ -851,7 +973,12 @@ mod tests {
                 views: AtomicUsize::new(0),
                 audio_opens: AtomicUsize::new(0),
                 root: AtomicBool::new(false),
+                focus: Mutex::new(None),
             })
+        }
+
+        fn set_focus(self: &Arc<Self>, focus: Option<FocusedApp>) {
+            *lock(&self.focus) = focus;
         }
     }
 
@@ -889,6 +1016,10 @@ mod tests {
         fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError> {
             lock(&self.typed).extend_from_slice(strokes);
             Ok(())
+        }
+
+        fn focused_app(&self) -> Result<Option<FocusedApp>, DesktopError> {
+            Ok(lock(&self.focus).clone())
         }
     }
 
@@ -1024,6 +1155,8 @@ while True:
         pass
     elif method == "tools/list":
         send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"pong"}]}})
 "#,
         )
         .unwrap();
@@ -1044,8 +1177,15 @@ while True:
             r#"{"active":"default","profiles":{"default":{"servers":["fixture"]}}}"#,
         )
         .unwrap();
+        // Prefer-MCP needs a binding + focused app; without focus, mode falls back to verb.
+        std::fs::write(
+            dir.join("mcp-bindings.json"),
+            r#"{"bindings":[{"server":"fixture","wm_class":"FixtureApp"}]}"#,
+        )
+        .unwrap();
 
-        let addr = spawn_with_mcp_dir(FakeDesktop::new(), dir.clone()).await;
+        let desktop = FakeDesktop::new();
+        let addr = spawn_with_mcp_dir(Arc::clone(&desktop), dir.clone()).await;
         let (status, text, id) = open_session_id(addr, serde_json::json!([])).await;
         assert_eq!(status, 201, "{text}");
         let opened: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -1058,11 +1198,81 @@ while True:
         let mcp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(mcp["profile"], "default");
         assert_eq!(mcp["servers"][0]["name"], "fixture");
+        assert_eq!(mcp["servers"][0]["healthy"], true);
         assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
 
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(companion["session"]["prefer_mcp"], false);
+        assert!(companion["session"].get("mcp").is_none() || companion["session"]["mcp"].is_null());
+
+        desktop.set_focus(Some(FocusedApp {
+            wm_class: Some("FixtureApp".into()),
+            app_id: None,
+            executable: None,
+        }));
+        let (status, _, _) = send(addr, "POST", &format!("/session/{id}/mouse"), Some(
+            r#"{"action":"move","x":1,"y":2}"#.into(),
+        )).await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(companion["session"]["prefer_mcp"], true);
         assert_eq!(companion["session"]["mcp"], "fixture");
+        assert_eq!(companion["session"]["mode"], "mcp:fixture");
+        assert_eq!(companion["session"]["verb"], "mouse");
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mcp/call"),
+            Some(
+                serde_json::json!({
+                    "server": "fixture",
+                    "tool": "ping",
+                    "decision": "deny",
+                    "arguments": {"secret": "should-not-be-audited"}
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let denied: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(denied["outcome"], "denied");
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mcp/call"),
+            Some(
+                serde_json::json!({
+                    "server": "fixture",
+                    "tool": "ping",
+                    "decision": "approve",
+                    "arguments": {}
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&body));
+        let approved: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(approved["outcome"], "ok");
+        assert_eq!(approved["result"]["content"][0]["text"], "pong");
+
+        let (status, _, body) = send(addr, "GET", "/mcp-audit", None).await;
+        assert_eq!(status, 200);
+        let audit: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let audit_text = String::from_utf8_lossy(&body);
+        assert!(!audit_text.contains("should-not-be-audited"));
+        assert!(!audit_text.contains("secret"));
+        assert_eq!(audit.as_array().unwrap().len(), 2);
+        assert_eq!(audit[0]["decision"], "deny");
+        assert_eq!(audit[0]["tool"], "ping");
+        assert_eq!(audit[0]["server"], "fixture");
+        assert_eq!(audit[1]["decision"], "approve");
+        assert_eq!(audit[1]["outcome"], "ok");
 
         let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
         assert_eq!(status, 204);

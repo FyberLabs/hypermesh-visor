@@ -111,10 +111,20 @@ pub fn render(
     let width = bug.w;
     let mut blocks: Vec<Block> = Vec::new();
     let mut y = bug.h as i32 + bob_room;
-    if let Pose::Active { purpose, verb } = pose {
+    if let Pose::Active {
+        purpose,
+        verb,
+        mode,
+    } = pose
+    {
+        // Prefer-MCP shows `mcp:<id>` on the mode line; mouse/type stay the verb fallback.
+        let mode_line = mode
+            .as_deref()
+            .or(verb.as_deref())
+            .unwrap_or("—");
         let lines = [
             format!("purpose: {}", sanitize(purpose)),
-            format!("verb: {}", verb.as_deref().unwrap_or("—")),
+            format!("verb: {}", sanitize(mode_line)),
         ];
         let card = text_card(width, 3, &lines, [7, 25, 61, 255], [255, 255, 255, 255]);
         blocks.push(Block {
@@ -218,6 +228,7 @@ pub fn dump_frames(dir: &Path) -> std::io::Result<()> {
         &Pose::Active {
             purpose: "review the desktop".into(),
             verb: Some("view".into()),
+            mode: Some("view".into()),
         },
         6,
         false,
@@ -758,6 +769,7 @@ mod tests {
             &Pose::Active {
                 purpose: "review the desktop".into(),
                 verb: Some("view".into()),
+                mode: Some("view".into()),
             },
             6,
             false,
@@ -770,6 +782,7 @@ mod tests {
             &Pose::Active {
                 purpose: "review the desktop".into(),
                 verb: Some("listen".into()),
+                mode: Some("listen".into()),
             },
             6,
             false,
@@ -791,6 +804,7 @@ mod tests {
         let active = Pose::Active {
             purpose: "review the desktop".into(),
             verb: Some("view".into()),
+            mode: Some("view".into()),
         };
         let still = render(&sprites, &active, 6, false, None, false, Some((0, 80)));
         let ignored = render(&sprites, &active, 6, false, None, false, Some((390, 80)));
