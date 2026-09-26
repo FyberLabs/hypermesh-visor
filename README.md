@@ -2,7 +2,9 @@
 
 `hypermesh-visor` is a local Linux daemon a supervisor starts for a desktop session. Open a session, then call view, watch, listen, mouse, and type. Calls without a live session fail. It is not a virtual machine. This version is Linux only.
 
-Purpose, recipes, agent, skills, and secrets are sent when the session opens. Only secrets included in that call are loaded. URL, MCP, chain, and IPFS sources are part of the session call and are not fetched.
+Purpose, recipes, agent, skills, and secrets are sent when the session opens. Only secrets included in that call are loaded. URL, MCP, chain, and IPFS *secret* sources are part of the session call and are not fetched (vault role B stays last on v1).
+
+Optional `mcp_profile` on `POST /session` attaches local MCP *tool* servers from `~/.config/hypermesh/mcp.json` and `mcp-profiles.json` (same files as `hypermesh mcp`). Stdio servers are spawned, initialized, and `tools/list` is called. Closing the session kills those children. `GET /session/{id}/mcp` returns the attached profile, servers, and tools. `GET /companion` includes `mcp` / `mcp_servers` when tools are attached.
 
 ## Linux build and tests
 

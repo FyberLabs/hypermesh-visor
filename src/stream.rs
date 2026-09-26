@@ -317,7 +317,12 @@ mod tests {
                 instructions: String::new(),
             }],
         };
-        Session::create(Uuid::new_v4(), harness, Vault::open(&[]).unwrap())
+        Session::create(
+            Uuid::new_v4(),
+            harness,
+            Vault::open(&[]).unwrap(),
+            crate::mcp::McpBundle::default(),
+        )
     }
 
     fn delivery() -> String {
