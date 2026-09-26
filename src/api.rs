@@ -2,6 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,11 +33,18 @@ pub struct AppState {
     desktop: Arc<dyn Desktop>,
     watch_poll: Duration,
     prompts: prompt::PromptPass,
+    /// Directory for mcp.json / mcp-profiles.json. Defaults to the Hypermesh config dir.
+    mcp_dir: PathBuf,
 }
 
 impl AppState {
     pub fn new(desktop: Arc<dyn Desktop>, watch_poll: Duration) -> Self {
-        Self::assemble(desktop, watch_poll, prompt::PromptPass::unconfigured())
+        Self::assemble(
+            desktop,
+            watch_poll,
+            prompt::PromptPass::unconfigured(),
+            mcp::config_dir(),
+        )
     }
 
     /// `door` is the cloud-agent pass-through. The desktop daemon uses
@@ -46,19 +54,26 @@ impl AppState {
         watch_poll: Duration,
         door: Arc<dyn prompt::PromptDoor>,
     ) -> Self {
-        Self::assemble(desktop, watch_poll, prompt::PromptPass::new(door))
+        Self::assemble(
+            desktop,
+            watch_poll,
+            prompt::PromptPass::new(door),
+            mcp::config_dir(),
+        )
     }
 
     fn assemble(
         desktop: Arc<dyn Desktop>,
         watch_poll: Duration,
         prompts: prompt::PromptPass,
+        mcp_dir: PathBuf,
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             desktop,
             watch_poll,
             prompts,
+            mcp_dir,
         }
     }
 
@@ -224,8 +239,9 @@ async fn open_session(
     harness.validate().map_err(ApiError::from_harness)?;
     let vault = Vault::open(&req.secrets).map_err(ApiError::from_vault)?;
     let profile = req.mcp_profile.clone();
+    let mcp_dir = state.mcp_dir.clone();
     let mcp = tokio::task::spawn_blocking(move || {
-        mcp::attach_profile(&mcp::config_dir(), profile.as_deref())
+        mcp::attach_profile(&mcp_dir, profile.as_deref())
     })
     .await
     .map_err(|_| ApiError::internal("mcp attach task failed"))?
@@ -851,9 +867,15 @@ mod tests {
     }
 
     async fn spawn(desktop: Arc<FakeDesktop>) -> SocketAddr {
+        spawn_with_mcp_dir(desktop, std::env::temp_dir().join("hypermesh-mcp-empty")).await
+    }
+
+    async fn spawn_with_mcp_dir(desktop: Arc<FakeDesktop>, mcp_dir: PathBuf) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = Arc::new(AppState::new(desktop, Duration::from_millis(20)));
+        let mut state = AppState::new(desktop, Duration::from_millis(20));
+        state.mcp_dir = mcp_dir;
+        let state = Arc::new(state);
         tokio::spawn(async move {
             axum::serve(listener, router(state)).await.unwrap();
         });
@@ -996,9 +1018,8 @@ while True:
             r#"{"active":"default","profiles":{"default":{"servers":["fixture"]}}}"#,
         )
         .unwrap();
-        std::env::set_var("HYPERMESH_CONFIG_DIR", &dir);
 
-        let addr = spawn(FakeDesktop::new()).await;
+        let addr = spawn_with_mcp_dir(FakeDesktop::new(), dir.clone()).await;
         let (status, text, id) = open_session_id(addr, serde_json::json!([])).await;
         assert_eq!(status, 201, "{text}");
         let opened: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -1019,7 +1040,6 @@ while True:
 
         let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
         assert_eq!(status, 204);
-        std::env::remove_var("HYPERMESH_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

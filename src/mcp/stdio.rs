@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -270,6 +269,7 @@ fn read_msg(name: &str, reader: &mut BufReader<ChildStdout>) -> Result<Value, Mc
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
