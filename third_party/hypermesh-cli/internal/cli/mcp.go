@@ -163,7 +163,7 @@ func newMCPProfileCmd(r *run) *cobra.Command {
 			return nil
 		},
 	})
-	cmd.AddCommand(&cobra.Command{
+	addCmd := &cobra.Command{
 		Use:   "add [server]",
 		Short: "Add a configured or catalog server to a profile",
 		Args:  cobra.ExactArgs(1),
@@ -178,15 +178,19 @@ func newMCPProfileCmd(r *run) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			var catalogEntry mcp.CatalogEntry
 			if _, ok := servers.Servers[serverID]; !ok {
 				entry, ok := mcp.CatalogByID(serverID)
 				if !ok {
 					return fmt.Errorf("unknown server %q (configure it in mcp.json or use a catalog id)", serverID)
 				}
+				catalogEntry = entry
 				servers.Servers[serverID] = entry.Server
 				if err := store.SaveServers(servers); err != nil {
 					return err
 				}
+			} else if entry, ok := mcp.CatalogByID(serverID); ok {
+				catalogEntry = entry
 			}
 			profiles, err := store.LoadProfiles()
 			if err != nil {
@@ -207,21 +211,68 @@ func newMCPProfileCmd(r *run) *cobra.Command {
 			if err := store.SaveProfiles(profiles); err != nil {
 				return err
 			}
+			for _, b := range mcp.BindingsFromMatchers(serverID, catalogEntry.Matchers) {
+				_ = store.AddBinding(b)
+			}
 			if r.json {
 				return r.printJSON(map[string]any{"ok": true, "profile": name, "server": serverID})
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "added %s to profile %s\n", serverID, name)
 			return nil
 		},
-	})
-	add := cmd.Commands()[len(cmd.Commands())-1]
-	add.Flags().String("profile", "", "profile name (default: active)")
+	}
+	addCmd.Flags().String("profile", "", "profile name (default: active)")
+	cmd.AddCommand(addCmd)
 
-	cmd.AddCommand(&cobra.Command{
+	gatewayCmd := &cobra.Command{
+		Use:   "gateway [on|off]",
+		Short: "Use the Docker MCP gateway as the sole attach for a profile",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			profileName, _ := cmd.Flags().GetString("profile")
+			store := r.mcpStore()
+			if err := store.Ensure(); err != nil {
+				return err
+			}
+			profiles, err := store.LoadProfiles()
+			if err != nil {
+				return err
+			}
+			name := profileName
+			if name == "" {
+				name = profiles.Active
+			}
+			profile, ok := profiles.Profiles[name]
+			if !ok {
+				return fmt.Errorf("profile %q not found", name)
+			}
+			switch strings.ToLower(strings.TrimSpace(args[0])) {
+			case "on", "true", "1":
+				profile.Gateway = true
+			case "off", "false", "0":
+				profile.Gateway = false
+			default:
+				return fmt.Errorf("expected on or off")
+			}
+			profiles.Profiles[name] = profile
+			if err := store.SaveProfiles(profiles); err != nil {
+				return err
+			}
+			if r.json {
+				return r.printJSON(map[string]any{"ok": true, "profile": name, "gateway": profile.Gateway})
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "profile %s gateway=%v\n", name, profile.Gateway)
+			return nil
+		},
+	}
+	gatewayCmd.Flags().String("profile", "", "profile name (default: active)")
+	cmd.AddCommand(gatewayCmd)
+
+	configCmd := &cobra.Command{
 		Use:   "config",
 		Short: "Set or show per-server profile config",
-	})
-	configCmd := cmd.Commands()[len(cmd.Commands())-1]
+	}
+	configCmd.PersistentFlags().String("profile", "", "profile name (default: active)")
 	configCmd.AddCommand(&cobra.Command{
 		Use:   "set [server.key=value]",
 		Short: "Set profile config, e.g. filesystem.cwd=/tmp",
@@ -271,14 +322,14 @@ func newMCPProfileCmd(r *run) *cobra.Command {
 			return nil
 		},
 	})
-	configCmd.PersistentFlags().String("profile", "", "profile name (default: active)")
+	cmd.AddCommand(configCmd)
 	return cmd
 }
 
 func newMCPImportCmd(r *run) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "import",
-		Short: "Import Cursor mcp.json or Docker MCP gateway",
+		Short: "Import Cursor, project, or Docker MCP gateway config",
 	}
 	cmd.AddCommand(&cobra.Command{
 		Use:   "cursor [path]",
@@ -320,6 +371,33 @@ func newMCPImportCmd(r *run) *cobra.Command {
 				return r.printJSON(map[string]any{"ok": true, "server": id, "config_dir": r.cfg.Dir})
 			}
 			fmt.Fprintf(cmd.OutOrStdout(), "added %s to active profile\n", id)
+			return nil
+		},
+	})
+	cmd.AddCommand(&cobra.Command{
+		Use:   "project [path]",
+		Short: "Merge project .hypermesh/mcp.json or .cursor/mcp.json",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			store := r.mcpStore()
+			var added []string
+			var err error
+			if len(args) == 1 {
+				added, err = store.ImportProject(args[0])
+			} else {
+				added, err = store.ImportProject()
+			}
+			if err != nil {
+				return err
+			}
+			if r.json {
+				return r.printJSON(map[string]any{"ok": true, "added": added, "config_dir": r.cfg.Dir})
+			}
+			if len(added) == 0 {
+				fmt.Fprintln(cmd.OutOrStdout(), "imported; no new servers")
+				return nil
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "imported %s\n", strings.Join(added, ", "))
 			return nil
 		},
 	})

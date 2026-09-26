@@ -69,16 +69,26 @@ type ProfilesFile struct {
 
 // Profile is a named enabled set plus optional per-server config overrides.
 type Profile struct {
-	Servers []string                    `json:"servers"`
+	Servers []string                     `json:"servers"`
 	Config  map[string]map[string]string `json:"config,omitempty"`
+	// Gateway asks the visor to attach only the Docker MCP gateway process.
+	Gateway bool `json:"gateway,omitempty"`
+}
+
+// Matchers map focused apps to this catalog server (written into mcp-bindings.json).
+type Matchers struct {
+	WMClass    []string `json:"wm_class,omitempty"`
+	AppID      []string `json:"app_id,omitempty"`
+	Executable []string `json:"executable,omitempty"`
 }
 
 // CatalogEntry is a known server the CLI can add without inventing a command.
 type CatalogEntry struct {
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	Description string `json:"description"`
-	Server      Server `json:"server"`
+	ID          string   `json:"id"`
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Server      Server   `json:"server"`
+	Matchers    Matchers `json:"matchers,omitempty"`
 }
 
 func decodeFile(raw []byte) (File, error) {

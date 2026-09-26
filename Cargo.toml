@@ -10,6 +10,10 @@ rust-version = "1.85"
 description = "Linux desktop visor for Hypermesh"
 publish = false
 
+[[bin]]
+name = "hypermesh-desktop-mcp"
+path = "src/bin/hypermesh-desktop-mcp.rs"
+
 [dependencies]
 axum = "0.7"
 base64 = "0.22"

@@ -22,6 +22,8 @@ pub enum Action {
     OpenRent,
     OpenDashboard,
     ToggleEyes,
+    McpProfiles,
+    McpDoctor,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -157,6 +159,8 @@ pub fn render(
         };
         let rows = [
             ("Open CLI", Action::OpenCli),
+            ("MCP profiles", Action::McpProfiles),
+            ("MCP doctor", Action::McpDoctor),
             ("Login", Action::Login),
             ("Billing", Action::OpenBilling),
             ("Rent", Action::OpenRent),

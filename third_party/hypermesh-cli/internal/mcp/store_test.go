@@ -85,6 +85,69 @@ func TestImportDockerAddsGateway(t *testing.T) {
 	}
 }
 
+func TestImportProjectMergesHypermeshMCP(t *testing.T) {
+	root := t.TempDir()
+	hm := filepath.Join(root, ".hypermesh")
+	if err := os.MkdirAll(hm, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(hm, "mcp.json")
+	if err := WriteCursorSample(path, map[string]Server{
+		"project-fs": {Command: "true"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(filepath.Join(root, "config"))
+	added, err := store.ImportProject(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(added) != 1 || added[0] != "project-fs" {
+		t.Fatalf("added=%v", added)
+	}
+}
+
+func TestGatewayProfileReturnsOnlyGateway(t *testing.T) {
+	store := NewStore(t.TempDir())
+	_ = store.Ensure()
+	_ = store.SaveServers(File{Servers: map[string]Server{
+		"filesystem":     {Command: "true"},
+		"docker-gateway": {Command: "docker", Args: []string{"mcp", "gateway", "run"}},
+	}})
+	profiles := emptyProfiles()
+	profiles.Profiles["default"] = Profile{
+		Servers: []string{"filesystem"},
+		Gateway: true,
+	}
+	_ = store.SaveProfiles(profiles)
+	_, active, err := store.ActiveServers("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(active) != 1 {
+		t.Fatalf("active=%+v", active)
+	}
+	if _, ok := active["docker-gateway"]; !ok {
+		t.Fatalf("expected gateway only: %+v", active)
+	}
+}
+
+func TestBindingsFromMatchers(t *testing.T) {
+	got := BindingsFromMatchers("chrome", Matchers{
+		WMClass: []string{"google-chrome"},
+		AppID:   []string{"chromium"},
+	})
+	if len(got) != 2 {
+		t.Fatalf("got=%+v", got)
+	}
+	if got[0].Server != "chrome" || got[0].WMClass != "google-chrome" {
+		t.Fatalf("got[0]=%+v", got[0])
+	}
+	if got[1].AppID != "chromium" {
+		t.Fatalf("got[1]=%+v", got[1])
+	}
+}
+
 func TestDoctorStdioMissingCommand(t *testing.T) {
 	store := NewStore(t.TempDir())
 	_ = store.Ensure()

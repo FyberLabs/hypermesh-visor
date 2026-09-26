@@ -73,7 +73,14 @@ mod tests {
 
     #[test]
     fn fetches_secret_text_from_fixture_stdio() {
-        let dir = std::env::temp_dir().join(format!("hm-mcp-secret-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hm-mcp-secret-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let script = dir.join("secret-mcp.py");
