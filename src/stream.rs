@@ -1,9 +1,10 @@
 //! Open API-keyed stream for a session that is already running.
 //!
-//! `POST /prompt` still forwards one prompt through the supervisor door.
-//! This stream does not. After the session is open, a caller with `X-Api-Key`
-//! can deliver more prompts, secrets, and files. The key is checked before
-//! the body is parsed and before the session changes.
+//! After the session is open, a caller with `X-Api-Key` can deliver more
+//! prompts, secrets, and files. The key is checked before the body is parsed
+//! and before the session changes. A `kind: prompt` line is kept on the inbox
+//! and also enters [`crate::prompt::PromptPass`]. Secret and file lines stay
+//! off that door.
 
 use std::collections::HashSet;
 
@@ -135,17 +136,66 @@ pub(crate) fn gate(api_key: &str) -> Result<(), StreamError> {
 #[cfg(test)]
 fn accept(session: &mut Session, api_key: &str, body: &str) -> Result<Vec<Ack>, StreamError> {
     gate(api_key)?;
-    deliver(session, body)
+    Ok(deliver(session, body)?.acks)
 }
 
-pub(crate) fn deliver(session: &mut Session, body: &str) -> Result<Vec<Ack>, StreamError> {
+pub(crate) struct ParkedPrompt {
+    pub prompt: String,
+    pub model: Option<String>,
+}
+
+pub(crate) struct Parked {
+    pub acks: Vec<Ack>,
+    pub prompts: Vec<ParkedPrompt>,
+    pub file_texts: Vec<String>,
+}
+
+pub(crate) fn deliver(session: &mut Session, body: &str) -> Result<Parked, StreamError> {
     let items = parse(body)?;
     preflight(session, &items)?;
-    let mut acks = Vec::with_capacity(items.len());
+    let mut parked = Parked {
+        acks: Vec::with_capacity(items.len()),
+        prompts: Vec::new(),
+        file_texts: Vec::new(),
+    };
     for item in items {
-        acks.push(apply(session, item)?);
+        match item {
+            Item::Prompt { prompt, model } => {
+                session.push_prompt(prompt.clone(), model.clone());
+                parked.prompts.push(ParkedPrompt { prompt, model });
+                parked.acks.push(Ack::Prompt { accepted: true });
+            }
+            Item::File { name, bytes } => {
+                if let Ok(text) = std::str::from_utf8(&bytes) {
+                    parked.file_texts.push(text.to_string());
+                }
+                let len = bytes.len();
+                session.push_file(name.clone(), bytes);
+                parked.acks.push(Ack::File { name, bytes: len });
+            }
+            Item::Secret(request) => {
+                let handle = session.push_secret(&request).map_err(StreamError::Vault)?;
+                parked.acks.push(Ack::Secret { handle });
+            }
+        }
     }
-    Ok(acks)
+    Ok(parked)
+}
+
+pub(crate) fn vault_needles(session: &Session) -> Vec<String> {
+    session
+        .secret_handles()
+        .iter()
+        .filter_map(|handle| {
+            let bytes = session.vault().get(handle)?;
+            let text = String::from_utf8(bytes.to_vec()).ok()?;
+            if text.chars().count() >= 8 {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 fn preflight(session: &Session, items: &[Item]) -> Result<(), StreamError> {
@@ -162,24 +212,6 @@ fn preflight(session: &Session, items: &[Item]) -> Result<(), StreamError> {
         Vault::open(std::slice::from_ref(request)).map_err(StreamError::Vault)?;
     }
     Ok(())
-}
-
-fn apply(session: &mut Session, item: Item) -> Result<Ack, StreamError> {
-    match item {
-        Item::Prompt { prompt, model } => {
-            session.push_prompt(prompt, model);
-            Ok(Ack::Prompt { accepted: true })
-        }
-        Item::File { name, bytes } => {
-            let len = bytes.len();
-            session.push_file(name.clone(), bytes);
-            Ok(Ack::File { name, bytes: len })
-        }
-        Item::Secret(request) => {
-            let handle = session.push_secret(&request).map_err(StreamError::Vault)?;
-            Ok(Ack::Secret { handle })
-        }
-    }
 }
 
 fn parse(body: &str) -> Result<Vec<Item>, StreamError> {
@@ -425,5 +457,114 @@ mod tests {
             session.held_prompts()[0].model.as_deref(),
             Some("llama-3.1-8b-q4")
         );
+    }
+
+    #[test]
+    fn a_prompt_line_enters_the_pass_and_stays_on_the_inbox() {
+        use crate::prompt::{PromptPass, RecordingDoor, DEFAULT_CATALOG_ID};
+
+        let door = RecordingDoor::ok("baa");
+        let pass = PromptPass::new(door.clone());
+        let mut session = session();
+        let parked = deliver(&mut session, &delivery()).unwrap();
+        let needles = vault_needles(&session);
+        pass.drive_parked(
+            &parked
+                .prompts
+                .iter()
+                .map(|prompt| (prompt.prompt.clone(), prompt.model.clone()))
+                .collect::<Vec<_>>(),
+            &parked.file_texts,
+            FIXTURE_KEY,
+            &needles,
+        );
+
+        assert_eq!(session.held_prompts().len(), 1);
+        assert_eq!(session.held_prompts()[0].prompt, "count the sheep");
+        assert!(session.held_prompts()[0].model.is_none());
+        assert_eq!(session.held_files().len(), 1);
+        assert_eq!(session.secret_handles(), ["token"]);
+        assert_eq!(door.calls().len(), 1);
+        assert_eq!(door.calls()[0].prompt, "count the sheep");
+        assert_eq!(door.calls()[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
+        assert!(!door.calls()[0].prompt.contains(SECRET_VALUE));
+        assert_eq!(pass.audit()[0].outcome, "forwarded");
+        assert_eq!(pass.audit()[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
+    }
+
+    #[test]
+    fn secret_and_file_lines_stay_off_the_door() {
+        use crate::prompt::{PromptPass, RecordingDoor};
+
+        let door = RecordingDoor::ok("baa");
+        let pass = PromptPass::new(door.clone());
+        let mut session = session();
+        let body = format!(
+            "{}\n{}\n",
+            r#"{"kind":"file","name":"note.txt","content_base64":"aGVsbG8="}"#,
+            format!(
+                r#"{{"kind":"secret","name":"token","source":"local","value":"{SECRET_VALUE}"}}"#
+            ),
+        );
+        let parked = deliver(&mut session, &body).unwrap();
+        pass.drive_parked(
+            &[],
+            &parked.file_texts,
+            FIXTURE_KEY,
+            &vault_needles(&session),
+        );
+        assert!(door.calls().is_empty());
+        assert!(session.held_prompts().is_empty());
+        assert_eq!(session.held_files().len(), 1);
+        assert_eq!(session.secret_handles(), ["token"]);
+        assert!(pass.audit().is_empty());
+    }
+
+    #[test]
+    fn a_secret_on_an_inbox_line_is_flagged_without_being_stored() {
+        use crate::prompt::{PromptPass, RecordingDoor};
+
+        let door = RecordingDoor::ok("baa");
+        let pass = PromptPass::new(door.clone());
+        let mut session = session();
+        let leaked = "vault-secret-value";
+        let body = format!(
+            "{}\n{}\n",
+            format!(r#"{{"kind":"prompt","prompt":"see {leaked} please"}}"#),
+            format!(
+                r#"{{"kind":"file","name":"note.txt","content_base64":"{}"}}"#,
+                base64::engine::general_purpose::STANDARD.encode(leaked)
+            ),
+        );
+        let parked = deliver(&mut session, &body).unwrap();
+        pass.drive_parked(
+            &parked
+                .prompts
+                .iter()
+                .map(|prompt| (prompt.prompt.clone(), prompt.model.clone()))
+                .collect::<Vec<_>>(),
+            &parked.file_texts,
+            FIXTURE_KEY,
+            &[leaked.to_string()],
+        );
+        assert_eq!(door.calls().len(), 1);
+        assert_eq!(door.calls()[0].prompt, format!("see {leaked} please"));
+        assert_eq!(
+            session.held_prompts()[0].prompt,
+            format!("see {leaked} please")
+        );
+        let json = serde_json::to_string(&pass.audit()).unwrap();
+        assert!(!json.contains(leaked));
+        let audit = pass.audit();
+        assert!(audit.iter().any(|row| {
+            row.findings
+                .iter()
+                .any(|finding| finding.kind == "secret" && finding.place == "prompt")
+        }));
+        assert!(audit.iter().any(|row| {
+            row.findings
+                .iter()
+                .any(|finding| finding.kind == "secret" && finding.place == "inbox")
+        }));
     }
 }

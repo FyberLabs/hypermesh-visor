@@ -1,8 +1,8 @@
-//! v0 prompt pass-through.
+//! Prompt pass-through.
 //!
-//! A prompt and an API key come in. The orchestrator forwards that prompt,
-//! unchanged, through one [`PromptDoor`]. The auditor records what was sent,
-//! whether it passed through, and the outcome. The response comes back.
+//! A prompt and an API key come in. [`PromptPass::submit`] checks the key,
+//! rejects an empty prompt, asks the orchestrator which catalog id and which
+//! door to use, then forwards that prompt once. The auditor records the pass.
 //!
 //! The cloud agent that serves chat today is the renter supervisor in
 //! hypermesh-host. That process posts `POST /v1/chat/completions` with
@@ -17,13 +17,15 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+pub use crate::orchestrator::{DoorConfig, DEFAULT_CATALOG_ID};
+
 /// Host, router, and site credentials are not renter API keys.
 /// Same prefixes the CLI rejects.
 pub const FORBIDDEN_RENTER_PREFIXES: &[&str] = &["hm_dev_", "hm_rtr_", "hm_site_"];
 
-/// One prompt handed to the cloud-agent door.
+/// One prompt handed to a cloud-agent door.
 ///
-/// `model` is the caller's string. v0 does not choose or rewrite it.
+/// `model` is set by [`PromptPass`] before `forward`. The door does not invent it.
 #[derive(Clone)]
 pub struct ForwardedPrompt {
     pub prompt: String,
@@ -41,7 +43,7 @@ impl fmt::Debug for ForwardedPrompt {
     }
 }
 
-/// The single door v0 knows how to call.
+/// One door the orchestrator can call. A mixture-of-experts wrapper is also a door.
 ///
 /// Implementations must not log `api_key`.
 pub trait PromptDoor: Send + Sync {
@@ -181,6 +183,19 @@ fn completions_url(chat_base: &str) -> Result<String, String> {
     Ok(format!("{scheme}://{authority}{path}"))
 }
 
+pub(crate) fn door_authority(chat_base: &str) -> Result<String, String> {
+    let endpoint = completions_url(chat_base)?;
+    let rest = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or("");
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("supervisor url must be an http(s) URL".into());
+    }
+    Ok(authority.to_string())
+}
+
 fn read_limited(response: ureq::Response) -> Result<String, String> {
     let mut buf = Vec::new();
     response
@@ -209,6 +224,7 @@ pub enum PromptError {
     MissingKey,
     InvalidKey { prefix: &'static str },
     EmptyPrompt,
+    UnknownModel,
     Door(String),
 }
 
@@ -221,12 +237,27 @@ impl fmt::Display for PromptError {
                 "{prefix} is not a renter identity; use an org API key (purpose: renter)"
             ),
             Self::EmptyPrompt => write!(f, "prompt is required"),
+            Self::UnknownModel => write!(f, "unknown model"),
             Self::Door(message) => write!(f, "{message}"),
         }
     }
 }
 
 impl std::error::Error for PromptError {}
+
+/// A secret or PII finding. The matched value is not a field.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct AuditFinding {
+    pub kind: String,
+    pub place: String,
+}
+
+/// The other expert's door and redacted text. The caller does not receive this.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ExpertAside {
+    pub door: String,
+    pub response: String,
+}
 
 /// What the auditor keeps. The API key is not a field.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -237,35 +268,73 @@ pub struct AuditRecord {
     pub outcome: String,
     pub response: Option<String>,
     pub reason: Option<String>,
+    /// URL authority of the door that was selected. Absent when the router did not run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub door: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub findings: Vec<AuditFinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub other_expert: Option<ExpertAside>,
 }
 
-#[derive(Default)]
 struct Auditor {
     records: Vec<AuditRecord>,
+    pending: Vec<AuditFinding>,
+    needles: Vec<String>,
+}
+
+impl Default for Auditor {
+    fn default() -> Self {
+        Self {
+            records: Vec::new(),
+            pending: Vec::new(),
+            needles: Vec::new(),
+        }
+    }
 }
 
 impl Auditor {
-    fn record(&mut self, record: AuditRecord) {
+    fn record(&mut self, mut record: AuditRecord) {
+        for finding in std::mem::take(&mut self.pending) {
+            push_finding(&mut record.findings, finding);
+        }
         self.records.push(record);
     }
 }
 
 /// Orchestrator plus auditor. One submit is one audit row.
 pub struct PromptPass {
-    door: Arc<dyn PromptDoor>,
+    orchestrator: crate::orchestrator::Orchestrator,
     auditor: Mutex<Auditor>,
+    gate: Mutex<()>,
 }
 
 impl PromptPass {
     pub fn new(door: Arc<dyn PromptDoor>) -> Self {
-        Self {
+        Self::from_orchestrator(crate::orchestrator::Orchestrator::single(
+            DEFAULT_CATALOG_ID,
             door,
-            auditor: Mutex::new(Auditor::default()),
-        }
+        ))
     }
 
     pub fn unconfigured() -> Self {
-        Self::new(Arc::new(UnconfiguredDoor))
+        Self::from_orchestrator(crate::orchestrator::Orchestrator::unconfigured(
+            DEFAULT_CATALOG_ID,
+        ))
+    }
+
+    pub(crate) fn from_orchestrator(orchestrator: crate::orchestrator::Orchestrator) -> Self {
+        Self {
+            orchestrator,
+            auditor: Mutex::new(Auditor::default()),
+            gate: Mutex::new(()),
+        }
+    }
+
+    pub fn open(config: &DoorConfig) -> Result<Self, String> {
+        Ok(Self::from_orchestrator(crate::orchestrator::connect(
+            config,
+        )?))
     }
 
     pub fn submit(
@@ -274,57 +343,163 @@ impl PromptPass {
         api_key: &str,
         model: Option<&str>,
     ) -> Result<String, PromptError> {
+        let _guard = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.submit_inner(prompt, api_key, model)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn model_checks(&self) -> Vec<&'static str> {
+        self.orchestrator.checks()
+    }
+
+    /// Parked stream prompts enter here. Secret values are needles for the
+    /// audit row only; they are not copied onto that row.
+    pub(crate) fn drive_parked(
+        &self,
+        prompts: &[(String, Option<String>)],
+        file_texts: &[String],
+        api_key: &str,
+        secret_values: &[String],
+    ) {
+        let _guard = self
+            .gate
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        self.arm_needles(secret_values);
+        for (prompt, model) in prompts {
+            self.flag_inbox(prompt);
+            let _ = self.submit_inner(prompt, api_key, model.as_deref());
+        }
+        for text in file_texts {
+            self.flag_inbox(text);
+        }
+        self.flush_flags();
+        self.clear_needles();
+    }
+
+    fn submit_inner(
+        &self,
+        prompt: &str,
+        api_key: &str,
+        model: Option<&str>,
+    ) -> Result<String, PromptError> {
         let sent = prompt.trim().to_string();
-        let model = normalize_model(model);
+        let requested = normalize_model(model);
         let key = match validate_api_key(api_key) {
             Ok(key) => key.to_string(),
             Err(err) => {
-                self.record(rejected(&sent, model, &err));
+                let key = api_key.trim();
+                let mut row = rejected(&self.redact_text(&sent, key), None, &err);
+                row.findings = findings_in(&sent, "prompt", key, &self.needles());
+                self.record(row);
                 return Err(err);
             }
         };
         if sent.is_empty() {
             let err = PromptError::EmptyPrompt;
-            self.record(rejected(&sent, model, &err));
+            self.record(rejected(&sent, requested, &err));
             return Err(err);
         }
+        let selected = match self.orchestrator.select(requested.clone()) {
+            crate::orchestrator::Choice::Model(id) => id,
+            crate::orchestrator::Choice::Unknown => {
+                let err = PromptError::UnknownModel;
+                self.record(rejected(&self.redact_text(&sent, &key), requested, &err));
+                return Err(err);
+            }
+        };
         let call = ForwardedPrompt {
             prompt: sent.clone(),
             api_key: key.clone(),
-            model: model.clone(),
+            model: Some(selected.clone()),
         };
-        // TODO(model-selection): v0 forwards `model` only when the caller set it.
-        // Choosing a catalog id belongs here, before `door.forward`, and must
-        // not change how the auditor records the pass.
-        // TODO(smart-routing): v0 has a single PromptDoor. A later router can
-        // pick the door from the lease or the class without rewriting the auditor.
-        // TODO(moe): do not fan the prompt out. Mixture-of-experts wraps
-        // PromptDoor; it does not replace this pass-through.
-        match self.door.forward(&call) {
-            Ok(response) => {
-                let response = redact(&response, &key);
-                self.record(AuditRecord {
-                    prompt: sent,
-                    model,
-                    passed_through: true,
-                    outcome: "forwarded".into(),
-                    response: Some(response.clone()),
-                    reason: None,
-                });
-                Ok(response)
-            }
-            Err(message) => {
-                let message = redact(&message, &key);
-                self.record(AuditRecord {
-                    prompt: sent,
-                    model,
-                    passed_through: false,
-                    outcome: "door_failed".into(),
-                    response: None,
-                    reason: Some(message.clone()),
-                });
+        // Model selection has already chosen `selected`. Routing and an expert
+        // wrapper, when one is marked, happen inside this single forward.
+        match self.orchestrator.dispatch(&selected, &call) {
+            crate::orchestrator::Dispatch::Unmapped => {
+                let message = "model is not routed".to_string();
+                self.record(self.failed_row(&sent, &key, Some(selected), None, &message));
                 Err(PromptError::Door(message))
             }
+            crate::orchestrator::Dispatch::Finished {
+                result,
+                door,
+                other_expert,
+            } => match result {
+                Ok(response) => {
+                    let stored =
+                        self.store_success(&sent, &key, selected, door, response, other_expert);
+                    Ok(stored)
+                }
+                Err(message) => {
+                    let message = self.redact_text(&message, &key);
+                    self.record(self.failed_row(&sent, &key, Some(selected), door, &message));
+                    Err(PromptError::Door(message))
+                }
+            },
+        }
+    }
+
+    fn store_success(
+        &self,
+        sent: &str,
+        key: &str,
+        model: String,
+        door: Option<String>,
+        response: String,
+        other_expert: Option<ExpertAside>,
+    ) -> String {
+        let mut findings = findings_in(sent, "prompt", key, &self.needles());
+        findings.extend(findings_in(&response, "completion", key, &self.needles()));
+        let response = self.redact_text(&response, key);
+        let other_expert = other_expert.map(|aside| {
+            findings.extend(findings_in(
+                &aside.response,
+                "completion",
+                key,
+                &self.needles(),
+            ));
+            ExpertAside {
+                door: aside.door,
+                response: self.redact_text(&aside.response, key),
+            }
+        });
+        self.record(AuditRecord {
+            prompt: self.redact_text(sent, key),
+            model: Some(model),
+            passed_through: true,
+            outcome: "forwarded".into(),
+            response: Some(response.clone()),
+            reason: None,
+            door,
+            findings,
+            other_expert,
+        });
+        response
+    }
+
+    fn failed_row(
+        &self,
+        sent: &str,
+        key: &str,
+        model: Option<String>,
+        door: Option<String>,
+        message: &str,
+    ) -> AuditRecord {
+        let findings = findings_in(sent, "prompt", key, &self.needles());
+        AuditRecord {
+            prompt: self.redact_text(sent, key),
+            model,
+            passed_through: false,
+            outcome: "door_failed".into(),
+            response: None,
+            reason: Some(self.redact_text(message, key)),
+            door,
+            findings,
+            other_expert: None,
         }
     }
 
@@ -334,6 +509,75 @@ impl PromptPass {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         auditor.records.clone()
+    }
+
+    fn flag_inbox(&self, text: &str) {
+        let found = findings_in(text, "inbox", "", &self.needles());
+        if found.is_empty() {
+            return;
+        }
+        let mut auditor = self
+            .auditor
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        auditor.pending.extend(found);
+    }
+
+    fn flush_flags(&self) {
+        let mut auditor = self
+            .auditor
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if auditor.pending.is_empty() {
+            return;
+        }
+        let findings = std::mem::take(&mut auditor.pending);
+        auditor.records.push(AuditRecord {
+            prompt: String::new(),
+            model: None,
+            passed_through: false,
+            outcome: "rejected".into(),
+            response: None,
+            reason: Some("flagged".into()),
+            door: None,
+            findings,
+            other_expert: None,
+        });
+    }
+
+    fn arm_needles(&self, secret_values: &[String]) {
+        let mut auditor = self
+            .auditor
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        auditor.needles = secret_values
+            .iter()
+            .filter(|value| value.chars().count() >= 8)
+            .cloned()
+            .collect();
+    }
+
+    fn clear_needles(&self) {
+        let mut auditor = self
+            .auditor
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        for needle in &mut auditor.needles {
+            needle.clear();
+        }
+        auditor.needles.clear();
+    }
+
+    fn needles(&self) -> Vec<String> {
+        self.auditor
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .needles
+            .clone()
+    }
+
+    fn redact_text(&self, text: &str, key: &str) -> String {
+        redact_sensitive(text, key, &self.needles())
     }
 
     fn record(&self, record: AuditRecord) {
@@ -373,14 +617,235 @@ fn rejected(prompt: &str, model: Option<String>, err: &PromptError) -> AuditReco
         outcome: "rejected".into(),
         response: None,
         reason: Some(err.to_string()),
+        door: None,
+        findings: Vec::new(),
+        other_expert: None,
     }
 }
 
-fn redact(text: &str, key: &str) -> String {
-    if key.is_empty() {
-        return text.to_string();
+fn push_finding(findings: &mut Vec<AuditFinding>, finding: AuditFinding) {
+    if !findings.iter().any(|had| had == &finding) {
+        findings.push(finding);
     }
-    text.replace(key, "***")
+}
+
+fn findings_in(text: &str, place: &str, key: &str, needles: &[String]) -> Vec<AuditFinding> {
+    let mut findings = Vec::new();
+    if has_secret(text, key, needles) {
+        findings.push(AuditFinding {
+            kind: "secret".into(),
+            place: place.into(),
+        });
+    }
+    if has_pii(text) {
+        findings.push(AuditFinding {
+            kind: "pii".into(),
+            place: place.into(),
+        });
+    }
+    findings
+}
+
+fn has_secret(text: &str, key: &str, needles: &[String]) -> bool {
+    if !key.is_empty() && text.contains(key) {
+        return true;
+    }
+    if needles
+        .iter()
+        .any(|needle| !needle.is_empty() && text.contains(needle))
+    {
+        return true;
+    }
+    !secret_spans(text).is_empty()
+}
+
+fn redact_sensitive(text: &str, key: &str, needles: &[String]) -> String {
+    let mut out = if key.is_empty() {
+        text.to_string()
+    } else {
+        text.replace(key, "***")
+    };
+    for needle in needles {
+        if needle.chars().count() >= 8 {
+            out = out.replace(needle, "***");
+        }
+    }
+    let spans = secret_spans(&out);
+    if spans.is_empty() {
+        return out;
+    }
+    let mut redacted = String::new();
+    let mut last = 0;
+    for (start, end) in spans {
+        if start < last || end > out.len() {
+            continue;
+        }
+        redacted.push_str(&out[last..start]);
+        redacted.push_str("***");
+        last = end;
+    }
+    redacted.push_str(&out[last..]);
+    redacted
+}
+
+fn secret_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    for prefix in ["hm_dev_", "hm_rtr_", "hm_site_", "sk-"] {
+        let mut rest = text;
+        let mut base = 0;
+        while let Some(index) = rest.find(prefix) {
+            let start = base + index;
+            let after = start + prefix.len();
+            let tail = text[after..]
+                .find(|ch: char| !ch.is_ascii_alphanumeric())
+                .unwrap_or(text.len() - after);
+            let end = after + tail;
+            let token_len = end - after;
+            let long_enough = if prefix == "sk-" {
+                token_len >= 8
+            } else {
+                token_len >= 1
+            };
+            if long_enough && end > start {
+                spans.push((start, end));
+            }
+            let next = after.max(start + 1);
+            base = next;
+            rest = &text[next..];
+        }
+    }
+    for keyword in [
+        "api_key", "apikey", "api-key", "secret", "password", "token",
+    ] {
+        let lower = text.to_ascii_lowercase();
+        let mut rest = lower.as_str();
+        let mut base = 0;
+        while let Some(index) = rest.find(keyword) {
+            let start = base + index;
+            let after_key = start + keyword.len();
+            let bytes = text.as_bytes();
+            let mut cursor = after_key;
+            while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            if cursor < bytes.len() && (bytes[cursor] == b'=' || bytes[cursor] == b':') {
+                cursor += 1;
+                while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                let value_start = cursor;
+                while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                    cursor += 1;
+                }
+                if cursor - value_start >= 4 {
+                    spans.push((value_start, cursor));
+                }
+            }
+            let next = after_key.max(start + 1);
+            base = next;
+            rest = &lower[next..];
+        }
+    }
+    spans.sort_unstable();
+    spans.dedup();
+    merge_spans(spans)
+}
+
+fn merge_spans(spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    let mut merged = Vec::new();
+    for (start, end) in spans {
+        if let Some((_, last_end)) = merged.last_mut() {
+            if start <= *last_end {
+                *last_end = (*last_end).max(end);
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+    merged
+}
+
+fn has_pii(text: &str) -> bool {
+    has_email(text) || has_digits_shape(text, &[3, 2, 4]) || has_digits_shape(text, &[3, 3, 4])
+}
+
+fn has_email(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'@' || index == 0 {
+            continue;
+        }
+        let mut start = index;
+        while start > 0 && is_email_local(bytes[start - 1]) {
+            start -= 1;
+        }
+        if start == index {
+            continue;
+        }
+        let mut end = index + 1;
+        let mut saw_dot = false;
+        while end < bytes.len() && is_email_domain(bytes[end]) {
+            if bytes[end] == b'.' {
+                saw_dot = true;
+            }
+            end += 1;
+        }
+        if !saw_dot || end < index + 3 || bytes[end - 1] == b'.' {
+            continue;
+        }
+        if let Some(dot) = text[index + 1..end].rfind('.') {
+            let tld = &text[index + 1 + dot + 1..end];
+            if tld.len() >= 2 && tld.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_email_local(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'-')
+}
+
+fn is_email_domain(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-'
+}
+
+fn has_digits_shape(text: &str, groups: &[usize]) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < groups.iter().sum::<usize>() + groups.len() - 1 {
+        return false;
+    }
+    for start in 0..bytes.len() {
+        if start > 0 && bytes[start - 1].is_ascii_digit() {
+            continue;
+        }
+        let mut cursor = start;
+        let mut matched = true;
+        for (index, group) in groups.iter().enumerate() {
+            if index > 0 {
+                if cursor >= bytes.len() || bytes[cursor] != b'-' {
+                    matched = false;
+                    break;
+                }
+                cursor += 1;
+            }
+            for _ in 0..*group {
+                if cursor >= bytes.len() || !bytes[cursor].is_ascii_digit() {
+                    matched = false;
+                    break;
+                }
+                cursor += 1;
+            }
+            if !matched {
+                break;
+            }
+        }
+        if matched && (cursor == bytes.len() || !bytes[cursor].is_ascii_digit()) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -397,6 +862,14 @@ impl RecordingDoor {
             calls: Mutex::new(Vec::new()),
             response: response.into(),
             fail: None,
+        })
+    }
+
+    pub(crate) fn fail(message: impl Into<String>) -> Arc<Self> {
+        Arc::new(Self {
+            calls: Mutex::new(Vec::new()),
+            response: String::new(),
+            fail: Some(message.into()),
         })
     }
 
@@ -442,15 +915,18 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].api_key, FIXTURE_KEY);
         assert_eq!(calls[0].prompt, FIXTURE_PROMPT);
-        assert_eq!(calls[0].model, None);
+        assert_eq!(calls[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
         assert!(!format!("{:?}", calls[0]).contains(FIXTURE_KEY));
 
         let audit = pass.audit();
         assert_eq!(audit.len(), 1);
         assert_eq!(audit[0].prompt, FIXTURE_PROMPT);
+        assert_eq!(audit[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
         assert!(audit[0].passed_through);
         assert_eq!(audit[0].outcome, "forwarded");
         assert_eq!(audit[0].response.as_deref(), Some("baa"));
+        assert!(audit[0].door.is_none());
+        assert!(audit[0].other_expert.is_none());
         let rendered = format!("{audit:?}");
         assert!(!rendered.contains(FIXTURE_KEY));
         let json = serde_json::to_string(&audit).unwrap();
@@ -483,26 +959,75 @@ mod tests {
         assert_eq!(audit.len(), 4);
         assert!(audit.iter().all(|row| !row.passed_through));
         assert!(audit.iter().all(|row| row.outcome == "rejected"));
+        assert!(audit.iter().all(|row| row.model.is_none()));
+        assert!(audit.iter().all(|row| row.door.is_none()));
         let rendered = format!("{audit:?}");
         assert!(!rendered.contains("fixture_tail"));
         assert!(!rendered.contains(FIXTURE_KEY));
     }
 
     #[test]
-    fn caller_model_is_forwarded_without_selection() {
+    fn omitted_model_uses_the_flagged_default_and_a_blank_model_does_too() {
         let door = RecordingDoor::ok("ok");
-        let pass = PromptPass::new(door.clone());
-        pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, Some("caller-picked"))
-            .unwrap();
+        let pass = PromptPass::from_orchestrator(crate::orchestrator::Orchestrator::single(
+            "whisper-small",
+            door.clone(),
+        ));
+        pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, None).unwrap();
         pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, Some("  "))
             .unwrap();
         let calls = door.calls();
-        assert_eq!(calls[0].model.as_deref(), Some("caller-picked"));
-        assert_eq!(calls[1].model, None);
-        assert_ne!(calls[0].model.as_deref(), Some("llama-3.1-8b-q4"));
+        assert_eq!(calls[0].model.as_deref(), Some("whisper-small"));
+        assert_eq!(calls[1].model.as_deref(), Some("whisper-small"));
         let audit = pass.audit();
-        assert_eq!(audit[0].model.as_deref(), Some("caller-picked"));
-        assert_eq!(audit[1].model, None);
+        assert_eq!(audit[0].model.as_deref(), Some("whisper-small"));
+        assert_eq!(audit[1].model.as_deref(), Some("whisper-small"));
+        assert!(audit.iter().all(|row| row.outcome == "forwarded"));
+    }
+
+    #[test]
+    fn unknown_model_is_rejected_after_catalog_and_live_net_checks() {
+        let door = RecordingDoor::ok("ok");
+        let pass = PromptPass::from_orchestrator(
+            crate::orchestrator::Orchestrator::single(DEFAULT_CATALOG_ID, door.clone()).with_net(
+                &[DEFAULT_CATALOG_ID, "whisper-small"],
+                &[DEFAULT_CATALOG_ID, "live-only"],
+            ),
+        );
+
+        let known = pass
+            .submit(FIXTURE_PROMPT, FIXTURE_KEY, Some(DEFAULT_CATALOG_ID))
+            .unwrap();
+        assert_eq!(known, "ok");
+        assert_eq!(pass.model_checks(), ["catalog", "live_net"]);
+
+        let missing_net = pass
+            .submit(FIXTURE_PROMPT, FIXTURE_KEY, Some("whisper-small"))
+            .unwrap_err();
+        assert_eq!(missing_net, PromptError::UnknownModel);
+        assert_eq!(pass.model_checks(), ["catalog", "live_net"]);
+
+        let missing_catalog = pass
+            .submit(FIXTURE_PROMPT, FIXTURE_KEY, Some("live-only"))
+            .unwrap_err();
+        assert_eq!(missing_catalog, PromptError::UnknownModel);
+
+        let unknown = pass
+            .submit(FIXTURE_PROMPT, FIXTURE_KEY, Some("not-a-model"))
+            .unwrap_err();
+        assert_eq!(unknown, PromptError::UnknownModel);
+        assert_eq!(unknown.to_string(), "unknown model");
+        assert_eq!(pass.model_checks(), ["catalog", "live_net"]);
+
+        assert_eq!(door.calls().len(), 1);
+        assert_eq!(door.calls()[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
+        let audit = pass.audit();
+        assert_eq!(audit.len(), 4);
+        assert_eq!(audit[0].outcome, "forwarded");
+        assert_eq!(audit[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
+        assert!(audit.iter().skip(1).all(|row| row.outcome == "rejected"));
+        assert!(audit.iter().skip(1).all(|row| row.door.is_none()));
+        assert_eq!(audit[3].model.as_deref(), Some("not-a-model"));
     }
 
     #[test]
@@ -525,6 +1050,7 @@ mod tests {
         assert_eq!(err, PromptError::EmptyPrompt);
         assert!(door.calls().is_empty());
         assert!(!pass.audit()[0].passed_through);
+        assert!(pass.audit()[0].model.is_none());
     }
 
     #[test]
@@ -536,8 +1062,10 @@ mod tests {
         assert!(!err.to_string().contains(FIXTURE_KEY));
         let audit = pass.audit();
         assert_eq!(audit[0].prompt, FIXTURE_PROMPT);
+        assert_eq!(audit[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
         assert!(!audit[0].passed_through);
         assert_eq!(audit[0].outcome, "door_failed");
+        assert!(audit[0].door.is_none());
         assert!(!format!("{audit:?}").contains(FIXTURE_KEY));
     }
 
@@ -606,27 +1134,36 @@ mod tests {
         assert!(hits[0].hypermesh_lease.is_empty());
         let posted: serde_json::Value = serde_json::from_str(&hits[0].body).unwrap();
         assert_eq!(posted["messages"][0]["content"], FIXTURE_PROMPT);
-        assert!(posted.get("model").is_none());
-        assert!(!hits[0].body.contains("llama-3.1-8b-q4"));
+        assert_eq!(posted["model"], DEFAULT_CATALOG_ID);
         assert!(!hits[0].body.contains(FIXTURE_KEY));
 
-        pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, Some("caller-picked"))
+        pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, Some("whisper-small"))
             .unwrap();
+        let unknown = pass
+            .submit(FIXTURE_PROMPT, FIXTURE_KEY, Some("not-a-model"))
+            .unwrap_err();
+        assert_eq!(unknown, PromptError::UnknownModel);
         let hits = fixture.hits();
+        assert_eq!(hits.len(), 2);
         let posted: serde_json::Value = serde_json::from_str(&hits[1].body).unwrap();
-        assert_eq!(posted["model"], "caller-picked");
+        assert_eq!(posted["model"], "whisper-small");
 
         let audit = pass.audit();
-        assert_eq!(audit.len(), 4);
+        assert_eq!(audit.len(), 5);
         assert_eq!(audit[0].outcome, "rejected");
         assert_eq!(audit[1].outcome, "rejected");
+        assert!(audit[0].model.is_none());
+        assert!(audit[1].model.is_none());
         assert!(!audit[0].passed_through);
         assert!(!audit[1].passed_through);
         assert_eq!(audit[2].outcome, "forwarded");
         assert!(audit[2].passed_through);
         assert_eq!(audit[2].response.as_deref(), Some("echo ***"));
         assert_eq!(audit[2].prompt, FIXTURE_PROMPT);
-        assert_eq!(audit[3].model.as_deref(), Some("caller-picked"));
+        assert_eq!(audit[2].model.as_deref(), Some(DEFAULT_CATALOG_ID));
+        assert_eq!(audit[3].model.as_deref(), Some("whisper-small"));
+        assert_eq!(audit[4].outcome, "rejected");
+        assert_eq!(audit[4].model.as_deref(), Some("not-a-model"));
         let rendered = format!("{audit:?}");
         assert!(!rendered.contains(FIXTURE_KEY));
         assert!(!rendered.contains("fixture_tail"));
@@ -648,7 +1185,289 @@ mod tests {
         assert_eq!(audit[0].outcome, "door_failed");
         assert!(!audit[0].passed_through);
         assert_eq!(audit[0].reason.as_deref(), Some("supervisor chat HTTP 403"));
+        assert_eq!(audit[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
         assert!(!format!("{audit:?}").contains(FIXTURE_KEY));
+    }
+
+    fn two_hosts() -> (
+        Arc<RecordingDoor>,
+        Arc<RecordingDoor>,
+        crate::orchestrator::Orchestrator,
+    ) {
+        let first = RecordingDoor::fail("host-a down");
+        let second = RecordingDoor::ok("from-b");
+        let orchestrator = crate::orchestrator::Orchestrator::from_named(
+            DEFAULT_CATALOG_ID,
+            vec![
+                ("host-a".into(), first.clone()),
+                ("host-b".into(), second.clone()),
+            ],
+            vec![
+                (DEFAULT_CATALOG_ID.into(), "host-a".into()),
+                (DEFAULT_CATALOG_ID.into(), "host-b".into()),
+            ],
+            Vec::new(),
+            Vec::new(),
+        );
+        (first, second, orchestrator)
+    }
+
+    #[test]
+    fn unmapped_model_fails_closed_without_calling_a_door() {
+        let first = RecordingDoor::ok("from-a");
+        let second = RecordingDoor::ok("from-b");
+        let pass = PromptPass::from_orchestrator(crate::orchestrator::Orchestrator::from_named(
+            DEFAULT_CATALOG_ID,
+            vec![
+                ("host-a".into(), first.clone()),
+                ("host-b".into(), second.clone()),
+            ],
+            vec![("whisper-small".into(), "host-a".into())],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let err = pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, None).unwrap_err();
+        assert_eq!(err.to_string(), "model is not routed");
+        assert!(first.calls().is_empty());
+        assert!(second.calls().is_empty());
+        let audit = pass.audit();
+        assert_eq!(audit[0].outcome, "door_failed");
+        assert_eq!(audit[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
+        assert!(audit[0].door.is_none());
+        assert!(!audit[0].passed_through);
+    }
+
+    #[test]
+    fn a_failed_mapped_door_retries_only_a_host_the_rules_already_allow() {
+        let (first, second, orchestrator) = two_hosts();
+        let pass = PromptPass::from_orchestrator(orchestrator);
+        let response = pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, None).unwrap();
+        assert_eq!(response, "from-b");
+        assert_eq!(first.calls().len(), 1);
+        assert_eq!(second.calls().len(), 1);
+        assert_eq!(first.calls()[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
+        assert_eq!(second.calls()[0].prompt, FIXTURE_PROMPT);
+        let audit = pass.audit();
+        assert_eq!(audit[0].outcome, "forwarded");
+        assert_eq!(audit[0].door.as_deref(), Some("host-b"));
+        assert_eq!(audit[0].response.as_deref(), Some("from-b"));
+
+        let only = RecordingDoor::fail("only host down");
+        let spare = RecordingDoor::ok("spare");
+        let pass = PromptPass::from_orchestrator(crate::orchestrator::Orchestrator::from_named(
+            DEFAULT_CATALOG_ID,
+            vec![
+                ("host-a".into(), only.clone()),
+                ("host-b".into(), spare.clone()),
+            ],
+            vec![(DEFAULT_CATALOG_ID.into(), "host-a".into())],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let err = pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, None).unwrap_err();
+        assert!(err.to_string().contains("only host down"));
+        assert_eq!(only.calls().len(), 1);
+        assert!(spare.calls().is_empty());
+        assert_eq!(pass.audit()[0].door.as_deref(), Some("host-a"));
+        assert_eq!(pass.audit()[0].outcome, "door_failed");
+    }
+
+    #[test]
+    fn forbidden_keys_do_not_call_a_routed_door() {
+        let (first, second, orchestrator) = two_hosts();
+        let pass = PromptPass::from_orchestrator(orchestrator);
+        for key in [
+            "",
+            "  ",
+            "hm_dev_fixture_tail",
+            "hm_rtr_fixture_tail",
+            "hm_site_fixture_tail",
+        ] {
+            let _ = pass.submit(FIXTURE_PROMPT, key, None).unwrap_err();
+        }
+        assert!(first.calls().is_empty());
+        assert!(second.calls().is_empty());
+        assert!(pass.audit().iter().all(|row| row.door.is_none()));
+        assert!(pass.audit().iter().all(|row| row.outcome == "rejected"));
+        assert!(!format!("{:?}", pass.audit()).contains("fixture_tail"));
+    }
+
+    #[test]
+    fn a_second_url_does_not_turn_a_blank_first_url_into_a_call() {
+        let pass = PromptPass::open(&DoorConfig {
+            default_model: DEFAULT_CATALOG_ID.into(),
+            primary_url: None,
+            second_url: Some("http://127.0.0.1:9".into()),
+            routes: Vec::new(),
+            experts: Vec::new(),
+            answers: Vec::new(),
+        })
+        .unwrap();
+        let err = pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, None).unwrap_err();
+        assert!(err.to_string().contains("not configured"));
+        assert_eq!(pass.audit()[0].outcome, "door_failed");
+        assert_eq!(pass.audit()[0].model.as_deref(), Some(DEFAULT_CATALOG_ID));
+    }
+
+    #[test]
+    fn one_expert_failure_fails_the_prompt_and_hides_the_success() {
+        let first = RecordingDoor::ok("alpha-should-not-return");
+        let second = RecordingDoor::fail("expert down");
+        let pass = PromptPass::from_orchestrator(crate::orchestrator::Orchestrator::from_named(
+            DEFAULT_CATALOG_ID,
+            vec![
+                ("host-a".into(), first.clone()),
+                ("host-b".into(), second.clone()),
+            ],
+            Vec::new(),
+            vec![DEFAULT_CATALOG_ID.into()],
+            Vec::new(),
+        ));
+        let err = pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, None).unwrap_err();
+        assert!(err.to_string().contains("expert down"));
+        assert!(!err.to_string().contains("alpha-should-not-return"));
+        assert_eq!(first.calls().len(), 1);
+        assert_eq!(second.calls().len(), 1);
+        let audit = pass.audit();
+        assert_eq!(audit[0].outcome, "door_failed");
+        assert!(audit[0].response.is_none());
+        assert!(audit[0].other_expert.is_none());
+        let rendered = format!("{audit:?}");
+        assert!(!rendered.contains("alpha-should-not-return"));
+    }
+
+    #[test]
+    fn the_caller_sees_the_first_expert_until_a_rule_names_another() {
+        let first = RecordingDoor::ok("from-first");
+        let second = RecordingDoor::ok(format!("from-second {FIXTURE_KEY}"));
+        let pass = PromptPass::from_orchestrator(crate::orchestrator::Orchestrator::from_named(
+            DEFAULT_CATALOG_ID,
+            vec![
+                ("host-a".into(), first.clone()),
+                ("host-b".into(), second.clone()),
+            ],
+            Vec::new(),
+            vec![DEFAULT_CATALOG_ID.into()],
+            Vec::new(),
+        ));
+        let response = pass.submit(FIXTURE_PROMPT, FIXTURE_KEY, None).unwrap();
+        assert_eq!(response, "from-first");
+        assert!(!response.contains("from-second"));
+        assert_eq!(first.calls().len(), 1);
+        assert_eq!(second.calls().len(), 1);
+        assert_eq!(first.calls()[0].prompt, second.calls()[0].prompt);
+        assert_eq!(first.calls()[0].model, second.calls()[0].model);
+        assert_eq!(first.calls()[0].api_key, FIXTURE_KEY);
+        let audit = pass.audit();
+        assert_eq!(audit[0].response.as_deref(), Some("from-first"));
+        assert_eq!(audit[0].door.as_deref(), Some("host-a"));
+        let other = audit[0].other_expert.as_ref().unwrap();
+        assert_eq!(other.door, "host-b");
+        assert_eq!(other.response, "from-second ***");
+        assert!(!format!("{audit:?}").contains(FIXTURE_KEY));
+
+        let named = PromptPass::from_orchestrator(crate::orchestrator::Orchestrator::from_named(
+            DEFAULT_CATALOG_ID,
+            vec![
+                ("host-a".into(), first.clone()),
+                ("host-b".into(), second.clone()),
+            ],
+            Vec::new(),
+            vec![DEFAULT_CATALOG_ID.into()],
+            vec![(DEFAULT_CATALOG_ID.into(), "host-b".into())],
+        ));
+        let response = named.submit(FIXTURE_PROMPT, FIXTURE_KEY, None).unwrap();
+        assert_eq!(response, "from-second ***");
+        assert_eq!(named.audit()[0].door.as_deref(), Some("host-b"));
+        assert_eq!(
+            named.audit()[0].other_expert.as_ref().unwrap().door,
+            "host-a"
+        );
+        assert_eq!(
+            named.audit()[0].other_expert.as_ref().unwrap().response,
+            "from-first"
+        );
+    }
+
+    #[test]
+    fn an_expert_wrapper_refuses_an_empty_key_before_either_door() {
+        let first = RecordingDoor::ok("from-first");
+        let second = RecordingDoor::ok("from-second");
+        let fan = crate::orchestrator::ExpertFan::pair(
+            "host-a",
+            first.clone(),
+            "host-b",
+            second.clone(),
+            false,
+        );
+        let err = fan
+            .forward(&ForwardedPrompt {
+                prompt: FIXTURE_PROMPT.into(),
+                api_key: "  ".into(),
+                model: Some(DEFAULT_CATALOG_ID.into()),
+            })
+            .unwrap_err();
+        assert!(err.contains("api key is required"));
+        assert!(first.calls().is_empty());
+        assert!(second.calls().is_empty());
+    }
+
+    #[test]
+    fn a_forbidden_key_calls_neither_expert() {
+        let first = RecordingDoor::ok("from-first");
+        let second = RecordingDoor::ok("from-second");
+        let pass = PromptPass::from_orchestrator(crate::orchestrator::Orchestrator::from_named(
+            DEFAULT_CATALOG_ID,
+            vec![
+                ("host-a".into(), first.clone()),
+                ("host-b".into(), second.clone()),
+            ],
+            Vec::new(),
+            vec![DEFAULT_CATALOG_ID.into()],
+            Vec::new(),
+        ));
+        let err = pass
+            .submit(FIXTURE_PROMPT, "hm_site_fixture_tail", None)
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            PromptError::InvalidKey { prefix: "hm_site_" }
+        ));
+        assert!(first.calls().is_empty());
+        assert!(second.calls().is_empty());
+        assert!(pass.audit()[0].other_expert.is_none());
+        assert!(pass.audit()[0].door.is_none());
+        assert!(!format!("{:?}", pass.audit()).contains("fixture_tail"));
+    }
+
+    #[test]
+    fn the_auditor_flags_a_secret_and_pii_without_storing_the_secret() {
+        let door = RecordingDoor::ok("reach ada@example.com token=sk-fixturesecretvalue");
+        let pass = PromptPass::new(door.clone());
+        let prompt = "email ada@example.com and token=sk-fixturesecretvalue";
+        pass.submit(prompt, FIXTURE_KEY, None).unwrap();
+        let audit = pass.audit();
+        assert!(audit[0]
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "pii" && finding.place == "prompt"));
+        assert!(audit[0]
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "secret" && finding.place == "prompt"));
+        assert!(audit[0]
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "pii" && finding.place == "completion"));
+        assert!(audit[0]
+            .findings
+            .iter()
+            .any(|finding| finding.kind == "secret" && finding.place == "completion"));
+        let json = serde_json::to_string(&audit).unwrap();
+        assert!(!json.contains("sk-fixturesecretvalue"));
+        assert!(json.contains("ada@example.com"));
+        assert!(!json.contains("\"value\""));
+        assert_eq!(door.calls()[0].prompt, prompt);
     }
 }
 
