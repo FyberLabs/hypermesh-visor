@@ -3,6 +3,7 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::harness::Harness;
+use crate::mcp::McpBundle;
 use crate::vault::{SecretRequest, Vault, VaultError};
 
 /// The verb the session is performing. The desktop companion reads this.
@@ -28,11 +29,12 @@ impl Verb {
     }
 }
 
-/// One open desktop session. Closing it drops the harness and the vault.
+/// One open desktop session. Closing it drops the harness, vault, and MCP children.
 pub struct Session {
     id: Uuid,
     harness: Harness,
     vault: Vault,
+    mcp: McpBundle,
     verb: Option<Verb>,
     touched: Instant,
     prompts: Vec<HeldPrompt>,
@@ -55,11 +57,12 @@ pub(crate) struct HeldFile {
 }
 
 impl Session {
-    pub fn create(id: Uuid, harness: Harness, vault: Vault) -> Self {
+    pub fn create(id: Uuid, harness: Harness, vault: Vault, mcp: McpBundle) -> Self {
         Self {
             id,
             harness,
             vault,
+            mcp,
             verb: None,
             touched: Instant::now(),
             prompts: Vec::new(),
@@ -78,6 +81,10 @@ impl Session {
 
     pub fn vault(&self) -> &Vault {
         &self.vault
+    }
+
+    pub fn mcp(&self) -> &McpBundle {
+        &self.mcp
     }
 
     pub fn purpose(&self) -> &str {
@@ -136,6 +143,8 @@ impl std::fmt::Debug for Session {
             .field("verb", &self.verb.map(Verb::as_str))
             .field("agent", &self.harness().agent.name)
             .field("vault", self.vault())
+            .field("mcp_profile", &self.mcp.profile)
+            .field("mcp_servers", &self.mcp.server_names())
             .finish()
     }
 }

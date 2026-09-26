@@ -2,6 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,6 +22,7 @@ use zeroize::Zeroize;
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
 use crate::input::{plan_type, MouseOp, PlanError, TypeBody};
+use crate::mcp::{self, McpError, ToolInfo};
 use crate::prompt::{self, AuditRecord, PromptError};
 use crate::session::{Session, Verb};
 use crate::stream::{self, StreamError};
@@ -31,11 +33,18 @@ pub struct AppState {
     desktop: Arc<dyn Desktop>,
     watch_poll: Duration,
     prompts: prompt::PromptPass,
+    /// Directory for mcp.json / mcp-profiles.json. Defaults to the Hypermesh config dir.
+    mcp_dir: PathBuf,
 }
 
 impl AppState {
     pub fn new(desktop: Arc<dyn Desktop>, watch_poll: Duration) -> Self {
-        Self::assemble(desktop, watch_poll, prompt::PromptPass::unconfigured())
+        Self::assemble(
+            desktop,
+            watch_poll,
+            prompt::PromptPass::unconfigured(),
+            mcp::config_dir(),
+        )
     }
 
     /// `door` is the cloud-agent pass-through. The desktop daemon uses
@@ -45,19 +54,26 @@ impl AppState {
         watch_poll: Duration,
         door: Arc<dyn prompt::PromptDoor>,
     ) -> Self {
-        Self::assemble(desktop, watch_poll, prompt::PromptPass::new(door))
+        Self::assemble(
+            desktop,
+            watch_poll,
+            prompt::PromptPass::new(door),
+            mcp::config_dir(),
+        )
     }
 
     fn assemble(
         desktop: Arc<dyn Desktop>,
         watch_poll: Duration,
         prompts: prompt::PromptPass,
+        mcp_dir: PathBuf,
     ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             desktop,
             watch_poll,
             prompts,
+            mcp_dir,
         }
     }
 
@@ -94,10 +110,18 @@ impl AppState {
     fn companion_session(&self) -> Option<CompanionSession> {
         let sessions = lock(&self.sessions);
         let session = sessions.values().max_by_key(|session| session.touched())?;
+        let mcp_servers = session.mcp().server_names();
+        let mcp = if mcp_servers.is_empty() {
+            None
+        } else {
+            Some(mcp_servers[0].clone())
+        };
         Some(CompanionSession {
             id: session.id(),
             purpose: session.purpose().to_string(),
             verb: session.verb().map(Verb::as_str),
+            mcp,
+            mcp_servers,
         })
     }
 }
@@ -114,6 +138,11 @@ struct CompanionSession {
     id: Uuid,
     purpose: String,
     verb: Option<&'static str>,
+    /// Preferred MCP server id when tools are attached (v0: first attached).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mcp: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mcp_servers: Vec<String>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
@@ -130,6 +159,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/audit", get(list_audit))
         .route("/session/:id/stream", post(session_stream))
         .route("/session/:id/inbox", get(session_inbox))
+        .route("/session/:id/mcp", get(session_mcp))
         .with_state(state)
 }
 
@@ -166,6 +196,10 @@ struct OpenRequest {
     skills: Vec<Skill>,
     #[serde(default)]
     secrets: Vec<SecretRequest>,
+    /// Optional MCP profile name. When omitted, the active profile is used
+    /// if mcp.json exists; missing config attaches nothing.
+    #[serde(default)]
+    mcp_profile: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -175,6 +209,21 @@ struct OpenedSession {
     recipes: Vec<Recipe>,
     agent: Agent,
     skills: Vec<Skill>,
+    mcp_profile: String,
+    mcp_servers: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct SessionMcpBody {
+    profile: String,
+    servers: Vec<SessionMcpServer>,
+}
+
+#[derive(Serialize)]
+struct SessionMcpServer {
+    name: String,
+    transport: String,
+    tools: Vec<ToolInfo>,
 }
 
 async fn open_session(
@@ -189,6 +238,14 @@ async fn open_session(
     };
     harness.validate().map_err(ApiError::from_harness)?;
     let vault = Vault::open(&req.secrets).map_err(ApiError::from_vault)?;
+    let profile = req.mcp_profile.clone();
+    let mcp_dir = state.mcp_dir.clone();
+    let mcp = tokio::task::spawn_blocking(move || {
+        mcp::attach_profile(&mcp_dir, profile.as_deref())
+    })
+    .await
+    .map_err(|_| ApiError::internal("mcp attach task failed"))?
+    .map_err(ApiError::from_mcp)?;
     let id = Uuid::new_v4();
     let opened = OpenedSession {
         id,
@@ -196,9 +253,34 @@ async fn open_session(
         recipes: harness.recipes.clone(),
         agent: harness.agent.clone(),
         skills: harness.skills.clone(),
+        mcp_profile: mcp.profile.clone(),
+        mcp_servers: mcp.server_names(),
     };
-    lock(&state.sessions).insert(id, Session::create(id, harness, vault));
+    lock(&state.sessions).insert(id, Session::create(id, harness, vault, mcp));
     Ok((StatusCode::CREATED, Json(opened)))
+}
+
+async fn session_mcp(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<SessionMcpBody>, ApiError> {
+    let id = parse_id(&id)?;
+    let sessions = lock(&state.sessions);
+    let session = sessions.get(&id).ok_or_else(ApiError::missing)?;
+    let servers = session
+        .mcp()
+        .servers
+        .iter()
+        .map(|server| SessionMcpServer {
+            name: server.name.clone(),
+            transport: server.transport.clone(),
+            tools: server.tools.clone(),
+        })
+        .collect();
+    Ok(Json(SessionMcpBody {
+        profile: session.mcp().profile.clone(),
+        servers,
+    }))
 }
 
 async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
@@ -662,6 +744,13 @@ impl ApiError {
         }
     }
 
+    fn from_mcp(err: McpError) -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            message: err.to_string(),
+        }
+    }
+
     fn from_prompt(err: PromptError) -> Self {
         let status = match &err {
             PromptError::MissingKey | PromptError::InvalidKey { .. } => StatusCode::UNAUTHORIZED,
@@ -778,9 +867,15 @@ mod tests {
     }
 
     async fn spawn(desktop: Arc<FakeDesktop>) -> SocketAddr {
+        spawn_with_mcp_dir(desktop, std::env::temp_dir().join("hypermesh-mcp-empty")).await
+    }
+
+    async fn spawn_with_mcp_dir(desktop: Arc<FakeDesktop>, mcp_dir: PathBuf) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = Arc::new(AppState::new(desktop, Duration::from_millis(20)));
+        let mut state = AppState::new(desktop, Duration::from_millis(20));
+        state.mcp_dir = mcp_dir;
+        let state = Arc::new(state);
         tokio::spawn(async move {
             axum::serve(listener, router(state)).await.unwrap();
         });
@@ -869,6 +964,83 @@ mod tests {
         assert_eq!(value["skills"][0]["name"], "typing");
         assert!(value.get("secrets").is_none());
         assert!(!text.contains("hunter2"));
+    }
+
+    #[tokio::test]
+    async fn session_attaches_stdio_mcp_from_config_dir() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hm-mcp-api-{}-{}",
+            std::process::id(),
+            Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fixture-mcp.py");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        raise SystemExit(0)
+    return json.loads(line)
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+while True:
+    msg = recv()
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"0"}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"}}]}})
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        let servers = serde_json::json!({
+            "mcpServers": {
+                "fixture": {
+                    "command": script.to_string_lossy(),
+                    "type": "stdio"
+                }
+            }
+        });
+        std::fs::write(dir.join("mcp.json"), servers.to_string()).unwrap();
+        std::fs::write(
+            dir.join("mcp-profiles.json"),
+            r#"{"active":"default","profiles":{"default":{"servers":["fixture"]}}}"#,
+        )
+        .unwrap();
+
+        let addr = spawn_with_mcp_dir(FakeDesktop::new(), dir.clone()).await;
+        let (status, text, id) = open_session_id(addr, serde_json::json!([])).await;
+        assert_eq!(status, 201, "{text}");
+        let opened: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(opened["mcp_profile"], "default");
+        assert_eq!(opened["mcp_servers"][0], "fixture");
+
+        let (status, _, body) =
+            send(addr, "GET", &format!("/session/{id}/mcp"), None).await;
+        assert_eq!(status, 200);
+        let mcp: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(mcp["profile"], "default");
+        assert_eq!(mcp["servers"][0]["name"], "fixture");
+        assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
+
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(companion["session"]["mcp"], "fixture");
+
+        let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
+        assert_eq!(status, 204);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
