@@ -9,6 +9,7 @@ mod bind;
 mod desktop;
 mod harness;
 mod input;
+mod prompt;
 mod session;
 mod vault;
 

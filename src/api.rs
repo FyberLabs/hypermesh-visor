@@ -21,6 +21,7 @@ use zeroize::Zeroize;
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
 use crate::input::{plan_type, MouseOp, PlanError, TypeBody};
+use crate::prompt::{self, AuditRecord, PromptError};
 use crate::session::{Session, Verb};
 use crate::vault::{SecretRequest, Vault, VaultError};
 
@@ -28,14 +29,34 @@ pub struct AppState {
     sessions: Mutex<HashMap<Uuid, Session>>,
     desktop: Arc<dyn Desktop>,
     watch_poll: Duration,
+    prompts: prompt::PromptPass,
 }
 
 impl AppState {
     pub fn new(desktop: Arc<dyn Desktop>, watch_poll: Duration) -> Self {
+        Self::assemble(desktop, watch_poll, prompt::PromptPass::unconfigured())
+    }
+
+    /// `door` is the cloud-agent pass-through. The desktop daemon uses
+    /// [`prompt::PromptPass::unconfigured`] and does not call a model.
+    pub fn with_prompt_door(
+        desktop: Arc<dyn Desktop>,
+        watch_poll: Duration,
+        door: Arc<dyn prompt::PromptDoor>,
+    ) -> Self {
+        Self::assemble(desktop, watch_poll, prompt::PromptPass::new(door))
+    }
+
+    fn assemble(
+        desktop: Arc<dyn Desktop>,
+        watch_poll: Duration,
+        prompts: prompt::PromptPass,
+    ) -> Self {
         Self {
             sessions: Mutex::new(HashMap::new()),
             desktop,
             watch_poll,
+            prompts,
         }
     }
 
@@ -93,6 +114,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session/:id/listen", get(listen))
         .route("/session/:id/mouse", post(mouse))
         .route("/session/:id/type", post(type_keys))
+        .route("/prompt", post(submit_prompt))
+        .route("/audit", get(list_audit))
         .with_state(state)
 }
 
@@ -424,6 +447,40 @@ async fn type_keys(
 }
 
 #[derive(Deserialize)]
+struct PromptRequest {
+    prompt: String,
+    #[serde(default)]
+    api_key: String,
+    #[serde(default)]
+    model: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PromptResponse {
+    response: String,
+    passed_through: bool,
+}
+
+async fn submit_prompt(
+    State(state): State<Arc<AppState>>,
+    Json(mut body): Json<PromptRequest>,
+) -> Result<Json<PromptResponse>, ApiError> {
+    let result = state
+        .prompts
+        .submit(&body.prompt, &body.api_key, body.model.as_deref());
+    body.api_key.zeroize();
+    let response = result.map_err(ApiError::from_prompt)?;
+    Ok(Json(PromptResponse {
+        response,
+        passed_through: true,
+    }))
+}
+
+async fn list_audit(State(state): State<Arc<AppState>>) -> Json<Vec<AuditRecord>> {
+    Json(state.prompts.audit())
+}
+
+#[derive(Deserialize)]
 struct WatchQuery {
     #[serde(default)]
     mode: WatchMode,
@@ -500,6 +557,18 @@ impl ApiError {
             StatusCode::NOT_IMPLEMENTED
         } else {
             StatusCode::BAD_REQUEST
+        };
+        Self {
+            status,
+            message: err.to_string(),
+        }
+    }
+
+    fn from_prompt(err: PromptError) -> Self {
+        let status = match &err {
+            PromptError::MissingKey | PromptError::InvalidKey { .. } => StatusCode::UNAUTHORIZED,
+            PromptError::EmptyPrompt => StatusCode::BAD_REQUEST,
+            PromptError::Door(_) => StatusCode::BAD_GATEWAY,
         };
         Self {
             status,
@@ -955,5 +1024,121 @@ mod tests {
         buf.windows(2)
             .position(|pair| pair == b"\n\n")
             .map(|index| index + 2)
+    }
+
+    async fn spawn_with_door(door: Arc<dyn crate::prompt::PromptDoor>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let state = Arc::new(AppState::with_prompt_door(
+            FakeDesktop::new(),
+            Duration::from_millis(20),
+            door,
+        ));
+        tokio::spawn(async move {
+            axum::serve(listener, router(state)).await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn prompt_key_is_forwarded_and_the_auditor_records_the_pass() {
+        let door = crate::prompt::RecordingDoor::ok("baa");
+        let addr = spawn_with_door(door.clone()).await;
+        let (status, _, body) = send(addr, "GET", "/audit", None).await;
+        assert_eq!(status, 200);
+        assert_eq!(body.as_ref(), b"[]");
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/prompt",
+            Some(r#"{"prompt":"count the sheep","api_key":"org_fixture_ok"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("org_fixture_ok"));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["response"], "baa");
+        assert_eq!(value["passed_through"], true);
+
+        let calls = door.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].api_key, "org_fixture_ok");
+        assert_eq!(calls[0].prompt, "count the sheep");
+        assert_eq!(calls[0].model, None);
+
+        let (status, _, body) = send(addr, "GET", "/audit", None).await;
+        assert_eq!(status, 200);
+        let audit_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!audit_text.contains("org_fixture_ok"));
+        let audit: serde_json::Value = serde_json::from_str(&audit_text).unwrap();
+        assert_eq!(audit[0]["prompt"], "count the sheep");
+        assert_eq!(audit[0]["passed_through"], true);
+        assert_eq!(audit[0]["outcome"], "forwarded");
+        assert_eq!(audit[0]["response"], "baa");
+    }
+
+    #[tokio::test]
+    async fn prompt_rejects_a_missing_or_invalid_api_key() {
+        let door = crate::prompt::RecordingDoor::ok("baa");
+        let addr = spawn_with_door(door.clone()).await;
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/prompt",
+            Some(r#"{"prompt":"count the sheep"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert!(String::from_utf8_lossy(&body).contains("api key is required"));
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/prompt",
+            Some(r#"{"prompt":"count the sheep","api_key":"hm_dev_fixture_tail"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 401);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("hm_dev_"));
+        assert!(!text.contains("fixture_tail"));
+        assert!(door.calls().is_empty());
+
+        let (_, _, body) = send(addr, "GET", "/audit", None).await;
+        let audit_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!audit_text.contains("fixture_tail"));
+        assert!(!audit_text.contains("org_fixture_ok"));
+        let audit: serde_json::Value = serde_json::from_str(&audit_text).unwrap();
+        assert_eq!(audit.as_array().unwrap().len(), 2);
+        assert!(audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["passed_through"] == false && row["outcome"] == "rejected"));
+    }
+
+    #[tokio::test]
+    async fn unconfigured_prompt_door_does_not_invent_a_response() {
+        let addr = spawn(FakeDesktop::new()).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/prompt",
+            Some(r#"{"prompt":"count the sheep","api_key":"org_fixture_ok"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 502);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("not configured"));
+        assert!(!text.contains("org_fixture_ok"));
+        let (_, _, body) = send(addr, "GET", "/audit", None).await;
+        let audit: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(audit[0]["passed_through"], false);
+        assert_eq!(audit[0]["outcome"], "door_failed");
+        assert_eq!(audit[0]["prompt"], "count the sheep");
+        assert!(!String::from_utf8_lossy(&body).contains("org_fixture_ok"));
     }
 }
