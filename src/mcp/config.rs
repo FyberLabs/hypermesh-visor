@@ -66,6 +66,9 @@ struct Profile {
     servers: Vec<String>,
     #[serde(default)]
     config: BTreeMap<String, BTreeMap<String, String>>,
+    /// When true, attach only the Docker MCP gateway process for this profile.
+    #[serde(default)]
+    gateway: bool,
 }
 
 fn default_active() -> String {
@@ -110,17 +113,24 @@ pub fn load_named_server(dir: &Path, id: &str) -> Result<ServerSpec, McpError> {
 
 /// Load enabled servers for `profile_name` (or the active profile when empty).
 /// Missing config files yield an empty map (no attach).
+/// Merges project-local `mcp.json` (`.hypermesh/` or `.cursor/`) when present.
 pub fn load_profile_servers(
     dir: &Path,
     profile_name: Option<&str>,
 ) -> Result<(String, BTreeMap<String, ServerSpec>), McpError> {
     let servers_path = dir.join("mcp.json");
     let profiles_path = dir.join("mcp-profiles.json");
-    if !servers_path.exists() && !profiles_path.exists() {
+    if !servers_path.exists() && !profiles_path.exists() && project_mcp_path().is_none() {
         let name = profile_name.unwrap_or("default").to_string();
         return Ok((name, BTreeMap::new()));
     }
-    let servers = read_servers(&servers_path)?;
+    let mut servers = read_servers(&servers_path)?;
+    if let Some(project) = project_mcp_path() {
+        let project_servers = read_servers(&project)?;
+        for (id, spec) in project_servers.servers {
+            servers.servers.entry(id).or_insert(spec);
+        }
+    }
     let profiles = read_profiles(&profiles_path)?;
     let name = profile_name
         .map(str::trim)
@@ -130,6 +140,29 @@ pub fn load_profile_servers(
     let profile = profiles.profiles.get(&name).ok_or_else(|| {
         McpError::message(format!("mcp profile \"{name}\" not found"))
     })?;
+
+    if profile.gateway {
+        let id = "docker-gateway";
+        let mut spec = servers.servers.get(id).cloned().unwrap_or(ServerSpec {
+            r#type: Some("stdio".into()),
+            command: Some("docker".into()),
+            args: vec!["mcp".into(), "gateway".into(), "run".into()],
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            cwd: None,
+            enabled: Some(true),
+        });
+        if let Some(cfg) = profile.config.get(id) {
+            apply_config(&mut spec, cfg);
+        }
+        let mut out = BTreeMap::new();
+        if spec.is_enabled() {
+            out.insert(id.to_string(), spec);
+        }
+        return Ok((name, out));
+    }
+
     let mut out = BTreeMap::new();
     for id in &profile.servers {
         let Some(mut spec) = servers.servers.get(id).cloned() else {
@@ -146,6 +179,33 @@ pub fn load_profile_servers(
         out.insert(id.clone(), spec);
     }
     Ok((name, out))
+}
+
+/// Walk cwd (and parents) for project MCP config, or `HYPERMESH_MCP_PROJECT`.
+pub fn project_mcp_path() -> Option<PathBuf> {
+    if let Ok(explicit) = std::env::var("HYPERMESH_MCP_PROJECT") {
+        let p = PathBuf::from(explicit.trim());
+        if p.is_file() {
+            return Some(p);
+        }
+        let nested = p.join("mcp.json");
+        if nested.is_file() {
+            return Some(nested);
+        }
+    }
+    let mut dir = std::env::current_dir().ok()?;
+    for _ in 0..8 {
+        for rel in [".hypermesh/mcp.json", ".cursor/mcp.json"] {
+            let candidate = dir.join(rel);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    None
 }
 
 fn read_servers(path: &Path) -> Result<ServersFile, McpError> {
@@ -225,10 +285,34 @@ mod tests {
     }
 
     fn tempfile_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hm-mcp-cfg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hm-mcp-cfg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn gateway_profile_attaches_only_docker_gateway() {
+        let dir = tempfile_dir();
+        write(
+            &dir.join("mcp.json"),
+            r#"{"mcpServers":{"filesystem":{"command":"true"},"docker-gateway":{"command":"docker","args":["mcp","gateway","run"]}}}"#,
+        );
+        write(
+            &dir.join("mcp-profiles.json"),
+            r#"{"active":"default","profiles":{"default":{"servers":["filesystem"],"gateway":true}}}"#,
+        );
+        let (name, servers) = load_profile_servers(&dir, None).unwrap();
+        assert_eq!(name, "default");
+        assert_eq!(servers.len(), 1);
+        assert!(servers.contains_key("docker-gateway"));
     }
 
     fn write(path: &Path, body: &str) {

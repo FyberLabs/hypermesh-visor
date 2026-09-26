@@ -204,6 +204,18 @@ fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32) {
                 *app.status.lock().unwrap() = err;
             }
         }
+        Action::McpProfiles => {
+            app.menu = false;
+            if let Err(err) = open_hypermesh_args(&["mcp", "profile", "ls"]) {
+                *app.status.lock().unwrap() = err.to_string();
+            }
+        }
+        Action::McpDoctor => {
+            app.menu = false;
+            if let Err(err) = open_hypermesh_args(&["mcp", "doctor"]) {
+                *app.status.lock().unwrap() = err.to_string();
+            }
+        }
     }
 }
 
@@ -261,17 +273,48 @@ fn open_url(url: &str) -> std::io::Result<()> {
 }
 
 fn open_cli() -> std::io::Result<()> {
-    let terminals: &[(&str, &[&str])] = &[
-        ("x-terminal-emulator", &["-e", "hypermesh"]),
-        ("gnome-terminal", &["--", "hypermesh"]),
-        ("konsole", &["-e", "hypermesh"]),
-        ("xfce4-terminal", &["-e", "hypermesh"]),
-        ("kitty", &["hypermesh"]),
-        ("alacritty", &["-e", "hypermesh"]),
-        ("xterm", &["-e", "hypermesh"]),
+    open_hypermesh_args(&[])
+}
+
+fn open_hypermesh_args(extra: &[&str]) -> std::io::Result<()> {
+    let mut cmd = vec!["hypermesh".to_string()];
+    for a in extra {
+        cmd.push((*a).to_string());
+    }
+    let joined = shell_join(&cmd);
+    let terminals: &[(&str, Vec<String>)] = &[
+        (
+            "x-terminal-emulator",
+            vec!["-e".into(), "sh".into(), "-c".into(), joined.clone()],
+        ),
+        (
+            "gnome-terminal",
+            vec!["--".into(), "sh".into(), "-c".into(), joined.clone()],
+        ),
+        (
+            "konsole",
+            vec!["-e".into(), "sh".into(), "-c".into(), joined.clone()],
+        ),
+        (
+            "xfce4-terminal",
+            vec!["-e".into(), "sh".into(), "-c".into(), joined.clone()],
+        ),
+        ("kitty", {
+            let mut v = vec!["sh".into(), "-c".into()];
+            v.push(joined.clone());
+            v
+        }),
+        (
+            "alacritty",
+            vec!["-e".into(), "sh".into(), "-c".into(), joined.clone()],
+        ),
+        (
+            "xterm",
+            vec!["-e".into(), "sh".into(), "-c".into(), joined],
+        ),
     ];
     for (bin, args) in terminals {
-        if std::process::Command::new(bin).args(*args).spawn().is_ok() {
+        if std::process::Command::new(bin).args(args).spawn().is_ok() {
             return Ok(());
         }
     }
@@ -279,6 +322,20 @@ fn open_cli() -> std::io::Result<()> {
         std::io::ErrorKind::NotFound,
         "no terminal emulator found for hypermesh",
     ))
+}
+
+fn shell_join(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|p| {
+            if p.chars().any(|c| c.is_whitespace()) {
+                format!("'{p}'")
+            } else {
+                p.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn poll_pose() -> Pose {

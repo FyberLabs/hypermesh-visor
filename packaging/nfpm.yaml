@@ -25,6 +25,11 @@ contents:
     expand: true
     file_info:
       mode: 0755
+  - src: ${DESKTOP_MCP_BIN}
+    dst: /usr/bin/hypermesh-desktop-mcp
+    expand: true
+    file_info:
+      mode: 0755
   - src: ${CLI_BIN}
     dst: /usr/bin/hypermesh
     expand: true

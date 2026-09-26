@@ -129,6 +129,25 @@ func (s Store) ActiveServers(profileName string) (string, map[string]Server, err
 		return "", nil, fmt.Errorf("profile %q not found", name)
 	}
 	out := map[string]Server{}
+	if profile.Gateway {
+		id := "docker-gateway"
+		server, ok := servers.Servers[id]
+		if !ok {
+			if entry, found := CatalogByID(id); found {
+				server = entry.Server
+			} else {
+				server = Server{
+					Type:    "stdio",
+					Command: "docker",
+					Args:    []string{"mcp", "gateway", "run"},
+				}
+			}
+		}
+		if server.IsEnabled() {
+			out[id] = applyConfig(server, profile.Config[id])
+		}
+		return name, out, nil
+	}
 	for _, id := range profile.Servers {
 		server, ok := servers.Servers[id]
 		if !ok {

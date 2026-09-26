@@ -44,6 +44,82 @@ func cursorPaths() []string {
 	return out
 }
 
+// ImportProject merges a project-local mcp.json into the store.
+// Paths may be a file, a project root (looks for .hypermesh/mcp.json then .cursor/mcp.json),
+// or empty (walk cwd parents the same way).
+func (s Store) ImportProject(paths ...string) (added []string, err error) {
+	candidates := paths
+	if len(candidates) == 0 {
+		candidates = projectPaths()
+	}
+	var lastErr error
+	for _, path := range candidates {
+		filePath, err := resolveProjectMCP(path)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		raw, err := os.ReadFile(filePath)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		file, err := decodeFile(raw)
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", filePath, err)
+		}
+		return s.mergeServers(file.Servers)
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("no project mcp.json found: %w", lastErr)
+	}
+	return nil, fmt.Errorf("no project mcp.json found")
+}
+
+func projectPaths() []string {
+	var out []string
+	if cwd, err := os.Getwd(); err == nil {
+		dir := cwd
+		for i := 0; i < 8; i++ {
+			out = append(out,
+				filepath.Join(dir, ".hypermesh", "mcp.json"),
+				filepath.Join(dir, ".cursor", "mcp.json"),
+			)
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	return out
+}
+
+func resolveProjectMCP(path string) (string, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", fmt.Errorf("empty path")
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !st.IsDir() {
+		return path, nil
+	}
+	for _, rel := range []string{
+		filepath.Join(".hypermesh", "mcp.json"),
+		filepath.Join(".cursor", "mcp.json"),
+		"mcp.json",
+	} {
+		candidate := filepath.Join(path, rel)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("%s has no .hypermesh/mcp.json or .cursor/mcp.json", path)
+}
+
 // ImportDocker ensures a docker-gateway server and adds it to the active profile.
 // It prefers an existing `docker mcp gateway run` entry from Cursor-style configs
 // when the user already wired Docker that way; otherwise it uses the catalog entry.

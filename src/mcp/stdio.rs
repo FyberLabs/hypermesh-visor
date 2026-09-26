@@ -5,6 +5,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use serde_json::{json, Value};
 
 use super::config::{load_profile_servers, ServerSpec};
+use super::http::{self, HttpClient};
 use super::McpError;
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -26,6 +27,25 @@ pub struct AttachedServer {
     pub tools: Vec<ToolInfo>,
     child: Option<Child>,
     client: Option<StdioClient>,
+    http: Option<HttpClient>,
+}
+
+impl AttachedServer {
+    pub(crate) fn from_http(
+        name: String,
+        transport: String,
+        tools: Vec<ToolInfo>,
+        http: HttpClient,
+    ) -> Self {
+        Self {
+            name,
+            transport,
+            tools,
+            child: None,
+            client: None,
+            http: Some(http),
+        }
+    }
 }
 
 impl std::fmt::Debug for AttachedServer {
@@ -42,6 +62,7 @@ impl std::fmt::Debug for AttachedServer {
 impl Drop for AttachedServer {
     fn drop(&mut self) {
         self.client.take();
+        self.http.take();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -51,53 +72,74 @@ impl Drop for AttachedServer {
 
 impl AttachedServer {
     pub fn is_healthy(&self) -> bool {
+        if self.tools.is_empty() {
+            return false;
+        }
         match self.transport.as_str() {
             "stdio" => {
-                if self.client.is_none() || self.tools.is_empty() {
+                if self.client.is_none() {
                     return false;
                 }
                 let Some(child) = self.child.as_ref() else {
                     return false;
                 };
-                // try_wait needs &mut Child — check via raw pid still running.
-                // Use libc kill(pid, 0).
                 let pid = child.id() as i32;
                 unsafe { libc::kill(pid, 0) == 0 }
             }
+            "http" | "sse" => self.http.is_some(),
             _ => false,
         }
     }
 
     pub fn call_tool(&mut self, tool: &str, arguments: Value) -> Result<Value, McpError> {
         let name = self.name.clone();
-        let client = self
-            .client
-            .as_mut()
-            .ok_or_else(|| McpError::message(format!("mcp server \"{name}\" is not callable")))?;
-        let id = client.next_id;
-        client.next_id += 1;
-        write_msg(
-            &mut client.stdin,
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": "tools/call",
-                "params": {
+        if let Some(client) = self.client.as_mut() {
+            let id = client.next_id;
+            client.next_id += 1;
+            write_msg(
+                &mut client.stdin,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "tools/call",
+                    "params": {
+                        "name": tool,
+                        "arguments": arguments,
+                    }
+                }),
+            )?;
+            let response = read_msg(&name, &mut client.stdout)?;
+            if let Some(err) = response.get("error") {
+                return Err(McpError::message(format!(
+                    "mcp server \"{name}\" tool \"{tool}\" failed: {err}"
+                )));
+            }
+            return Ok(response
+                .get("result")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default())));
+        }
+        if let Some(http) = self.http.as_mut() {
+            let response = http.call(
+                "tools/call",
+                json!({
                     "name": tool,
                     "arguments": arguments,
-                }
-            }),
-        )?;
-        let response = read_msg(&name, &mut client.stdout)?;
-        if let Some(err) = response.get("error") {
-            return Err(McpError::message(format!(
-                "mcp server \"{name}\" tool \"{tool}\" failed: {err}"
-            )));
+                }),
+            )?;
+            if let Some(err) = response.get("error") {
+                return Err(McpError::message(format!(
+                    "mcp server \"{name}\" tool \"{tool}\" failed: {err}"
+                )));
+            }
+            return Ok(response
+                .get("result")
+                .cloned()
+                .unwrap_or(Value::Object(Default::default())));
         }
-        Ok(response
-            .get("result")
-            .cloned()
-            .unwrap_or(Value::Object(Default::default())))
+        Err(McpError::message(format!(
+            "mcp server \"{name}\" is not callable"
+        )))
     }
 }
 
@@ -168,13 +210,15 @@ pub(crate) fn attach_one_server(name: &str, spec: &ServerSpec) -> Result<Attache
 fn attach_one(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpError> {
     match spec.transport() {
         "stdio" => attach_stdio(name, spec),
-        "http" | "sse" => Ok(AttachedServer {
-            name: name.to_string(),
-            transport: spec.transport().to_string(),
-            tools: Vec::new(),
-            child: None,
-            client: None,
-        }),
+        "http" | "sse" => {
+            let (tools, client) = http::handshake_http(name, spec)?;
+            Ok(AttachedServer::from_http(
+                name.to_string(),
+                spec.transport().to_string(),
+                tools,
+                client,
+            ))
+        }
         other => Err(McpError::message(format!(
             "mcp server \"{name}\": unknown transport {other}"
         ))),
@@ -230,6 +274,7 @@ fn attach_stdio(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpErro
         tools,
         child: Some(child),
         client: Some(client),
+        http: None,
     })
 }
 
@@ -422,7 +467,14 @@ while True:
 
     #[test]
     fn attaches_fixture_stdio_lists_and_calls_tools() {
-        let dir = std::env::temp_dir().join(format!("hm-mcp-stdio-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "hm-mcp-stdio-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let script = fixture_script(&dir);

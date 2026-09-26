@@ -107,10 +107,15 @@ for target in "${targets[@]}"; do
 
   built="target/${target}/release/hypermesh-visor"
   companion="target/${target}/release/hypermesh-companion"
+  desktop_mcp="target/${target}/release/hypermesh-desktop-mcp"
   raw="dist/hypermesh-visor-${asset_arch}"
   install -m 0755 "$built" "$raw"
   if [[ ! -x "$companion" ]]; then
     echo "missing companion binary $companion" >&2
+    exit 1
+  fi
+  if [[ ! -x "$desktop_mcp" ]]; then
+    echo "missing desktop mcp binary $desktop_mcp" >&2
     exit 1
   fi
 
@@ -135,10 +140,10 @@ for target in "${targets[@]}"; do
 
   deb="dist/hypermesh-visor-${asset_arch}.deb"
   rpm="dist/hypermesh-visor-${asset_arch}.rpm"
-  VISOR_BIN="$raw" COMPANION_BIN="$companion" CLI_BIN="$cli_bin" HM_BIN="$hm_bin" \
+  VISOR_BIN="$raw" COMPANION_BIN="$companion" DESKTOP_MCP_BIN="$desktop_mcp" CLI_BIN="$cli_bin" HM_BIN="$hm_bin" \
     VERSION="$version" NFPM_ARCH="$deb_arch" \
     nfpm package --config packaging/nfpm.yaml --packager deb --target "$deb"
-  VISOR_BIN="$raw" COMPANION_BIN="$companion" CLI_BIN="$cli_bin" HM_BIN="$hm_bin" \
+  VISOR_BIN="$raw" COMPANION_BIN="$companion" DESKTOP_MCP_BIN="$desktop_mcp" CLI_BIN="$cli_bin" HM_BIN="$hm_bin" \
     VERSION="$version" NFPM_ARCH="$deb_arch" \
     nfpm package --config packaging/nfpm.yaml --packager rpm --target "$rpm"
 
@@ -153,6 +158,7 @@ for target in "${targets[@]}"; do
   for path in \
     './usr/bin/hypermesh-visor' \
     './usr/bin/hypermesh-companion' \
+    './usr/bin/hypermesh-desktop-mcp' \
     './usr/bin/hypermesh' \
     './usr/bin/hm' \
     './etc/xdg/autostart/hypermesh-companion.desktop'

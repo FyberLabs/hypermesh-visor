@@ -6,6 +6,7 @@
 mod audit;
 mod bindings;
 mod config;
+mod http;
 mod secret_fetch;
 mod stdio;
 

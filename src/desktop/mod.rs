@@ -1,5 +1,6 @@
 mod audio;
 mod fixture;
+mod focus;
 pub(crate) mod pixels;
 mod wayland;
 mod x11;
@@ -189,8 +190,7 @@ impl Desktop for LinuxDesktop {
                     executable: None,
                 }))
             }
-            // Wayland focus identity waits on a compositor protocol; fall back.
-            BackendKind::Wayland => Ok(None),
+            BackendKind::Wayland => Ok(focus::wayland_focused_app()),
         }
     }
 }
