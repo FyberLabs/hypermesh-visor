@@ -34,12 +34,22 @@ impl SecretSource {
 #[derive(Debug, PartialEq, Eq)]
 pub enum VaultError {
     NotImplemented(SecretSource),
-    MissingValue { name: String },
-    MissingLocator { name: String, source: SecretSource },
+    MissingValue {
+        name: String,
+    },
+    MissingLocator {
+        name: String,
+        source: SecretSource,
+    },
     /// Locator must be `server/tool` for source mcp.
-    BadLocator { name: String },
+    BadLocator {
+        name: String,
+    },
     /// MCP fetch failed. Message never includes secret bytes.
-    McpFetch { name: String, detail: String },
+    McpFetch {
+        name: String,
+        detail: String,
+    },
     EmptyName,
     DuplicateName(String),
 }
@@ -65,10 +75,7 @@ impl fmt::Display for VaultError {
                 )
             }
             Self::BadLocator { name } => {
-                write!(
-                    f,
-                    "secret \"{name}\" mcp locator must be server/tool"
-                )
+                write!(f, "secret \"{name}\" mcp locator must be server/tool")
             }
             Self::McpFetch { name, detail } => {
                 write!(f, "secret \"{name}\" mcp fetch failed: {detail}")
@@ -259,7 +266,10 @@ pub struct Vault {
 }
 
 impl Vault {
-    pub fn open(requests: &[SecretRequest], mcp_dir: impl Into<PathBuf>) -> Result<Self, VaultError> {
+    pub fn open(
+        requests: &[SecretRequest],
+        mcp_dir: impl Into<PathBuf>,
+    ) -> Result<Self, VaultError> {
         let ctx = VaultContext::new(mcp_dir);
         let mut seen = HashSet::new();
         let mut secrets = Vec::with_capacity(requests.len());
@@ -288,6 +298,30 @@ impl Vault {
             .iter()
             .find(|secret| secret.name == name)
             .map(|secret| Zeroizing::new(secret.value.to_vec()))
+    }
+
+    /// Names only. Values stay in the vault.
+    pub(crate) fn names(&self) -> Vec<String> {
+        self.secrets
+            .iter()
+            .map(|secret| secret.name.clone())
+            .collect()
+    }
+
+    /// Replaces secret values in `text`. Short values are left alone so a
+    /// one-character secret does not punch holes in ordinary activity.
+    pub(crate) fn redact(&self, text: &str) -> String {
+        let mut out = text.to_string();
+        for secret in &self.secrets {
+            let Ok(value) = std::str::from_utf8(&secret.value) else {
+                continue;
+            };
+            if value.chars().count() < 4 || !out.contains(value) {
+                continue;
+            }
+            out = out.replace(value, "***");
+        }
+        out
     }
 
     pub(crate) fn contains(&self, name: &str) -> bool {
@@ -417,7 +451,10 @@ mod tests {
 
     #[test]
     fn mcp_locator_must_be_server_slash_tool() {
-        assert_eq!(parse_mcp_locator("vault-fixture/get_secret"), Some(("vault-fixture", "get_secret")));
+        assert_eq!(
+            parse_mcp_locator("vault-fixture/get_secret"),
+            Some(("vault-fixture", "get_secret"))
+        );
         assert!(parse_mcp_locator("noslash").is_none());
         assert!(parse_mcp_locator("/tool").is_none());
         assert!(parse_mcp_locator("server/").is_none());

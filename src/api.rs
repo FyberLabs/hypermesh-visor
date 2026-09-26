@@ -21,7 +21,7 @@ use zeroize::Zeroize;
 
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
-use crate::input::{plan_type, MouseOp, PlanError, TypeBody};
+use crate::input::{keys_activity, mouse_activity, plan_type, MouseOp, PlanError, TypeBody};
 use crate::mcp::{
     self, companion_mode, load_bindings, resolve_preferred, FocusedApp, McpAuditRow, McpAuditor,
     McpError, ToolInfo,
@@ -39,6 +39,16 @@ pub struct AppState {
     /// Directory for mcp.json / mcp-profiles.json. Defaults to the Hypermesh config dir.
     mcp_dir: PathBuf,
     mcp_audit: Mutex<McpAuditor>,
+    /// Latest view/watch frame per session. The feed serves this cache.
+    /// It does not call `Desktop::view` again.
+    frames: Mutex<HashMap<Uuid, CachedFrame>>,
+}
+
+struct CachedFrame {
+    mime: String,
+    bytes: Vec<u8>,
+    handle: String,
+    seq: u64,
 }
 
 impl AppState {
@@ -92,15 +102,53 @@ impl AppState {
             prompts,
             mcp_dir,
             mcp_audit: Mutex::new(McpAuditor::default()),
+            frames: Mutex::new(HashMap::new()),
         }
     }
 
     fn close_all(&self) {
         lock(&self.sessions).clear();
+        lock(&self.frames).clear();
     }
 
     fn has_session(&self, id: Uuid) -> bool {
         lock(&self.sessions).contains_key(&id)
+    }
+
+    fn note(&self, id: Uuid, kind: &'static str, text: &str) {
+        let mut sessions = lock(&self.sessions);
+        let Some(session) = sessions.get_mut(&id) else {
+            return;
+        };
+        session.note(kind, text);
+    }
+
+    fn note_focus(&self, id: Uuid, label: &str) {
+        let mut sessions = lock(&self.sessions);
+        let Some(session) = sessions.get_mut(&id) else {
+            return;
+        };
+        session.note_focus(label);
+    }
+
+    /// Stores the frame `view` or `watch` already captured.
+    fn remember_frame(&self, id: Uuid, mime: String, bytes: Vec<u8>) {
+        let handle = format!("{:016x}", hash_frame(&bytes));
+        let mut frames = lock(&self.frames);
+        let seq = match frames.get(&id) {
+            Some(prev) if prev.handle == handle => prev.seq,
+            Some(prev) => prev.seq.saturating_add(1),
+            None => 1,
+        };
+        frames.insert(
+            id,
+            CachedFrame {
+                mime,
+                bytes,
+                handle,
+                seq,
+            },
+        );
     }
 
     fn mark_verb(&self, id: Uuid, verb: Verb) -> bool {
@@ -150,9 +198,7 @@ impl AppState {
             .ok()
             .flatten()
             .filter(|app| !app.is_empty());
-        let bindings = load_bindings(&self.mcp_dir)
-            .unwrap_or_default()
-            .bindings;
+        let bindings = load_bindings(&self.mcp_dir).unwrap_or_default().bindings;
         let preferred = focused
             .as_ref()
             .and_then(|app| resolve_preferred(app, &bindings, &healthy));
@@ -204,6 +250,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/session/:id", delete(close_session))
         .route("/session/:id/view", post(view))
         .route("/session/:id/watch", get(watch))
+        .route("/session/:id/feed/snapshot", get(session_feed_snapshot))
+        .route("/session/:id/feed", get(session_feed))
         .route("/session/:id/listen", get(listen))
         .route("/session/:id/mouse", post(mouse))
         .route("/session/:id/type", post(type_keys))
@@ -321,12 +369,11 @@ async fn open_session(
         .map_err(|_| ApiError::internal("vault open task failed"))?
         .map_err(ApiError::from_vault)?;
     let profile = req.mcp_profile.clone();
-    let mcp = tokio::task::spawn_blocking(move || {
-        mcp::attach_profile(&mcp_dir, profile.as_deref())
-    })
-    .await
-    .map_err(|_| ApiError::internal("mcp attach task failed"))?
-    .map_err(ApiError::from_mcp)?;
+    let mcp =
+        tokio::task::spawn_blocking(move || mcp::attach_profile(&mcp_dir, profile.as_deref()))
+            .await
+            .map_err(|_| ApiError::internal("mcp attach task failed"))?
+            .map_err(ApiError::from_mcp)?;
     let id = Uuid::new_v4();
     let opened = OpenedSession {
         id,
@@ -388,6 +435,7 @@ async fn mcp_call(
             decision: "deny".into(),
             outcome: "denied".into(),
         });
+        state.note(id, "mcp", &format!("{server} {tool} deny"));
         return Ok(Json(McpCallResponse {
             server,
             tool,
@@ -412,6 +460,7 @@ async fn mcp_call(
                 decision: "approve".into(),
                 outcome: "ok".into(),
             });
+            state.note(id, "mcp", &format!("{server} {tool} approve"));
             Ok(Json(McpCallResponse {
                 server,
                 tool,
@@ -427,6 +476,7 @@ async fn mcp_call(
                 decision: "approve".into(),
                 outcome: "failed".into(),
             });
+            state.note(id, "mcp", &format!("{server} {tool} approve"));
             Err(ApiError::from_mcp(err))
         }
     }
@@ -452,6 +502,7 @@ async fn close_session(
     if lock(&state.sessions).remove(&id).is_none() {
         return Err(ApiError::missing());
     }
+    lock(&state.frames).remove(&id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -464,13 +515,21 @@ async fn view(
         return Err(ApiError::missing());
     }
     let desktop = Arc::clone(&state.desktop);
-    let frame = tokio::task::spawn_blocking(move || desktop.view())
-        .await
-        .map_err(|_| ApiError::internal("desktop task failed"))?
-        .map_err(ApiError::from_desktop)?;
+    let (frame, focus) = tokio::task::spawn_blocking(move || {
+        let frame = desktop.view()?;
+        let focus = desktop.focused_app().ok().flatten();
+        Ok::<_, DesktopError>((frame, focus))
+    })
+    .await
+    .map_err(|_| ApiError::internal("desktop task failed"))?
+    .map_err(ApiError::from_desktop)?;
     if !state.has_session(id) {
         return Err(ApiError::missing());
     }
+    if let Some(label) = focus.as_ref().and_then(focus_label) {
+        state.note_focus(id, &label);
+    }
+    state.remember_frame(id, frame.mime.clone(), frame.bytes.clone());
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, frame.mime)
@@ -518,9 +577,14 @@ async fn watch_loop(
             break;
         }
         let desktop = Arc::clone(&state.desktop);
-        let viewed = tokio::task::spawn_blocking(move || desktop.view()).await;
-        let frame = match viewed {
-            Ok(Ok(frame)) => frame,
+        let viewed = tokio::task::spawn_blocking(move || {
+            let frame = desktop.view()?;
+            let focus = desktop.focused_app().ok().flatten();
+            Ok::<_, DesktopError>((frame, focus))
+        })
+        .await;
+        let (frame, focus) = match viewed {
+            Ok(Ok(pair)) => pair,
             Ok(Err(err)) => {
                 let _ = tx
                     .send(Ok(sse_json(serde_json::json!({
@@ -549,8 +613,12 @@ async fn watch_loop(
                 .await;
             break;
         }
+        if let Some(label) = focus.as_ref().and_then(focus_label) {
+            state.note_focus(id, &label);
+        }
         let digest = hash_frame(&frame.bytes);
         if last != Some(digest) {
+            state.remember_frame(id, frame.mime.clone(), frame.bytes.clone());
             seq += 1;
             let payload = match mode {
                 WatchMode::Notice => serde_json::json!({
@@ -640,6 +708,7 @@ async fn mouse(
     if !state.mark_verb(id, Verb::Mouse) {
         return Err(ApiError::missing());
     }
+    let activity = mouse_activity(&op);
     let desktop = Arc::clone(&state.desktop);
     let state2 = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
@@ -650,6 +719,7 @@ async fn mouse(
     })
     .await
     .map_err(|_| ApiError::internal("desktop task failed"))??;
+    state.note(id, "mouse", &activity);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -659,11 +729,18 @@ async fn type_keys(
     Json(mut body): Json<TypeBody>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
-    let secret = {
+    let (secret, typed, secret_handle, key_line) = {
         let mut sessions = lock(&state.sessions);
         let session = sessions.get_mut(&id).ok_or_else(ApiError::missing)?;
         session.mark_verb(Verb::Type);
-        match &body.secret {
+        let typed = body
+            .text
+            .as_deref()
+            .map(|text| session.redact(text))
+            .filter(|text| !text.is_empty());
+        let secret_handle = body.secret.clone().filter(|name| !name.is_empty());
+        let key_line = keys_activity(&body);
+        let secret = match &body.secret {
             Some(name) => Some(
                 session
                     .vault()
@@ -671,7 +748,8 @@ async fn type_keys(
                     .ok_or_else(|| ApiError::bad(format!("unknown secret \"{name}\"")))?,
             ),
             None => None,
-        }
+        };
+        (secret, typed, secret_handle, key_line)
     };
     let strokes = plan_type(&body, secret.as_ref().map(|value| value.as_slice()))
         .map_err(ApiError::from_plan)?;
@@ -692,6 +770,15 @@ async fn type_keys(
     })
     .await
     .map_err(|_| ApiError::internal("desktop task failed"))??;
+    if let Some(text) = &typed {
+        state.note(id, "type", text);
+    }
+    if let Some(text) = &key_line {
+        state.note(id, "type", text);
+    }
+    if let Some(handle) = &secret_handle {
+        state.note(id, "secret", handle);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -834,6 +921,130 @@ impl Default for WatchMode {
 
 fn parse_id(value: &str) -> Result<Uuid, ApiError> {
     Uuid::parse_str(value).map_err(|_| ApiError::missing())
+}
+
+#[derive(Serialize)]
+struct FeedBody {
+    session: Uuid,
+    snapshot: Option<FeedSnapshot>,
+    thinking: Vec<FeedLine>,
+    files: Vec<FeedHandle>,
+    secrets: Vec<FeedHandle>,
+}
+
+#[derive(Serialize)]
+struct FeedSnapshot {
+    handle: String,
+    mime: String,
+    seq: u64,
+}
+
+#[derive(Serialize)]
+struct FeedLine {
+    kind: &'static str,
+    text: String,
+}
+
+#[derive(Serialize)]
+struct FeedHandle {
+    handle: String,
+}
+
+/// Latest desktop snapshot handle plus terminal/IDE activity.
+/// Image bytes stay on `GET /session/{id}/feed/snapshot`. Secret values
+/// and file bytes are not on this document.
+async fn session_feed(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<FeedBody>, ApiError> {
+    let id = parse_id(&id)?;
+    let (thinking, files, secrets) = {
+        let sessions = lock(&state.sessions);
+        let session = sessions.get(&id).ok_or_else(ApiError::missing)?;
+        let thinking = session
+            .activity()
+            .iter()
+            .map(|line| FeedLine {
+                kind: line.kind,
+                text: session.redact(&line.text),
+            })
+            .collect();
+        let files = session
+            .held_files()
+            .iter()
+            .map(|file| FeedHandle {
+                handle: file.name.clone(),
+            })
+            .collect();
+        let secrets = session
+            .vault()
+            .names()
+            .into_iter()
+            .map(|handle| FeedHandle { handle })
+            .collect();
+        (thinking, files, secrets)
+    };
+    let snapshot = {
+        let frames = lock(&state.frames);
+        frames.get(&id).map(|frame| FeedSnapshot {
+            handle: frame.handle.clone(),
+            mime: frame.mime.clone(),
+            seq: frame.seq,
+        })
+    };
+    Ok(Json(FeedBody {
+        session: id,
+        snapshot,
+        thinking,
+        files,
+        secrets,
+    }))
+}
+
+async fn session_feed_snapshot(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let id = parse_id(&id)?;
+    if !state.has_session(id) {
+        return Err(ApiError::missing());
+    }
+    let held = {
+        let frames = lock(&state.frames);
+        frames
+            .get(&id)
+            .map(|frame| (frame.mime.clone(), frame.bytes.clone()))
+    };
+    let Some((mime, bytes)) = held else {
+        return Err(ApiError::missing());
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from(bytes))
+        .map_err(|_| ApiError::internal("response"))
+}
+
+fn focus_label(app: &FocusedApp) -> Option<String> {
+    let raw = app
+        .wm_class
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| app.app_id.clone().filter(|value| !value.trim().is_empty()))
+        .or_else(|| {
+            app.executable.as_ref().and_then(|path| {
+                std::path::Path::new(path)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+        })?;
+    let label = raw.trim();
+    if label.is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    }
 }
 
 fn hash_frame(bytes: &[u8]) -> u64 {
@@ -1198,8 +1409,7 @@ while True:
         assert_eq!(opened["mcp_profile"], "default");
         assert_eq!(opened["mcp_servers"][0], "fixture");
 
-        let (status, _, body) =
-            send(addr, "GET", &format!("/session/{id}/mcp"), None).await;
+        let (status, _, body) = send(addr, "GET", &format!("/session/{id}/mcp"), None).await;
         assert_eq!(status, 200);
         let mcp: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(mcp["profile"], "default");
@@ -1217,9 +1427,13 @@ while True:
             app_id: None,
             executable: None,
         }));
-        let (status, _, _) = send(addr, "POST", &format!("/session/{id}/mouse"), Some(
-            r#"{"action":"move","x":1,"y":2}"#.into(),
-        )).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":1,"y":2}"#.into()),
+        )
+        .await;
         assert_eq!(status, 204);
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1589,6 +1803,135 @@ while True:
     }
 
     #[tokio::test]
+    async fn renter_feed_uses_the_view_frame_and_hides_secrets() {
+        let desktop = FakeDesktop::new();
+        desktop.set_focus(Some(FocusedApp {
+            wm_class: Some("gnome-terminal".into()),
+            app_id: None,
+            executable: None,
+        }));
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(
+            addr,
+            serde_json::json!([{
+                "name": "password",
+                "source": "local",
+                "value": "hunter2"
+            }]),
+        )
+        .await;
+        let feed_path = format!("/session/{id}/feed");
+
+        let (status, _, body) = send(addr, "GET", &feed_path, None).await;
+        assert_eq!(status, 200);
+        let early: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(early["snapshot"].is_null());
+        assert_eq!(desktop.views.load(Ordering::SeqCst), 0);
+
+        let (status, _, view_body) = send(addr, "POST", &format!("/session/{id}/view"), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(desktop.views.load(Ordering::SeqCst), 1);
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"text":"cargo test --locked hunter2"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"secret":"password"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"click","x":4,"y":9,"button":"left"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, stream_body) = send_key(
+            addr,
+            "POST",
+            &format!("/session/{id}/stream"),
+            Some("org_fixture_ok"),
+            Some(
+                "\
+{\"kind\":\"prompt\",\"prompt\":\"count the sheep\"}
+{\"kind\":\"file\",\"name\":\"notes.txt\",\"content_base64\":\"U0VDUkVURklMRUJZVEVT\"}
+{\"kind\":\"secret\",\"name\":\"token\",\"source\":\"local\",\"value\":\"stream-secret-value\"}
+"
+                .into(),
+            ),
+        )
+        .await;
+        assert_eq!(status, 200, "{}", String::from_utf8_lossy(&stream_body));
+
+        let (status, _, body) = send(addr, "GET", &feed_path, None).await;
+        assert_eq!(status, 200);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("hunter2"));
+        assert!(!text.contains("stream-secret-value"));
+        assert!(!text.contains("SECRETFILEBYTES"));
+        assert!(!text.contains("content_base64"));
+        assert!(!text.contains("org_fixture_ok"));
+        let feed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(feed["snapshot"]["mime"], "image/png");
+        assert!(feed["snapshot"]["seq"].as_u64().unwrap() >= 1);
+        let thinking = feed["thinking"].as_array().unwrap();
+        let kinds: Vec<&str> = thinking
+            .iter()
+            .map(|row| row["kind"].as_str().unwrap())
+            .collect();
+        for kind in ["focus", "type", "mouse", "prompt", "file", "secret"] {
+            assert!(kinds.contains(&kind), "{kind} missing from {kinds:?}");
+        }
+        let lines: Vec<&str> = thinking
+            .iter()
+            .map(|row| row["text"].as_str().unwrap())
+            .collect();
+        assert!(lines.contains(&"gnome-terminal"));
+        assert!(lines.contains(&"cargo test --locked ***"));
+        assert!(lines.contains(&"password"));
+        assert!(lines.contains(&"click 4,9 left"));
+        assert!(lines.contains(&"count the sheep"));
+        assert!(lines.contains(&"notes.txt"));
+        assert_eq!(feed["files"][0]["handle"], "notes.txt");
+        assert!(feed["files"][0].get("content_base64").is_none());
+        let secret_handles: Vec<&str> = feed["secrets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["handle"].as_str().unwrap())
+            .collect();
+        assert!(secret_handles.contains(&"password"));
+        assert!(secret_handles.contains(&"token"));
+
+        let (status, headers, snap) =
+            send(addr, "GET", &format!("{feed_path}/snapshot"), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("image/png")
+        );
+        assert_eq!(snap, view_body);
+        assert_eq!(desktop.views.load(Ordering::SeqCst), 1);
+
+        let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(addr, "GET", &feed_path, None).await;
+        assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
     async fn watch_notices_a_changed_frame() {
         let desktop = FakeDesktop::new();
         let addr = spawn(Arc::clone(&desktop)).await;
@@ -1615,6 +1958,17 @@ while True:
             .await
             .expect("second notice");
         assert!(second.contains("\"seq\":2"));
+        let (status, _, body) = send(addr, "GET", &format!("/session/{id}/feed"), None).await;
+        assert_eq!(status, 200);
+        let feed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(feed["snapshot"]["seq"], 2);
+        let (status, _, snap) =
+            send(addr, "GET", &format!("/session/{id}/feed/snapshot"), None).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            snap.as_ref(),
+            encode_rgba_png(1, 1, &[1, 2, 3, 255]).unwrap().as_slice()
+        );
     }
 
     #[tokio::test]

@@ -13,6 +13,54 @@ impl Default for Button {
     }
 }
 
+impl Button {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+            Self::Middle => "middle",
+        }
+    }
+}
+
+/// What the renter feed may show for a mouse verb. Coordinates only.
+pub fn mouse_activity(op: &MouseOp) -> String {
+    match op {
+        MouseOp::Move { x, y } => format!("move {x},{y}"),
+        MouseOp::Click { x, y, button } => format!("click {x},{y} {}", button.as_str()),
+        MouseOp::Drag {
+            x,
+            y,
+            to_x,
+            to_y,
+            button,
+        } => format!("drag {x},{y} to {to_x},{to_y} {}", button.as_str()),
+    }
+}
+
+/// Named keys from a type verb. The secret value is not on this body.
+pub fn keys_activity(body: &TypeBody) -> Option<String> {
+    if body.keys.is_empty() {
+        return None;
+    }
+    let mut names = Vec::new();
+    for key in &body.keys {
+        let name = key.key.trim();
+        if name.is_empty() || name.len() > 32 || !name.chars().all(|ch| ch.is_ascii_graphic()) {
+            continue;
+        }
+        names.push(name.to_string());
+        if names.len() == 8 {
+            break;
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(format!("keys {}", names.join(" ")))
+    }
+}
+
 impl<'de> Deserialize<'de> for Button {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

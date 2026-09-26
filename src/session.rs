@@ -40,6 +40,17 @@ pub struct Session {
     prompts: Vec<HeldPrompt>,
     files: Vec<HeldFile>,
     secret_handles: Vec<String>,
+    activity: Vec<Activity>,
+    last_focus: Option<String>,
+}
+
+/// One line of terminal or IDE activity. `text` is already redacted.
+const ACTIVITY_CAP: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Activity {
+    pub kind: &'static str,
+    pub text: String,
 }
 
 /// A prompt delivered on the open stream. `model` is set only when the caller sent one.
@@ -68,6 +79,8 @@ impl Session {
             prompts: Vec::new(),
             files: Vec::new(),
             secret_handles: Vec::new(),
+            activity: Vec::new(),
+            last_focus: None,
         }
     }
 
@@ -121,21 +134,65 @@ impl Session {
     }
 
     pub(crate) fn push_prompt(&mut self, prompt: String, model: Option<String>) {
+        self.note("prompt", &prompt);
         self.prompts.push(HeldPrompt { prompt, model });
-        self.touched = Instant::now();
     }
 
     pub(crate) fn push_file(&mut self, name: String, bytes: Vec<u8>) {
+        self.note("file", &name);
         self.files.push(HeldFile { name, bytes });
-        self.touched = Instant::now();
     }
 
     /// Puts a secret in the session vault and records its name as a handle.
     pub(crate) fn push_secret(&mut self, request: &SecretRequest) -> Result<String, VaultError> {
         let handle = self.vault.insert(request)?;
         self.secret_handles.push(handle.clone());
-        self.touched = Instant::now();
+        self.note("secret", &handle);
         Ok(handle)
+    }
+
+    pub(crate) fn activity(&self) -> &[Activity] {
+        &self.activity
+    }
+
+    pub(crate) fn redact(&self, text: &str) -> String {
+        self.vault.redact(text)
+    }
+
+    /// Records terminal or IDE activity. Secret values are replaced first.
+    /// File bytes are not accepted here.
+    pub(crate) fn note(&mut self, kind: &'static str, text: &str) {
+        let redacted = self.redact(text);
+        let mut clean = String::new();
+        for ch in redacted.chars() {
+            if clean.chars().count() >= 280 {
+                break;
+            }
+            if ch.is_control() {
+                clean.push(' ');
+            } else {
+                clean.push(ch);
+            }
+        }
+        let clean = clean.trim().to_string();
+        if clean.is_empty() {
+            return;
+        }
+        if self.activity.len() >= ACTIVITY_CAP {
+            self.activity.remove(0);
+        }
+        self.activity.push(Activity { kind, text: clean });
+        self.touched = Instant::now();
+    }
+
+    /// Focused terminal or IDE. The same label is not repeated.
+    pub(crate) fn note_focus(&mut self, label: &str) {
+        let label = label.trim();
+        if label.is_empty() || self.last_focus.as_deref() == Some(label) {
+            return;
+        }
+        self.last_focus = Some(label.to_string());
+        self.note("focus", label);
     }
 }
 
