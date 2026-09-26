@@ -60,6 +60,11 @@ pub trait Desktop: Send + Sync {
     fn open_audio(&self) -> Result<Box<dyn AudioRead>, DesktopError>;
     fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError>;
     fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError>;
+
+    /// Focused window identity for MCP prefer detection. Default: unknown.
+    fn focused_app(&self) -> Result<Option<crate::mcp::FocusedApp>, DesktopError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -168,6 +173,24 @@ impl Desktop for LinuxDesktop {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::type_strokes(self.env.display.as_deref(), strokes),
             BackendKind::Wayland => self.with_wayland(|input| input.type_strokes(strokes)),
+        }
+    }
+
+    fn focused_app(&self) -> Result<Option<crate::mcp::FocusedApp>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => {
+                let wm_class = x11::focused_wm_class(self.env.display.as_deref())?;
+                if wm_class.is_none() {
+                    return Ok(None);
+                }
+                Ok(Some(crate::mcp::FocusedApp {
+                    wm_class,
+                    app_id: None,
+                    executable: None,
+                }))
+            }
+            // Wayland focus identity waits on a compositor protocol; fall back.
+            BackendKind::Wayland => Ok(None),
         }
     }
 }

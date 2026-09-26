@@ -6,7 +6,10 @@ pub enum Pose {
     Idle,
     Active {
         purpose: String,
+        /// Last desktop verb (`view`, `mouse`, …), when any.
         verb: Option<String>,
+        /// Prefer-MCP display: `mcp:<id>` when healthy binding matches, else the verb.
+        mode: Option<String>,
     },
 }
 
@@ -34,7 +37,30 @@ pub fn pose_from_companion(body: &str) -> Pose {
         .get("verb")
         .and_then(|verb| verb.as_str())
         .map(str::to_string);
-    Pose::Active { purpose, verb }
+    let mode = session
+        .get("mode")
+        .and_then(|mode| mode.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            // Prefer mcp:<id> when the visor says prefer_mcp.
+            if session
+                .get("prefer_mcp")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
+                session
+                    .get("mcp")
+                    .and_then(|mcp| mcp.as_str())
+                    .map(|id| format!("mcp:{id}"))
+            } else {
+                verb.clone()
+            }
+        });
+    Pose::Active {
+        purpose,
+        verb,
+        mode,
+    }
 }
 
 #[cfg(test)]
@@ -53,11 +79,29 @@ mod tests {
     fn idle_without_a_session() {
         assert_eq!(pose_from_companion(r#"{"open":false}"#), Pose::Idle);
         match pose_from_companion(
-            r#"{"open":true,"session":{"id":"x","purpose":"review the desktop","verb":"view"}}"#,
+            r#"{"open":true,"session":{"id":"x","purpose":"review the desktop","verb":"view","mode":"view","prefer_mcp":false}}"#,
         ) {
-            Pose::Active { purpose, verb } => {
+            Pose::Active {
+                purpose,
+                verb,
+                mode,
+            } => {
                 assert_eq!(purpose, "review the desktop");
                 assert_eq!(verb.as_deref(), Some("view"));
+                assert_eq!(mode.as_deref(), Some("view"));
+            }
+            Pose::Idle => panic!("expected active"),
+        }
+    }
+
+    #[test]
+    fn prefers_mcp_mode_on_the_label() {
+        match pose_from_companion(
+            r#"{"open":true,"session":{"id":"x","purpose":"drive","verb":"mouse","mode":"mcp:chrome","mcp":"chrome","prefer_mcp":true}}"#,
+        ) {
+            Pose::Active { mode, verb, .. } => {
+                assert_eq!(mode.as_deref(), Some("mcp:chrome"));
+                assert_eq!(verb.as_deref(), Some("mouse"));
             }
             Pose::Idle => panic!("expected active"),
         }

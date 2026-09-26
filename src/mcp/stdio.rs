@@ -1,7 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Duration;
 
 use serde_json::{json, Value};
 
@@ -15,13 +14,18 @@ pub struct ToolInfo {
     pub description: Option<String>,
 }
 
+struct StdioClient {
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    next_id: u64,
+}
+
 pub struct AttachedServer {
     pub name: String,
     pub transport: String,
     pub tools: Vec<ToolInfo>,
     child: Option<Child>,
-    /// Kept open so the server does not see EOF after tools/list.
-    _stdin: Option<ChildStdin>,
+    client: Option<StdioClient>,
 }
 
 impl std::fmt::Debug for AttachedServer {
@@ -30,17 +34,70 @@ impl std::fmt::Debug for AttachedServer {
             .field("name", &self.name)
             .field("transport", &self.transport)
             .field("tools", &self.tools)
+            .field("healthy", &self.is_healthy())
             .finish()
     }
 }
 
 impl Drop for AttachedServer {
     fn drop(&mut self) {
-        self._stdin.take();
+        self.client.take();
         if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+impl AttachedServer {
+    pub fn is_healthy(&self) -> bool {
+        match self.transport.as_str() {
+            "stdio" => {
+                if self.client.is_none() || self.tools.is_empty() {
+                    return false;
+                }
+                let Some(child) = self.child.as_ref() else {
+                    return false;
+                };
+                // try_wait needs &mut Child — check via raw pid still running.
+                // Use libc kill(pid, 0).
+                let pid = child.id() as i32;
+                unsafe { libc::kill(pid, 0) == 0 }
+            }
+            _ => false,
+        }
+    }
+
+    pub fn call_tool(&mut self, tool: &str, arguments: Value) -> Result<Value, McpError> {
+        let name = self.name.clone();
+        let client = self
+            .client
+            .as_mut()
+            .ok_or_else(|| McpError::message(format!("mcp server \"{name}\" is not callable")))?;
+        let id = client.next_id;
+        client.next_id += 1;
+        write_msg(
+            &mut client.stdin,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": tool,
+                    "arguments": arguments,
+                }
+            }),
+        )?;
+        let response = read_msg(&name, &mut client.stdout)?;
+        if let Some(err) = response.get("error") {
+            return Err(McpError::message(format!(
+                "mcp server \"{name}\" tool \"{tool}\" failed: {err}"
+            )));
+        }
+        Ok(response
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Object(Default::default())))
     }
 }
 
@@ -55,10 +112,37 @@ impl McpBundle {
     pub fn server_names(&self) -> Vec<String> {
         self.servers.iter().map(|s| s.name.clone()).collect()
     }
+
+    pub fn healthy_server_names(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .filter(|s| s.is_healthy())
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    pub fn call_tool(
+        &mut self,
+        server: &str,
+        tool: &str,
+        arguments: Value,
+    ) -> Result<Value, McpError> {
+        let attached = self
+            .servers
+            .iter_mut()
+            .find(|s| s.name == server)
+            .ok_or_else(|| McpError::message(format!("mcp server \"{server}\" is not attached")))?;
+        if !attached.tools.iter().any(|t| t.name == tool) {
+            return Err(McpError::message(format!(
+                "mcp server \"{server}\" has no tool \"{tool}\""
+            )));
+        }
+        attached.call_tool(tool, arguments)
+    }
 }
 
 /// Attach every enabled server in the profile. HTTP/SSE is recorded as
-/// not-yet-connected in v0; stdio is spawned and tools/list is called.
+/// not-yet-connected; stdio is spawned and tools/list is called.
 pub fn attach_profile(
     dir: &Path,
     profile_name: Option<&str>,
@@ -85,7 +169,7 @@ fn attach_one(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpError>
             transport: spec.transport().to_string(),
             tools: Vec::new(),
             child: None,
-            _stdin: None,
+            client: None,
         }),
         other => Err(McpError::message(format!(
             "mcp server \"{name}\": unknown transport {other}"
@@ -127,7 +211,7 @@ fn attach_stdio(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpErro
         .take()
         .ok_or_else(|| McpError::message(format!("mcp server \"{name}\": missing stdout")))?;
 
-    let (tools, stdin) = match handshake(name, stdin, stdout) {
+    let (tools, client) = match handshake(name, stdin, stdout) {
         Ok(pair) => pair,
         Err(err) => {
             let _ = child.kill();
@@ -141,12 +225,11 @@ fn attach_stdio(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpErro
         transport: "stdio".into(),
         tools,
         child: Some(child),
-        _stdin: Some(stdin),
+        client: Some(client),
     })
 }
 
 fn resolve_env(value: &str) -> String {
-    // ${env:NAME} only — do not expand arbitrary shell.
     let trimmed = value.trim();
     if let Some(inner) = trimmed
         .strip_prefix("${env:")
@@ -161,7 +244,7 @@ fn handshake(
     name: &str,
     mut stdin: ChildStdin,
     stdout: ChildStdout,
-) -> Result<(Vec<ToolInfo>, ChildStdin), McpError> {
+) -> Result<(Vec<ToolInfo>, StdioClient), McpError> {
     let mut reader = BufReader::new(stdout);
     write_msg(
         &mut stdin,
@@ -229,8 +312,14 @@ fn handshake(
             description,
         });
     }
-    let _ = Duration::from_millis(1);
-    Ok((out, stdin))
+    Ok((
+        out,
+        StdioClient {
+            stdin,
+            stdout: reader,
+            next_id: 3,
+        },
+    ))
 }
 
 fn write_msg(stdin: &mut ChildStdin, value: Value) -> Result<(), McpError> {
@@ -243,7 +332,6 @@ fn write_msg(stdin: &mut ChildStdin, value: Value) -> Result<(), McpError> {
 }
 
 fn read_msg(name: &str, reader: &mut BufReader<ChildStdout>) -> Result<Value, McpError> {
-    // Skip notifications / non-id messages until we see a response, with a bound.
     for _ in 0..32 {
         let mut line = String::new();
         reader
@@ -273,25 +361,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
 
-    fn attach_servers_for_test(
-        profile: &str,
-        specs: BTreeMap<String, ServerSpec>,
-    ) -> Result<McpBundle, McpError> {
-        let mut servers = Vec::new();
-        for (name, spec) in specs {
-            servers.push(attach_one(&name, &spec)?);
-        }
-        Ok(McpBundle {
-            profile: profile.into(),
-            servers,
-        })
-    }
-
-    #[test]
-    fn attaches_fixture_stdio_and_lists_tools() {
-        let dir = std::env::temp_dir().join(format!("hm-mcp-stdio-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+    fn fixture_script(dir: &Path) -> std::path::PathBuf {
         let script = dir.join("fixture-mcp.py");
         fs::write(
             &script,
@@ -314,6 +384,12 @@ while True:
         pass
     elif method == "tools/list":
         send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        name = msg.get("params",{}).get("name")
+        if name == "ping":
+            send({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"pong"}]}})
+        else:
+            send({"jsonrpc":"2.0","id":msg["id"],"error":{"code":-32601,"message":"unknown tool"}})
     else:
         if "id" in msg:
             send({"jsonrpc":"2.0","id":msg["id"],"error":{"code":-32601,"message":"unknown"}})
@@ -323,6 +399,29 @@ while True:
         let mut perms = fs::metadata(&script).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&script, perms).unwrap();
+        script
+    }
+
+    fn attach_servers_for_test(
+        profile: &str,
+        specs: BTreeMap<String, ServerSpec>,
+    ) -> Result<McpBundle, McpError> {
+        let mut servers = Vec::new();
+        for (name, spec) in specs {
+            servers.push(attach_one(&name, &spec)?);
+        }
+        Ok(McpBundle {
+            profile: profile.into(),
+            servers,
+        })
+    }
+
+    #[test]
+    fn attaches_fixture_stdio_lists_and_calls_tools() {
+        let dir = std::env::temp_dir().join(format!("hm-mcp-stdio-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = fixture_script(&dir);
 
         let mut specs = BTreeMap::new();
         specs.insert(
@@ -338,9 +437,13 @@ while True:
                 enabled: None,
             },
         );
-        let bundle = attach_servers_for_test("default", specs).unwrap();
-        assert_eq!(bundle.server_names(), vec!["fixture".to_string()]);
-        assert_eq!(bundle.servers[0].tools[0].name, "ping");
+        let mut bundle = attach_servers_for_test("default", specs).unwrap();
+        assert!(bundle.servers[0].is_healthy());
+        assert_eq!(bundle.healthy_server_names(), vec!["fixture".to_string()]);
+        let result = bundle
+            .call_tool("fixture", "ping", json!({}))
+            .unwrap();
+        assert_eq!(result["content"][0]["text"], "pong");
         drop(bundle);
     }
 }

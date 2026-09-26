@@ -3,9 +3,13 @@
 //! This is not vault `SecretSource::Mcp` (role B). Config matches the CLI:
 //! `mcp.json` + `mcp-profiles.json` under the Hypermesh config dir.
 
+mod audit;
+mod bindings;
 mod config;
 mod stdio;
 
+pub use audit::{McpAuditRow, McpAuditor};
+pub use bindings::{companion_mode, load_bindings, resolve_preferred, FocusedApp};
 pub use config::config_dir;
 pub use stdio::{attach_profile, McpBundle, ToolInfo};
 
