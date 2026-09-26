@@ -209,7 +209,8 @@ fn preflight(session: &Session, items: &[Item]) -> Result<(), StreamError> {
                 request.name.clone(),
             )));
         }
-        Vault::open(std::slice::from_ref(request)).map_err(StreamError::Vault)?;
+        Vault::open(std::slice::from_ref(request), session.vault().mcp_dir())
+            .map_err(StreamError::Vault)?;
     }
     Ok(())
 }
@@ -352,7 +353,7 @@ mod tests {
         Session::create(
             Uuid::new_v4(),
             harness,
-            Vault::open(&[]).unwrap(),
+            Vault::open(&[], std::env::temp_dir()).unwrap(),
             crate::mcp::McpBundle::default(),
         )
     }

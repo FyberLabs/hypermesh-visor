@@ -91,6 +91,23 @@ pub fn config_dir() -> PathBuf {
     PathBuf::from(".config/hypermesh")
 }
 
+/// Load one named server from `mcp.json` for vault secret fetch (role B).
+/// Profile membership is not required; disabled servers are rejected.
+pub fn load_named_server(dir: &Path, id: &str) -> Result<ServerSpec, McpError> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err(McpError::message("mcp server id is required"));
+    }
+    let servers = read_servers(&dir.join("mcp.json"))?;
+    let spec = servers.servers.get(id).cloned().ok_or_else(|| {
+        McpError::message(format!("mcp server \"{id}\" not found in mcp.json"))
+    })?;
+    if !spec.is_enabled() {
+        return Err(McpError::message(format!("mcp server \"{id}\" is disabled")));
+    }
+    Ok(spec)
+}
+
 /// Load enabled servers for `profile_name` (or the active profile when empty).
 /// Missing config files yield an empty map (no attach).
 pub fn load_profile_servers(

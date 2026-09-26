@@ -1,11 +1,14 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::mcp;
+
 /// Where a session secret comes from. The session call accepts every source.
-/// Version one materializes [`LocalBackend`] only.
+/// Version one materializes [`LocalBackend`] and [`McpBackend`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretSource {
@@ -33,6 +36,10 @@ pub enum VaultError {
     NotImplemented(SecretSource),
     MissingValue { name: String },
     MissingLocator { name: String, source: SecretSource },
+    /// Locator must be `server/tool` for source mcp.
+    BadLocator { name: String },
+    /// MCP fetch failed. Message never includes secret bytes.
+    McpFetch { name: String, detail: String },
     EmptyName,
     DuplicateName(String),
 }
@@ -56,6 +63,15 @@ impl fmt::Display for VaultError {
                     "secret \"{name}\" requires a locator for source \"{}\"",
                     source.as_str()
                 )
+            }
+            Self::BadLocator { name } => {
+                write!(
+                    f,
+                    "secret \"{name}\" mcp locator must be server/tool"
+                )
+            }
+            Self::McpFetch { name, detail } => {
+                write!(f, "secret \"{name}\" mcp fetch failed: {detail}")
             }
             Self::EmptyName => write!(f, "secret name is required"),
             Self::DuplicateName(name) => write!(f, "duplicate secret \"{name}\""),
@@ -100,7 +116,25 @@ impl<'de> Deserialize<'de> for SecretRequest {
 
 pub trait SecretSourceBackend {
     fn source(&self) -> SecretSource;
-    fn materialize(&self, request: &SecretRequest) -> Result<Zeroizing<Vec<u8>>, VaultError>;
+    fn materialize(
+        &self,
+        request: &SecretRequest,
+        ctx: &VaultContext,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError>;
+}
+
+/// Context for materializing secrets. `mcp_dir` is only used by source mcp.
+#[derive(Clone, Debug)]
+pub struct VaultContext {
+    pub mcp_dir: PathBuf,
+}
+
+impl VaultContext {
+    pub fn new(mcp_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            mcp_dir: mcp_dir.into(),
+        }
+    }
 }
 
 pub struct LocalBackend;
@@ -110,7 +144,11 @@ impl SecretSourceBackend for LocalBackend {
         SecretSource::Local
     }
 
-    fn materialize(&self, request: &SecretRequest) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+    fn materialize(
+        &self,
+        request: &SecretRequest,
+        _ctx: &VaultContext,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
         let Some(value) = request.value.as_ref() else {
             return Err(VaultError::MissingValue {
                 name: request.name.clone(),
@@ -140,6 +178,7 @@ macro_rules! unimplemented_backend {
             fn materialize(
                 &self,
                 request: &SecretRequest,
+                _ctx: &VaultContext,
             ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
                 let locator = request
                     .locator
@@ -160,9 +199,53 @@ macro_rules! unimplemented_backend {
 }
 
 unimplemented_backend!(UrlBackend, Url);
-unimplemented_backend!(McpBackend, Mcp);
 unimplemented_backend!(ChainBackend, Chain);
 unimplemented_backend!(IpfsBackend, Ipfs);
+
+impl SecretSourceBackend for McpBackend {
+    fn source(&self) -> SecretSource {
+        SecretSource::Mcp
+    }
+
+    fn materialize(
+        &self,
+        request: &SecretRequest,
+        ctx: &VaultContext,
+    ) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+        let locator = request
+            .locator
+            .as_ref()
+            .map(|value| value.as_str().trim())
+            .unwrap_or("");
+        if locator.is_empty() {
+            return Err(VaultError::MissingLocator {
+                name: request.name.clone(),
+                source: SecretSource::Mcp,
+            });
+        }
+        let (server, tool) = parse_mcp_locator(locator).ok_or_else(|| VaultError::BadLocator {
+            name: request.name.clone(),
+        })?;
+        mcp::fetch_secret_bytes(&ctx.mcp_dir, server, tool, &request.name).map_err(|err| {
+            VaultError::McpFetch {
+                name: request.name.clone(),
+                detail: err.to_string(),
+            }
+        })
+    }
+}
+
+/// Locator shape for source mcp: `server/tool`.
+pub fn parse_mcp_locator(locator: &str) -> Option<(&str, &str)> {
+    let locator = locator.trim();
+    let (server, tool) = locator.split_once('/')?;
+    let server = server.trim();
+    let tool = tool.trim();
+    if server.is_empty() || tool.is_empty() || tool.contains('/') {
+        return None;
+    }
+    Some((server, tool))
+}
 
 struct StoredSecret {
     name: String,
@@ -172,10 +255,12 @@ struct StoredSecret {
 /// Secrets for one session. Dropping the vault clears them.
 pub struct Vault {
     secrets: Vec<StoredSecret>,
+    ctx: VaultContext,
 }
 
 impl Vault {
-    pub fn open(requests: &[SecretRequest]) -> Result<Self, VaultError> {
+    pub fn open(requests: &[SecretRequest], mcp_dir: impl Into<PathBuf>) -> Result<Self, VaultError> {
+        let ctx = VaultContext::new(mcp_dir);
         let mut seen = HashSet::new();
         let mut secrets = Vec::with_capacity(requests.len());
         for request in requests {
@@ -185,13 +270,17 @@ impl Vault {
             if !seen.insert(request.name.clone()) {
                 return Err(VaultError::DuplicateName(request.name.clone()));
             }
-            let value = materialize(request)?;
+            let value = materialize(request, &ctx)?;
             secrets.push(StoredSecret {
                 name: request.name.clone(),
                 value,
             });
         }
-        Ok(Self { secrets })
+        Ok(Self { secrets, ctx })
+    }
+
+    pub fn mcp_dir(&self) -> &Path {
+        &self.ctx.mcp_dir
     }
 
     pub fn get(&self, name: &str) -> Option<Zeroizing<Vec<u8>>> {
@@ -213,7 +302,7 @@ impl Vault {
         if self.contains(&request.name) {
             return Err(VaultError::DuplicateName(request.name.clone()));
         }
-        let value = materialize(request)?;
+        let value = materialize(request, &self.ctx)?;
         let name = request.name.clone();
         self.secrets.push(StoredSecret {
             name: name.clone(),
@@ -244,12 +333,15 @@ impl fmt::Debug for Vault {
     }
 }
 
-fn materialize(request: &SecretRequest) -> Result<Zeroizing<Vec<u8>>, VaultError> {
+fn materialize(
+    request: &SecretRequest,
+    ctx: &VaultContext,
+) -> Result<Zeroizing<Vec<u8>>, VaultError> {
     let backend = backend(request.source);
     if backend.source() != request.source {
         return Err(VaultError::NotImplemented(request.source));
     }
-    backend.materialize(request)
+    backend.materialize(request, ctx)
 }
 
 fn backend(source: SecretSource) -> &'static dyn SecretSourceBackend {
@@ -265,6 +357,8 @@ fn backend(source: SecretSource) -> &'static dyn SecretSourceBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
 
     fn local(name: &str, value: &str) -> SecretRequest {
         SecretRequest {
@@ -284,9 +378,15 @@ mod tests {
         }
     }
 
+    fn empty_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hm-vault-empty-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        dir
+    }
+
     #[test]
     fn local_secret_round_trips_and_debug_hides_it() {
-        let vault = Vault::open(&[local("password", "hunter2")]).unwrap();
+        let vault = Vault::open(&[local("password", "hunter2")], empty_dir()).unwrap();
         assert_eq!(vault.get("password").unwrap().as_slice(), b"hunter2");
         let rendered = format!("{vault:?}");
         assert!(rendered.contains("password"));
@@ -305,13 +405,8 @@ mod tests {
     #[test]
     fn later_sources_are_not_fetched() {
         let locator = "https://user:password@example.invalid/secret";
-        for source in [
-            SecretSource::Url,
-            SecretSource::Mcp,
-            SecretSource::Chain,
-            SecretSource::Ipfs,
-        ] {
-            let err = Vault::open(&[remote(source, Some(locator))]).unwrap_err();
+        for source in [SecretSource::Url, SecretSource::Chain, SecretSource::Ipfs] {
+            let err = Vault::open(&[remote(source, Some(locator))], empty_dir()).unwrap_err();
             assert_eq!(err, VaultError::NotImplemented(source));
             let text = err.to_string();
             assert!(!text.contains("password"));
@@ -321,23 +416,94 @@ mod tests {
     }
 
     #[test]
+    fn mcp_locator_must_be_server_slash_tool() {
+        assert_eq!(parse_mcp_locator("vault-fixture/get_secret"), Some(("vault-fixture", "get_secret")));
+        assert!(parse_mcp_locator("noslash").is_none());
+        assert!(parse_mcp_locator("/tool").is_none());
+        assert!(parse_mcp_locator("server/").is_none());
+        let err = Vault::open(
+            &[remote(SecretSource::Mcp, Some("not-a-locator"))],
+            empty_dir(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, VaultError::BadLocator { .. }));
+    }
+
+    #[test]
+    fn mcp_source_fetches_via_short_lived_stdio() {
+        let dir = std::env::temp_dir().join(format!("hm-vault-mcp-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("secret-mcp.py");
+        fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        raise SystemExit(0)
+    return json.loads(line)
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+while True:
+    msg = recv()
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"secrets","version":"0"}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"get_secret","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"from-mcp"}]}})
+"#,
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script, perms).unwrap();
+        fs::write(
+            dir.join("mcp.json"),
+            format!(
+                r#"{{"mcpServers":{{"vault-fixture":{{"command":"{}","type":"stdio"}}}}}}"#,
+                script.display()
+            ),
+        )
+        .unwrap();
+
+        let vault = Vault::open(
+            &[remote(SecretSource::Mcp, Some("vault-fixture/get_secret"))],
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(vault.get("token").unwrap().as_slice(), b"from-mcp");
+        let rendered = format!("{vault:?}");
+        assert!(!rendered.contains("from-mcp"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn remote_source_still_requires_a_locator() {
-        let err = Vault::open(&[remote(SecretSource::Url, None)]).unwrap_err();
+        let err = Vault::open(&[remote(SecretSource::Url, None)], empty_dir()).unwrap_err();
+        assert!(matches!(err, VaultError::MissingLocator { .. }));
+        let err = Vault::open(&[remote(SecretSource::Mcp, None)], empty_dir()).unwrap_err();
         assert!(matches!(err, VaultError::MissingLocator { .. }));
     }
 
     #[test]
     fn duplicate_and_empty_names_fail() {
         assert!(matches!(
-            Vault::open(&[local("  ", "x")]),
+            Vault::open(&[local("  ", "x")], empty_dir()),
             Err(VaultError::EmptyName)
         ));
         assert!(matches!(
-            Vault::open(&[local("a", "x"), local("a", "y")]),
+            Vault::open(&[local("a", "x"), local("a", "y")], empty_dir()),
             Err(VaultError::DuplicateName(_))
         ));
         assert!(matches!(
-            Vault::open(&[local("a", "")]),
+            Vault::open(&[local("a", "")], empty_dir()),
             Err(VaultError::MissingValue { .. })
         ));
     }
