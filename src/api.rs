@@ -465,10 +465,17 @@ async fn submit_prompt(
     State(state): State<Arc<AppState>>,
     Json(mut body): Json<PromptRequest>,
 ) -> Result<Json<PromptResponse>, ApiError> {
-    let result = state
-        .prompts
-        .submit(&body.prompt, &body.api_key, body.model.as_deref());
-    body.api_key.zeroize();
+    let prompt = std::mem::take(&mut body.prompt);
+    let mut api_key = std::mem::take(&mut body.api_key);
+    let model = body.model.clone();
+    let state = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        let result = state.prompts.submit(&prompt, &api_key, model.as_deref());
+        api_key.zeroize();
+        result
+    })
+    .await
+    .map_err(|_| ApiError::internal("prompt task failed"))?;
     let response = result.map_err(ApiError::from_prompt)?;
     Ok(Json(PromptResponse {
         response,
@@ -1140,5 +1147,72 @@ mod tests {
         assert_eq!(audit[0]["outcome"], "door_failed");
         assert_eq!(audit[0]["prompt"], "count the sheep");
         assert!(!String::from_utf8_lossy(&body).contains("org_fixture_ok"));
+    }
+
+    #[tokio::test]
+    async fn supervisor_fixture_hides_the_key_on_the_http_door() {
+        let fixture = crate::prompt::ChatFixture::spawn(
+            200,
+            r#"{"choices":[{"message":{"content":"echo org_fixture_ok"}}]}"#,
+        );
+        let door = Arc::new(crate::prompt::SupervisorDoor::connect(&fixture.url).unwrap());
+        let addr = spawn_with_door(door).await;
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/prompt",
+            Some(r#"{"prompt":"count the sheep"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert!(String::from_utf8_lossy(&body).contains("api key is required"));
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/prompt",
+            Some(r#"{"prompt":"count the sheep","api_key":"hm_site_fixture_tail"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 401);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(text.contains("hm_site_"));
+        assert!(!text.contains("fixture_tail"));
+        assert!(fixture.hits().is_empty());
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/prompt",
+            Some(r#"{"prompt":"count the sheep","api_key":"org_fixture_ok"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains("org_fixture_ok"));
+        assert!(text.contains("echo ***"));
+        let hits = fixture.hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].api_key, "org_fixture_ok");
+        assert_eq!(hits[0].path, "/v1/chat/completions");
+
+        let (status, _, body) = send(addr, "GET", "/audit", None).await;
+        assert_eq!(status, 200);
+        let audit_text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!audit_text.contains("org_fixture_ok"));
+        assert!(!audit_text.contains("fixture_tail"));
+        let audit: serde_json::Value = serde_json::from_str(&audit_text).unwrap();
+        assert_eq!(audit.as_array().unwrap().len(), 3);
+        assert_eq!(audit[2]["outcome"], "forwarded");
+        assert_eq!(audit[2]["passed_through"], true);
+        assert_eq!(audit[2]["response"], "echo ***");
+        assert_eq!(audit[2]["prompt"], "count the sheep");
+        assert!(audit
+            .as_array()
+            .unwrap()
+            .iter()
+            .take(2)
+            .all(|row| row["outcome"] == "rejected" && row["passed_through"] == false));
     }
 }
