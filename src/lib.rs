@@ -17,6 +17,7 @@ pub use api::{serve, AppState};
 pub use bind::parse_listen;
 pub use desktop::{current_euid, Desktop, FixtureDesktop, LinuxDesktop};
 pub use hypermesh_session::{refresh_token, MemoryStore, SessionStore};
+pub use prompt::{open_supervisor_door, PromptDoor};
 
 #[cfg(test)]
 mod session_key {
