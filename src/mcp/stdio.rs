@@ -161,6 +161,10 @@ pub fn attach_profile(
     Ok(McpBundle { profile, servers })
 }
 
+pub(crate) fn attach_one_server(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpError> {
+    attach_one(name, spec)
+}
+
 fn attach_one(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpError> {
     match spec.transport() {
         "stdio" => attach_stdio(name, spec),

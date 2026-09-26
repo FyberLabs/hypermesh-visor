@@ -6,11 +6,13 @@
 mod audit;
 mod bindings;
 mod config;
+mod secret_fetch;
 mod stdio;
 
 pub use audit::{McpAuditRow, McpAuditor};
 pub use bindings::{companion_mode, load_bindings, resolve_preferred, FocusedApp};
 pub use config::config_dir;
+pub use secret_fetch::fetch_secret_bytes;
 pub use stdio::{attach_profile, McpBundle, ToolInfo};
 
 use std::fmt;

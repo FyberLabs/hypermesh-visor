@@ -312,9 +312,15 @@ async fn open_session(
         skills: req.skills,
     };
     harness.validate().map_err(ApiError::from_harness)?;
-    let vault = Vault::open(&req.secrets).map_err(ApiError::from_vault)?;
-    let profile = req.mcp_profile.clone();
     let mcp_dir = state.mcp_dir.clone();
+    let vault_dir = mcp_dir.clone();
+    let secrets = req.secrets;
+    // Vault source mcp (role B) is a short-lived fetch; session tool attach (role A) follows.
+    let vault = tokio::task::spawn_blocking(move || Vault::open(&secrets, vault_dir))
+        .await
+        .map_err(|_| ApiError::internal("vault open task failed"))?
+        .map_err(ApiError::from_vault)?;
+    let profile = req.mcp_profile.clone();
     let mcp = tokio::task::spawn_blocking(move || {
         mcp::attach_profile(&mcp_dir, profile.as_deref())
     })
@@ -880,10 +886,10 @@ impl ApiError {
     }
 
     fn from_vault(err: VaultError) -> Self {
-        let status = if matches!(err, VaultError::NotImplemented(_)) {
-            StatusCode::NOT_IMPLEMENTED
-        } else {
-            StatusCode::BAD_REQUEST
+        let status = match &err {
+            VaultError::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
+            VaultError::McpFetch { .. } => StatusCode::BAD_GATEWAY,
+            _ => StatusCode::BAD_REQUEST,
         };
         Self {
             status,
@@ -1436,7 +1442,7 @@ while True:
         let desktop = FakeDesktop::new();
         let addr = spawn(desktop).await;
         let locator = "https://user:password@example.invalid/secret";
-        for source in ["url", "mcp", "chain", "ipfs"] {
+        for source in ["url", "chain", "ipfs"] {
             let (status, text, _) = open_session_id(
                 addr,
                 serde_json::json!([{
@@ -1459,6 +1465,112 @@ while True:
         )
         .await;
         assert_eq!(status, 404);
+    }
+
+    #[tokio::test]
+    async fn mcp_secret_source_materializes_via_locator() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "hm-api-mcp-vault-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("secret-mcp.py");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys
+def recv():
+    line = sys.stdin.readline()
+    if not line:
+        raise SystemExit(0)
+    return json.loads(line)
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+while True:
+    msg = recv()
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"protocolVersion":"2024-11-05","capabilities":{"tools":{}},"serverInfo":{"name":"secrets","version":"0"}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"get_secret","inputSchema":{"type":"object"}}]}})
+    elif method == "tools/call":
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"typed-from-mcp"}]}})
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        std::fs::write(
+            dir.join("mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "vault-fixture": {
+                        "command": script.to_string_lossy(),
+                        "type": "stdio"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let desktop = FakeDesktop::new();
+        let addr = spawn_with_mcp_dir(Arc::clone(&desktop), dir.clone()).await;
+        let (status, text, id) = open_session_id(
+            addr,
+            serde_json::json!([{
+                "name": "password",
+                "source": "mcp",
+                "locator": "vault-fixture/get_secret"
+            }]),
+        )
+        .await;
+        assert_eq!(status, 201, "{text}");
+        assert!(!text.contains("typed-from-mcp"));
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"secret":"password"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        assert!(body.is_empty());
+        let typed = lock(&desktop.typed).clone();
+        let expected = plan_type(
+            &TypeBody {
+                text: None,
+                keys: Vec::new(),
+                secret: None,
+            },
+            Some(b"typed-from-mcp"),
+        )
+        .unwrap();
+        assert_eq!(typed, expected);
+        let rendered = format!("{typed:?}");
+        assert!(!rendered.contains("typed-from-mcp"));
+
+        let (status, text, _) = open_session_id(
+            addr,
+            serde_json::json!([{
+                "name": "token",
+                "source": "mcp",
+                "locator": "not-a-locator"
+            }]),
+        )
+        .await;
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("server/tool"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
