@@ -324,3 +324,60 @@ func AssistantText(raw json.RawMessage) string {
 	}
 	return env.Choices[0].Message.Content
 }
+
+type visorPromptBody struct {
+	Kind   string `json:"kind"`
+	Prompt string `json:"prompt"`
+	Model  string `json:"model,omitempty"`
+}
+
+// PostVisorPrompt posts one prompt to the open visor stream.
+// The API key is X-Api-Key. Model is omitted when empty. Lease and tenant headers are not sent.
+func (c *Client) PostVisorPrompt(visorBase, sessionID, prompt, model string) ([]byte, error) {
+	if err := ValidateRenterKey(c.APIKey); err != nil {
+		return nil, err
+	}
+	prompt = strings.TrimSpace(prompt)
+	if prompt == "" {
+		return nil, fmt.Errorf("prompt is required")
+	}
+	u, err := VisorStreamURL(visorBase, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	payload := visorPromptBody{Kind: "prompt", Prompt: prompt, Model: strings.TrimSpace(model)}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	b = append(b, '\n')
+	req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(b))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+	req.Header.Set("Accept", "application/x-ndjson")
+	req.Header.Set(HeaderAPIKey, strings.TrimSpace(c.APIKey))
+	httpClient := c.HTTP
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
+	local := *httpClient
+	local.CheckRedirect = func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
+	resp, err := local.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("visor stream request failed")
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("visor stream request failed")
+	}
+	text := RedactKey(string(raw), c.APIKey)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("visor stream HTTP %d: %s", resp.StatusCode, strings.TrimSpace(text))
+	}
+	return []byte(text), nil
+}
