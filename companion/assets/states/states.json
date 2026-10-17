@@ -1,0 +1,183 @@
+{
+ "sizes": [
+  128,
+  256,
+  "400x520"
+ ],
+ "states": {
+  "idle": {
+   "ms_per_frame": 150,
+   "loop": true,
+   "frames": {
+    "128": [
+     "idle_0_128.png",
+     "idle_1_128.png",
+     "idle_2_128.png",
+     "idle_3_128.png",
+     "idle_4_128.png",
+     "idle_5_128.png",
+     "idle_6_128.png",
+     "idle_7_128.png"
+    ],
+    "256": [
+     "idle_0_256.png",
+     "idle_1_256.png",
+     "idle_2_256.png",
+     "idle_3_256.png",
+     "idle_4_256.png",
+     "idle_5_256.png",
+     "idle_6_256.png",
+     "idle_7_256.png"
+    ],
+    "400x520": [
+     "idle_0_400x520.png",
+     "idle_1_400x520.png",
+     "idle_2_400x520.png",
+     "idle_3_400x520.png",
+     "idle_4_400x520.png",
+     "idle_5_400x520.png",
+     "idle_6_400x520.png",
+     "idle_7_400x520.png"
+    ]
+   }
+  },
+  "automation": {
+   "ms_per_frame": 90,
+   "loop": true,
+   "frames": {
+    "128": [
+     "automation_0_128.png",
+     "automation_1_128.png",
+     "automation_2_128.png",
+     "automation_3_128.png",
+     "automation_4_128.png",
+     "automation_5_128.png",
+     "automation_6_128.png",
+     "automation_7_128.png"
+    ],
+    "256": [
+     "automation_0_256.png",
+     "automation_1_256.png",
+     "automation_2_256.png",
+     "automation_3_256.png",
+     "automation_4_256.png",
+     "automation_5_256.png",
+     "automation_6_256.png",
+     "automation_7_256.png"
+    ],
+    "400x520": [
+     "automation_0_400x520.png",
+     "automation_1_400x520.png",
+     "automation_2_400x520.png",
+     "automation_3_400x520.png",
+     "automation_4_400x520.png",
+     "automation_5_400x520.png",
+     "automation_6_400x520.png",
+     "automation_7_400x520.png"
+    ]
+   }
+  },
+  "upgrading": {
+   "ms_per_frame": 130,
+   "loop": true,
+   "frames": {
+    "128": [
+     "upgrading_0_128.png",
+     "upgrading_1_128.png",
+     "upgrading_2_128.png",
+     "upgrading_3_128.png",
+     "upgrading_4_128.png",
+     "upgrading_5_128.png",
+     "upgrading_6_128.png",
+     "upgrading_7_128.png"
+    ],
+    "256": [
+     "upgrading_0_256.png",
+     "upgrading_1_256.png",
+     "upgrading_2_256.png",
+     "upgrading_3_256.png",
+     "upgrading_4_256.png",
+     "upgrading_5_256.png",
+     "upgrading_6_256.png",
+     "upgrading_7_256.png"
+    ],
+    "400x520": [
+     "upgrading_0_400x520.png",
+     "upgrading_1_400x520.png",
+     "upgrading_2_400x520.png",
+     "upgrading_3_400x520.png",
+     "upgrading_4_400x520.png",
+     "upgrading_5_400x520.png",
+     "upgrading_6_400x520.png",
+     "upgrading_7_400x520.png"
+    ]
+   }
+  },
+  "disconnected": {
+   "ms_per_frame": 110,
+   "loop": true,
+   "frames": {
+    "128": [
+     "disconnected_0_128.png",
+     "disconnected_1_128.png",
+     "disconnected_2_128.png",
+     "disconnected_3_128.png",
+     "disconnected_4_128.png",
+     "disconnected_5_128.png"
+    ],
+    "256": [
+     "disconnected_0_256.png",
+     "disconnected_1_256.png",
+     "disconnected_2_256.png",
+     "disconnected_3_256.png",
+     "disconnected_4_256.png",
+     "disconnected_5_256.png"
+    ],
+    "400x520": [
+     "disconnected_0_400x520.png",
+     "disconnected_1_400x520.png",
+     "disconnected_2_400x520.png",
+     "disconnected_3_400x520.png",
+     "disconnected_4_400x520.png",
+     "disconnected_5_400x520.png"
+    ]
+   }
+  },
+  "sleeping": {
+   "ms_per_frame": 260,
+   "loop": true,
+   "frames": {
+    "128": [
+     "sleeping_0_128.png",
+     "sleeping_1_128.png",
+     "sleeping_2_128.png",
+     "sleeping_3_128.png",
+     "sleeping_4_128.png",
+     "sleeping_5_128.png",
+     "sleeping_6_128.png",
+     "sleeping_7_128.png"
+    ],
+    "256": [
+     "sleeping_0_256.png",
+     "sleeping_1_256.png",
+     "sleeping_2_256.png",
+     "sleeping_3_256.png",
+     "sleeping_4_256.png",
+     "sleeping_5_256.png",
+     "sleeping_6_256.png",
+     "sleeping_7_256.png"
+    ],
+    "400x520": [
+     "sleeping_0_400x520.png",
+     "sleeping_1_400x520.png",
+     "sleeping_2_400x520.png",
+     "sleeping_3_400x520.png",
+     "sleeping_4_400x520.png",
+     "sleeping_5_400x520.png",
+     "sleeping_6_400x520.png",
+     "sleeping_7_400x520.png"
+    ]
+   }
+  }
+ }
+}

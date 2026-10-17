@@ -49,6 +49,30 @@ The raw release assets `hypermesh-visor-x86_64` and `hypermesh-visor-aarch64` st
 
 `hypermesh-companion` is a Linux-only bug on the desktop. It draws the beetle sprites in `companion/assets`, bobs them, and blinks by covering the eyes. While a visor session is open it paints that session's purpose and the prefer-MCP mode (`mcp:<id>` when a healthy binding matches, else `view` / `watch` / `listen` / `mouse` / `type`) under the bug in a built-in bitmap face. It does not copy the screen into the window. With no session the bug is idle. Clicking it opens a short menu: a terminal running `hypermesh`, MCP profiles, MCP doctor, login, billing (`https://hyperme.sh/#pricing`), renting (`https://hyperme.sh/#offers`), the desk (`https://portal.test.hyperme.sh/dashboard/hypermesh`), and Eyes follow. Eyes follow is off unless that menu row turns it on. The choice is stored in `~/.config/hypermesh/companion.toml` as `eyes_follow_pointer`. While a session is open and the option is on, the pupils track the pointer and the purpose and verb stay on the label. Idle eyes do not follow the pointer.
 
+Optional cursor art, for a mode that would draw this beetle as the mouse pointer, is in [`companion/assets/cursor`](companion/assets/cursor/README.md). Animated mascot states (idle, automation, upgrading, disconnected, and sleeping) are in [`companion/assets/states`](companion/assets/states/README.md). Those files are art only. The running companion still draws `bug-idle.png` and `bug-active.png`. How the cursor and the automation visor go together is [Automation mode](#automation-mode).
+
+### Automation mode
+
+The top-down bug cursor and the automation state are one behavior. The visor is the bug using VR to do the tasks. The frames for that pairing live in [`companion/assets/cursor`](companion/assets/cursor/README.md) and [`companion/assets/states`](companion/assets/states/README.md). The running companion still draws the two still sprites and leaves the system pointer in place.
+
+While an automation runs, the on-screen companion shows the automation state (the visor), and the pointer is the bug cursor. That cursor plays crawl, fly, reach, click, and type as the automation moves, clicks, and types.
+
+If the user moves the mouse or types during an automation, the automation pauses. The companion drops the visor and switches to idle. The cursor goes back to the normal system pointer.
+
+Clicking the companion bug while it is paused asks whether to continue the automation. Continuing puts the visor and the bug cursor back. The automation also resumes on its own after 2 minutes with no user input, and the visor and the bug cursor come back then too. Further mouse or keyboard input during that wait keeps it paused.
+
+Away from an automation, the bug cursor stays optional.
+
+```mermaid
+stateDiagram-v2
+  state "Automation\nvisor on, bug cursor" as Automation
+  state "Paused / idle\nsystem pointer" as Paused
+  [*] --> Automation
+  Automation --> Paused: user moves the mouse or types
+  Paused --> Automation: click the bug and continue
+  Paused --> Automation: 2 minutes with no input
+```
+
 Sign in opens your browser; after you approve, Hypermesh stores your session in your system keychain. On a machine without a browser, use `hypermesh login --device`.
 
 The public Keycloak client is `hypermesh-native` in realm `controlplane` at `https://auth.test.hyperme.sh`. It has no client secret. It must allow the loopback redirect `http://127.0.0.1/callback` with any port (register that URI with no port; do not pin port 3000), require PKCE S256, and enable the device authorization grant. Sign-in requests the `openid` scope only. The refresh token is the normal SSO-session token, stored once under keychain service `hypermesh` and account `session`, which the CLI and the companion both read. Access tokens stay in memory. When the Keycloak session ends, Hypermesh clears that entry and asks you to sign in again. `hypermesh logout` revokes the refresh token and deletes the entry. The companion still only `GET`s `http://127.0.0.1:9847/companion` and does not put the session in the visor vault.
