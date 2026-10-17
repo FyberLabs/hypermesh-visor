@@ -59,9 +59,12 @@ pub struct Machine {
     /// A local resume is waiting for the visor to leave `paused`. A poll that
     /// still says paused must not undo it.
     holding_resume: bool,
-    /// The visor has reported this pause. A later `running` report is a
-    /// resume or start from the visor, not a poll from before the pause landed.
-    pause_acked: bool,
+    /// Resume sequence on the latest visor snapshot.
+    last_resume_seq: u64,
+    /// Resume sequence when this pause began. A later `running` snapshot
+    /// follows only when its sequence is newer, so a poll that skips the
+    /// `paused` state still counts, and a poll from before the pause does not.
+    pause_mark: u64,
 }
 
 impl Machine {
@@ -72,7 +75,8 @@ impl Machine {
             resume_after_ms: resume_after_ms.max(1),
             asking: false,
             holding_resume: false,
-            pause_acked: false,
+            last_resume_seq: 0,
+            pause_mark: 0,
         }
     }
 
@@ -88,29 +92,26 @@ impl Machine {
         self.resume_after_ms
     }
 
-    /// What the visor last reported. A local pause stays until the visor
-    /// confirms it. After that, a `running` report is a resume or start and
-    /// the companion follows it. A poll that still says running from before
-    /// the pause landed does not.
-    pub fn see_visor(&mut self, visor: VisorPhase, now_ms: u64) -> Effect {
+    /// What the visor last reported. A local pause follows a `running` report
+    /// only when that report's resume sequence is newer than the sequence at
+    /// the pause. The companion does not have to see the `paused` poll in
+    /// between. The same sequence is the report from before the pause.
+    pub fn see_visor(&mut self, visor: VisorPhase, now_ms: u64, resume_seq: u64) -> Effect {
+        self.last_resume_seq = resume_seq;
         match visor {
             VisorPhase::Off => {
                 self.phase = Phase::Off;
                 self.asking = false;
                 self.holding_resume = false;
-                self.pause_acked = false;
                 Effect::None
             }
             VisorPhase::Running => {
                 self.holding_resume = false;
-                let follow =
-                    self.phase == Phase::Off || (self.phase == Phase::Paused && self.pause_acked);
+                let follow = self.phase == Phase::Off
+                    || (self.phase == Phase::Paused && resume_seq > self.pause_mark);
                 if follow {
                     self.phase = Phase::Running;
                     self.asking = false;
-                }
-                if self.phase == Phase::Running {
-                    self.pause_acked = false;
                 }
                 Effect::None
             }
@@ -122,8 +123,8 @@ impl Machine {
                         self.phase = Phase::Paused;
                         self.last_input_ms = now_ms;
                         self.asking = false;
+                        self.pause_mark = resume_seq;
                     }
-                    self.pause_acked = true;
                     Effect::None
                 }
             }
@@ -139,7 +140,7 @@ impl Machine {
                 self.last_input_ms = now_ms;
                 self.asking = false;
                 self.holding_resume = false;
-                self.pause_acked = false;
+                self.pause_mark = self.last_resume_seq;
                 Effect::Pause
             }
             Phase::Paused => {
@@ -185,7 +186,6 @@ impl Machine {
         self.phase = Phase::Off;
         self.asking = false;
         self.holding_resume = false;
-        self.pause_acked = false;
     }
 
     /// Resume when the wait has elapsed with no user input.
@@ -473,7 +473,7 @@ mod tests {
     #[test]
     fn user_input_pauses_and_continue_resumes() {
         let mut machine = Machine::new(DEFAULT_RESUME_MS);
-        assert_eq!(machine.see_visor(VisorPhase::Running, 0), Effect::None);
+        assert_eq!(machine.see_visor(VisorPhase::Running, 0, 0), Effect::None);
         assert_eq!(machine.phase(), Phase::Running);
         assert_eq!(machine.user_input(1_000), Effect::Pause);
         assert_eq!(machine.phase(), Phase::Paused);
@@ -488,7 +488,7 @@ mod tests {
     #[test]
     fn continue_without_the_prompt_does_nothing() {
         let mut machine = Machine::new(DEFAULT_RESUME_MS);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 0);
         machine.user_input(10);
         assert_eq!(machine.continue_now(20), Effect::None);
         assert_eq!(machine.phase(), Phase::Paused);
@@ -497,7 +497,7 @@ mod tests {
     #[test]
     fn timeout_resumes_after_two_minutes_without_input() {
         let mut machine = Machine::new(DEFAULT_RESUME_MS);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 0);
         assert_eq!(machine.user_input(5_000), Effect::Pause);
         assert_eq!(machine.poll(5_000 + DEFAULT_RESUME_MS - 1), Effect::None);
         assert_eq!(machine.phase(), Phase::Paused);
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn input_during_the_wait_keeps_it_paused() {
         let mut machine = Machine::new(DEFAULT_RESUME_MS);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 0);
         machine.user_input(0);
         machine.ask(1_000);
         assert_eq!(machine.user_input(60_000), Effect::None);
@@ -522,14 +522,14 @@ mod tests {
     #[test]
     fn dismiss_stays_paused_and_a_stopped_visor_clears_it() {
         let mut machine = Machine::new(1_000);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 0);
         machine.user_input(0);
         machine.ask(10);
         machine.dismiss(20);
         assert!(!machine.asking());
         assert_eq!(machine.phase(), Phase::Paused);
         assert_eq!(machine.poll(20 + 999), Effect::None);
-        machine.see_visor(VisorPhase::Off, 30);
+        machine.see_visor(VisorPhase::Off, 30, 0);
         assert_eq!(machine.phase(), Phase::Off);
         assert_eq!(machine.poll(10_000), Effect::None);
     }
@@ -537,70 +537,69 @@ mod tests {
     #[test]
     fn stale_running_report_does_not_undo_a_local_pause() {
         let mut machine = Machine::new(DEFAULT_RESUME_MS);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 0);
         machine.user_input(100);
-        machine.see_visor(VisorPhase::Running, 200);
+        machine.see_visor(VisorPhase::Running, 200, 0);
         assert_eq!(machine.phase(), Phase::Paused);
     }
 
     #[test]
-    fn an_acked_pause_follows_a_later_running_report() {
+    fn a_newer_resume_sequence_follows_a_skipped_pause() {
         let mut machine = Machine::new(1_000);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 3);
         machine.user_input(10);
-        machine.see_visor(VisorPhase::Running, 20);
+        machine.see_visor(VisorPhase::Running, 20, 3);
         assert_eq!(machine.phase(), Phase::Paused);
-        machine.see_visor(VisorPhase::Paused, 30);
-        machine.user_input(40);
-        assert_eq!(machine.phase(), Phase::Paused);
-        machine.see_visor(VisorPhase::Running, 50);
+        machine.see_visor(VisorPhase::Running, 30, 4);
         assert_eq!(machine.phase(), Phase::Running);
 
-        machine.user_input(60);
-        machine.see_visor(VisorPhase::Paused, 70);
+        machine.user_input(40);
+        machine.see_visor(VisorPhase::Paused, 50, 4);
         machine.note_disconnect();
         assert_eq!(machine.phase(), Phase::Paused);
-        machine.see_visor(VisorPhase::Running, 80);
+        machine.see_visor(VisorPhase::Running, 60, 4);
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Running, 70, 5);
         assert_eq!(machine.phase(), Phase::Running);
     }
 
     #[test]
     fn pause_is_retried_after_a_disconnect() {
         let mut machine = Machine::new(1_000);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 0);
         assert_eq!(machine.user_input(10), Effect::Pause);
         machine.note_disconnect();
         assert_eq!(machine.phase(), Phase::Paused);
-        machine.see_visor(VisorPhase::Running, 20);
+        machine.see_visor(VisorPhase::Running, 20, 0);
         assert_eq!(machine.phase(), Phase::Paused);
-        machine.see_visor(VisorPhase::Off, 30);
+        machine.see_visor(VisorPhase::Off, 30, 0);
         assert_eq!(machine.phase(), Phase::Off);
     }
 
     #[test]
     fn disconnect_without_a_pause_clears_a_running_automation() {
         let mut machine = Machine::new(1_000);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 0);
         machine.note_disconnect();
         assert_eq!(machine.phase(), Phase::Off);
-        machine.see_visor(VisorPhase::Running, 10);
+        machine.see_visor(VisorPhase::Running, 10, 0);
         assert_eq!(machine.phase(), Phase::Running);
     }
 
     #[test]
     fn stale_paused_report_does_not_undo_a_local_resume() {
         let mut machine = Machine::new(1_000);
-        machine.see_visor(VisorPhase::Running, 0);
+        machine.see_visor(VisorPhase::Running, 0, 0);
         machine.user_input(10);
         machine.ask(20);
         assert_eq!(machine.continue_now(30), Effect::Resume);
-        machine.see_visor(VisorPhase::Paused, 40);
+        machine.see_visor(VisorPhase::Paused, 40, 0);
         assert_eq!(machine.phase(), Phase::Running);
-        machine.see_visor(VisorPhase::Running, 50);
-        machine.see_visor(VisorPhase::Paused, 60);
+        machine.see_visor(VisorPhase::Running, 50, 0);
+        machine.see_visor(VisorPhase::Paused, 60, 0);
         assert_eq!(machine.phase(), Phase::Paused);
         assert_eq!(machine.poll(60 + 1_000), Effect::Resume);
-        machine.see_visor(VisorPhase::Off, 2_000);
+        machine.see_visor(VisorPhase::Off, 2_000, 0);
         assert_eq!(machine.phase(), Phase::Off);
     }
 

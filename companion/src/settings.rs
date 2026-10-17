@@ -2,6 +2,9 @@
 
 use std::fs;
 use std::path::Path;
+use std::sync::Mutex;
+
+use toml::Value;
 
 const EYES: &str = "eyes_follow_pointer";
 const BUG_CURSOR: &str = "bug_cursor";
@@ -61,33 +64,51 @@ pub fn upgrading_notice(dir: &Path) -> bool {
 }
 
 fn read_bool(dir: &Path, key: &str, default: bool) -> bool {
-    match read_raw(dir, key) {
-        Some(value) if value == "true" => true,
-        Some(value) if value == "false" => false,
-        _ => default,
+    match table(dir).get(key) {
+        Some(Value::Boolean(value)) => *value,
+        Some(_) => {
+            warn_invalid(key, "expected a boolean");
+            default
+        }
+        None => default,
     }
 }
 
 fn read_u64(dir: &Path, key: &str, default: u64) -> u64 {
-    read_raw(dir, key)
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
+    match table(dir).get(key) {
+        Some(Value::Integer(value)) if *value >= 0 => *value as u64,
+        Some(_) => {
+            warn_invalid(key, "expected a non-negative integer");
+            default
+        }
+        None => default,
+    }
 }
 
-fn read_raw(dir: &Path, key: &str) -> Option<String> {
-    let text = fs::read_to_string(companion_path(dir)).ok()?;
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix(key) else {
-            continue;
-        };
-        let rest = rest.trim();
-        if !rest.starts_with('=') {
-            continue;
-        }
-        return Some(rest.trim_start_matches('=').trim().to_string());
+fn table(dir: &Path) -> toml::Table {
+    let Ok(text) = fs::read_to_string(companion_path(dir)) else {
+        return toml::Table::new();
+    };
+    if text.trim().is_empty() {
+        return toml::Table::new();
     }
-    None
+    match text.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(err) => {
+            warn_invalid("file", &err.to_string());
+            toml::Table::new()
+        }
+    }
+}
+
+fn warn_invalid(key: &str, detail: &str) {
+    static WARNED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(|poison| poison.into_inner());
+    if warned.iter().any(|item| item == key) {
+        return;
+    }
+    warned.push(key.to_string());
+    eprintln!("hypermesh-companion: companion.toml {key}: {detail}; using the default");
 }
 
 fn write_value(dir: &Path, key: &str, value: &str) -> Result<(), String> {
@@ -113,11 +134,8 @@ mod tests {
 
     #[test]
     fn eyes_follow_defaults_off_and_round_trips() {
-        let dir = std::env::temp_dir().join(format!(
-            "hypermesh-eyes-{}-{}",
-            std::process::id(),
-            line!()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hypermesh-eyes-{}-{}", std::process::id(), line!()));
         let _ = fs::remove_dir_all(&dir);
         assert!(!eyes_follow_pointer(&dir));
         set_eyes_follow_pointer(&dir, false).unwrap();
@@ -140,6 +158,27 @@ mod tests {
         assert!(!upgrading_notice(&dir));
         fs::write(dir.join("companion-notice"), "upgrading\n").unwrap();
         assert!(upgrading_notice(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toml_comments_and_underscores_are_read() {
+        let dir =
+            std::env::temp_dir().join(format!("hypermesh-toml-{}-{}", std::process::id(), line!()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("companion.toml"),
+            "sleep_after_secs = 1_800 # thirty minutes\nautomation_resume_secs = 600 # ten minutes\nbug_cursor = true\n",
+        )
+        .unwrap();
+        assert_eq!(sleep_after_secs(&dir), 1_800);
+        assert_eq!(automation_resume_secs(&dir), 600);
+        assert!(bug_cursor(&dir));
+        fs::write(dir.join("companion.toml"), "sleep_after_secs = \"nope\"\n").unwrap();
+        assert_eq!(sleep_after_secs(&dir), DEFAULT_SLEEP_AFTER_SECS);
+        fs::write(dir.join("companion.toml"), "sleep_after_secs = [\n").unwrap();
+        assert_eq!(sleep_after_secs(&dir), DEFAULT_SLEEP_AFTER_SECS);
         let _ = fs::remove_dir_all(&dir);
     }
 }

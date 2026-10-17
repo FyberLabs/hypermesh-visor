@@ -199,7 +199,7 @@ fn show(mut app: App) -> Result<(), String> {
         };
         let phase_before = app.machine.phase();
         if snap.connected {
-            app.machine.see_visor(visor_phase, now_ms);
+            app.machine.see_visor(visor_phase, now_ms, snap.resume_seq);
         } else {
             app.machine.note_disconnect();
         }
@@ -249,7 +249,13 @@ fn show(mut app: App) -> Result<(), String> {
                 }
             }
         }
-        if !watch.ready && app.machine.phase() == Phase::Running {
+        if snap.connected {
+            watch.set_portal(matches!(
+                snap.backend,
+                crate::auth::InjectionBackend::Wayland
+            ));
+        }
+        if !watch.accepts_raw() && app.machine.phase() == Phase::Running {
             if let Some((x, y, mask)) = pointer::root_pointer_state(&conn, root) {
                 let sample = snap.drive.as_ref().map(|drive| {
                     let age = wall_ms.saturating_sub(drive.at_ms);

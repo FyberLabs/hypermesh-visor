@@ -85,6 +85,10 @@ fn cursor_png(name: &str) -> Option<&'static [u8]> {
 pub struct Watch {
     pub xtest: Vec<u16>,
     pub ready: bool,
+    /// The visor is injecting through the Wayland portal. Those events are not
+    /// XTEST devices, so XI2 cannot tell them from a physical device.
+    pub portal: bool,
+    logged_portal: bool,
     pending_px: f64,
 }
 
@@ -93,6 +97,8 @@ impl Watch {
         let mut watch = Self {
             xtest: Vec::new(),
             ready: false,
+            portal: false,
+            logged_portal: false,
             pending_px: 0.0,
         };
         if conn
@@ -132,8 +138,24 @@ impl Watch {
         watch
     }
 
+    /// Portal injection and a missing XTEST device both leave XI2 unused.
+    /// The window then uses the drive-sample detector.
+    pub fn accepts_raw(&self) -> bool {
+        self.ready && !self.portal
+    }
+
+    pub fn set_portal(&mut self, portal: bool) {
+        if portal && !self.logged_portal {
+            self.logged_portal = true;
+            eprintln!(
+                "hypermesh-companion: Wayland portal input is not distinguishable from physical input on XWayland, so pause uses the pointer sample and cannot see key presses. Native separation is tracked in GitHub issue #17."
+            );
+        }
+        self.portal = portal;
+    }
+
     pub fn observe(&mut self, event: &Event) -> Option<LiveInput> {
-        if !self.ready {
+        if !self.accepts_raw() {
             return None;
         }
         match event {
@@ -572,7 +594,7 @@ fn pack_visual(image: &draw::Rgba, red: u32, green: u32, blue: u32, lsb: bool) -
 
 #[cfg(test)]
 mod tests {
-    use super::{fp3232, premultiply, replaces_root_cursor};
+    use super::{fp3232, premultiply, replaces_root_cursor, Watch};
 
     #[test]
     fn negative_fp3232_keeps_the_positive_fraction() {
@@ -583,6 +605,24 @@ mod tests {
         assert!((fp3232(1, 0) - 1.0).abs() < 1e-9);
         assert!((fp3232(-2, 0) + 2.0).abs() < 1e-9);
         assert!((fp3232(0, 0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn portal_input_does_not_count_as_a_physical_device() {
+        let mut watch = Watch {
+            xtest: vec![1],
+            ready: true,
+            portal: false,
+            logged_portal: false,
+            pending_px: 0.0,
+        };
+        assert!(watch.accepts_raw());
+        watch.set_portal(true);
+        assert!(!watch.accepts_raw());
+        watch.set_portal(false);
+        assert!(watch.accepts_raw());
+        watch.ready = false;
+        assert!(!watch.accepts_raw());
     }
 
     #[test]

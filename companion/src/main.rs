@@ -13,6 +13,7 @@ mod pages;
 mod pointer;
 mod prompt;
 mod settings;
+mod token;
 mod visor;
 mod window;
 

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use crate::auth::{self, Snapshot};
 use crate::automation::{Link, DISCONNECT_MISSES};
+use crate::{credentials, token};
 
 /// Visor poll and control posts. Both run off the X11 loop: a slow reply
 /// must not freeze the cursor overlay or hold up a pause.
@@ -153,12 +154,41 @@ fn post(action: &str) -> bool {
     let Ok((host, addr)) = endpoint() else {
         return false;
     };
+    let token = if action == "resume" || action == "start" {
+        token::read(&credentials::config_dir())
+    } else {
+        None
+    };
+    if (action == "resume" || action == "start") && token.is_none() {
+        note_missing_token();
+        return false;
+    }
+    let request = automation_post(&host, action, token.as_deref());
+    post_raw(&addr, &request)
+}
+
+fn automation_post(host: &str, action: &str, token: Option<&str>) -> String {
     let body = format!(r#"{{"action":"{action}"}}"#);
-    let request = format!(
-        "POST /companion/automation HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+    let mut request = format!(
+        "POST /companion/automation HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
         body.len()
     );
-    post_raw(&addr, &request)
+    if let Some(token) = token {
+        request.push_str(&format!("x-hypermesh-companion: {token}\r\n"));
+    }
+    request.push_str("connection: close\r\n\r\n");
+    request.push_str(&body);
+    request
+}
+
+fn note_missing_token() {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    eprintln!(
+        "hypermesh-companion: companion token is missing, so a paused automation cannot be resumed"
+    );
 }
 
 fn post_raw(addr: &str, request: &str) -> bool {
@@ -362,6 +392,17 @@ mod tests {
         cleared.connected = true;
         link.ok(cleared);
         assert!(!link.current().upgrading);
+    }
+
+    #[test]
+    fn resume_carries_the_companion_token() {
+        let pause = automation_post("127.0.0.1:9847", "pause", None);
+        assert!(!pause.contains("x-hypermesh-companion"));
+        assert!(pause.contains("\"action\":\"pause\""));
+        let resume = automation_post("127.0.0.1:9847", "resume", Some("ab".repeat(32).as_str()));
+        assert!(resume.contains("x-hypermesh-companion: "));
+        assert!(resume.contains("\"action\":\"resume\""));
+        assert!(resume.find("x-hypermesh-companion").unwrap() < resume.find("\r\n\r\n").unwrap());
     }
 
     #[test]

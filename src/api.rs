@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -20,6 +20,7 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::automation::{self, Control, Notice, Phase};
+use crate::companion_token;
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
 use crate::input::{keys_activity, mouse_activity, plan_type, MouseOp, PlanError, TypeBody};
@@ -253,22 +254,53 @@ impl AppState {
         lock(&self.automation).record_type(id, at, generation, automation::unix_ms());
     }
 
-    fn control_automation(&self, action: Control) -> Result<(), ()> {
+    fn control_automation(&self, action: Control, headers: &HeaderMap) -> Result<(), ApiError> {
         let _injection = lock(&self.injection);
-        let session = {
-            let sessions = lock(&self.sessions);
-            sessions
-                .values()
-                .max_by_key(|session| session.touched())
-                .map(|session| session.id())
+        let session = self.control_session();
+        let mut gate = lock(&self.automation);
+        // Decide under the same lock that applies the action. A pause that
+        // lands after a lock-free peek must still require the companion token.
+        if automation::lifts_user_pause(action, gate.phase())
+            && !companion_authorized(self, headers)
+        {
+            return Err(ApiError::forbidden(
+                "a paused automation can only be resumed by the companion",
+            ));
+        }
+        gate.control(session, action)
+            .map_err(|_| ApiError::bad("start needs an open session"))
+    }
+
+    /// The gate's live session while one exists. The most recently touched
+    /// session is only the fallback when the gate is off, or that session is gone.
+    fn control_session(&self) -> Option<Uuid> {
+        let live = {
+            let gate = lock(&self.automation);
+            if gate.phase() == Phase::Off {
+                None
+            } else {
+                gate.session()
+            }
         };
-        lock(&self.automation).control(session, action)
+        let sessions = lock(&self.sessions);
+        if let Some(id) = live {
+            if sessions.contains_key(&id) {
+                return Some(id);
+            }
+        }
+        sessions
+            .values()
+            .max_by_key(|session| session.touched())
+            .map(|session| session.id())
     }
 }
 
 #[derive(Serialize)]
 struct CompanionBody {
     open: bool,
+    /// `x11`, `wayland`, or `fixture`. The companion uses this to decide
+    /// whether XInput2 can tell injected input from a physical device.
+    backend: &'static str,
     /// `upgrading` when an updater published that notice. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     notice: Option<&'static str>,
@@ -347,6 +379,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 }
 
 pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()> {
+    companion_token::ensure(&state.mcp_dir)?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let local = listener.local_addr()?;
     println!("listening {local}");
@@ -605,6 +638,7 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
     };
     Json(CompanionBody {
         open: session.is_some(),
+        backend: state.desktop.backend_name(),
         notice,
         automation: AutomationBody {
             phase,
@@ -622,16 +656,31 @@ struct AutomationRequest {
 
 /// `start`, `pause`, `resume`, or `stop`. `start` and `stop` are the seam for
 /// a runner that is not the mouse and type verbs. `start` needs an open session.
+///
+/// Once the gate is paused, `resume`, `start`, and `stop` have to present the
+/// companion token. A session client must not lift that pause.
 async fn companion_automation(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<AutomationRequest>,
 ) -> Result<StatusCode, ApiError> {
     let action = Control::parse(&body.action)
         .ok_or_else(|| ApiError::bad("action must be start, pause, resume, or stop"))?;
-    state
-        .control_automation(action)
-        .map_err(|_| ApiError::bad("start needs an open session"))?;
+    state.control_automation(action, &headers)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn companion_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    let Ok(expected) = companion_token::ensure(&state.mcp_dir) else {
+        return false;
+    };
+    let Some(presented) = headers
+        .get(companion_token::HEADER)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    companion_token::tokens_match(presented.trim(), &expected)
 }
 
 #[derive(Deserialize)]
@@ -1271,6 +1320,13 @@ impl ApiError {
         }
     }
 
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1486,20 +1542,48 @@ mod tests {
         path: &str,
         body: Option<String>,
     ) -> hyper::Response<hyper::body::Incoming> {
+        dispatch_header(addr, method, path, body, None).await
+    }
+
+    async fn dispatch_header(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+        token: Option<&str>,
+    ) -> hyper::Response<hyper::body::Incoming> {
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let (mut sender, conn) = handshake(TokioIo::new(stream)).await.unwrap();
         tokio::spawn(async move {
             let _ = conn.await;
         });
         let payload = body.unwrap_or_default();
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method(method)
             .uri(path)
             .header("host", addr.to_string())
-            .header("content-type", "application/json")
-            .body(Full::new(Bytes::from(payload)))
-            .unwrap();
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header(crate::companion_token::HEADER, token);
+        }
+        let request = request.body(Full::new(Bytes::from(payload))).unwrap();
         sender.send_request(request).await.unwrap()
+    }
+
+    async fn send_token(
+        addr: SocketAddr,
+        path: &str,
+        body: &str,
+        token: Option<&str>,
+    ) -> (u16, Bytes) {
+        let response = dispatch_header(addr, "POST", path, Some(body.to_string()), token).await;
+        let status = response.status().as_u16();
+        let bytes = tokio::time::timeout(Duration::from_secs(2), response.into_body().collect())
+            .await
+            .expect("body timeout")
+            .unwrap()
+            .to_bytes();
+        (status, bytes)
     }
 
     async fn open_session_id(addr: SocketAddr, secrets: serde_json::Value) -> (u16, String, Uuid) {
@@ -1810,20 +1894,25 @@ while True:
         )
         .await;
         assert_eq!(status, 204);
-        let (status, _, _) = send(
+        let token =
+            crate::companion_token::ensure(&std::env::temp_dir().join("hypermesh-mcp-empty"))
+                .unwrap();
+        let (status, body) = send_token(
             addr,
-            "POST",
             "/companion/automation",
-            Some(r#"{"action":"resume"}"#.into()),
+            r#"{"action":"resume"}"#,
+            Some(&token),
         )
         .await;
-        assert_eq!(status, 204);
+        assert_eq!(status, 204, "{}", String::from_utf8_lossy(&body));
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let resumed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(resumed["automation"]["phase"], "running");
         assert_eq!(resumed["automation"]["resume_seq"], 1);
         assert!(resumed["automation"]["drive"].is_null());
+        assert_eq!(resumed["backend"], "fixture");
         assert_eq!(resumed["notice"], "upgrading");
+        assert!(!String::from_utf8_lossy(&body).contains(&token));
 
         let (status, _, _) = send(
             addr,
@@ -1841,6 +1930,124 @@ while True:
 
         let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn a_paused_automation_resumes_only_for_the_companion() {
+        let dir = std::env::temp_dir().join(format!(
+            "hypermesh-pause-token-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = crate::companion_token::ensure(&dir).unwrap();
+        let desktop = FakeDesktop::new();
+        let addr = spawn_with_mcp_dir(Arc::clone(&desktop), dir).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":1,"y":1}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _) =
+            send_token(addr, "/companion/automation", r#"{"action":"pause"}"#, None).await;
+        assert_eq!(status, 204);
+        for action in ["resume", "start", "stop"] {
+            let (status, body) = send_token(
+                addr,
+                "/companion/automation",
+                &format!(r#"{{"action":"{action}"}}"#),
+                None,
+            )
+            .await;
+            assert_eq!(status, 403, "{action} {}", String::from_utf8_lossy(&body));
+            let (status, _) = send_token(
+                addr,
+                "/companion/automation",
+                &format!(r#"{{"action":"{action}"}}"#),
+                Some("ab".repeat(32).as_str()),
+            )
+            .await;
+            assert_eq!(status, 403, "{action}");
+        }
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let paused: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paused["automation"]["phase"], "paused");
+        assert!(!String::from_utf8_lossy(&body).contains(&token));
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":2,"y":2}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 409);
+        let (status, _) = send_token(
+            addr,
+            "/companion/automation",
+            r#"{"action":"resume"}"#,
+            Some(&token),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let resumed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resumed["automation"]["phase"], "running");
+        assert!(!String::from_utf8_lossy(&body).contains(&token));
+    }
+
+    #[tokio::test]
+    async fn start_keeps_the_session_the_gate_is_driving() {
+        let addr = spawn(FakeDesktop::new()).await;
+        let (_, _, first) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{first}/mouse"),
+            Some(r#"{"action":"move","x":3,"y":4}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, second) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(addr, "POST", &format!("/session/{second}/view"), None).await;
+        assert_eq!(status, 200);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(started["session"]["id"], first.to_string());
+        assert!(started["automation"]["drive"].is_null());
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"stop"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let fresh: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(fresh["automation"]["phase"], "running");
+        assert_eq!(fresh["session"]["id"], second.to_string());
     }
 
     #[tokio::test]

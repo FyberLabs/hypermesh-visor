@@ -340,10 +340,22 @@ impl Gate {
     }
 }
 
+/// Leaving `paused` is the user-interrupt boundary. Pause itself is not.
+pub fn lifts_user_pause(action: Control, phase: Phase) -> bool {
+    phase == Phase::Paused && matches!(action, Control::Start | Control::Resume | Control::Stop)
+}
+
 pub fn distance(x0: i32, y0: i32, x1: i32, y1: i32) -> u32 {
-    let dx = i64::from(x1) - i64::from(x0);
-    let dy = i64::from(y1) - i64::from(y0);
-    ((dx * dx + dy * dy) as f64).sqrt().round() as u32
+    let dx = f64::from(x1) - f64::from(x0);
+    let dy = f64::from(y1) - f64::from(y0);
+    let pixels = dx.hypot(dy).round();
+    if !pixels.is_finite() || pixels <= 0.0 {
+        0
+    } else if pixels >= f64::from(u32::MAX) {
+        u32::MAX
+    } else {
+        pixels as u32
+    }
 }
 
 pub fn unix_ms() -> u64 {
@@ -584,5 +596,19 @@ mod tests {
         assert!(gate.drive().is_none());
         gate.control(None, Control::Stop).unwrap();
         assert_eq!(gate.resume_seq(), 2, "stop must not rewind the sequence");
+    }
+
+    #[test]
+    fn distance_survives_the_full_i32_span() {
+        assert_eq!(distance(0, 0, 3, 4), 5);
+        assert_eq!(distance(i32::MIN, 0, i32::MAX, 0), u32::MAX);
+        let diagonal = distance(i32::MIN, i32::MIN, i32::MAX, i32::MAX);
+        assert_eq!(diagonal, u32::MAX);
+        assert!(lifts_user_pause(Control::Resume, Phase::Paused));
+        assert!(lifts_user_pause(Control::Start, Phase::Paused));
+        assert!(lifts_user_pause(Control::Stop, Phase::Paused));
+        assert!(!lifts_user_pause(Control::Pause, Phase::Paused));
+        assert!(!lifts_user_pause(Control::Start, Phase::Off));
+        assert!(!lifts_user_pause(Control::Stop, Phase::Running));
     }
 }

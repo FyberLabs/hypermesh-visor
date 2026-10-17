@@ -72,6 +72,12 @@ pub trait Desktop: Send + Sync {
     fn focused_app(&self) -> Result<Option<crate::mcp::FocusedApp>, DesktopError> {
         Ok(None)
     }
+
+    /// `x11`, `wayland`, or `fixture`. The companion uses this to tell whether
+    /// injected input is visible as an XTEST device.
+    fn backend_name(&self) -> &'static str {
+        "fixture"
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +193,14 @@ impl Desktop for LinuxDesktop {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::pointer(self.env.display.as_deref()).map(Some),
             BackendKind::Wayland => Ok(None),
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match choose_backend(&self.env) {
+            Ok(BackendKind::Wayland) => "wayland",
+            Ok(BackendKind::X11) => "x11",
+            Err(_) => "unknown",
         }
     }
 

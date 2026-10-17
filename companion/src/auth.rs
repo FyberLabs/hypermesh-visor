@@ -77,6 +77,14 @@ pub struct Snapshot {
     pub drive: Option<DriveView>,
     /// Visor resume sequence. Bumps on resume and start, and stays put across stop.
     pub resume_seq: u64,
+    /// How the visor injects. Wayland portal input is not an XTEST device.
+    pub backend: InjectionBackend,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InjectionBackend {
+    X11,
+    Wayland,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +113,7 @@ impl Snapshot {
             phase: VisorPhase::Off,
             drive: None,
             resume_seq: 0,
+            backend: InjectionBackend::X11,
         }
     }
 }
@@ -146,6 +155,10 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         .pointer("/automation/resume_seq")
         .and_then(|item| item.as_u64())
         .unwrap_or(0);
+    let backend = match value.get("backend").and_then(|item| item.as_str()) {
+        Some("wayland") => InjectionBackend::Wayland,
+        _ => InjectionBackend::X11,
+    };
     Some(Snapshot {
         connected: true,
         upgrading,
@@ -154,6 +167,7 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         phase,
         drive,
         resume_seq,
+        backend,
     })
 }
 
@@ -259,6 +273,9 @@ mod tests {
         .unwrap();
         assert_eq!(stamped.resume_seq, 4);
         assert_eq!(stamped.drive.unwrap().resume_seq, 4);
+        assert_eq!(stamped.backend, InjectionBackend::X11);
+        let wayland = snapshot_from_body(r#"{"open":false,"backend":"wayland"}"#).unwrap();
+        assert_eq!(wayland.backend, InjectionBackend::Wayland);
         assert!(snapshot_from_body("not-json").is_none());
         let idle = snapshot_from_body(r#"{"open":false}"#).unwrap();
         assert!(idle.connected);
