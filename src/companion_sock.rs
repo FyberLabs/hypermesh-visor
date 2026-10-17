@@ -1,9 +1,12 @@
 //! Companion channel on a Unix socket.
 //!
 //! The directory is `$XDG_RUNTIME_DIR/hypermesh` (mode 0700) and the socket is
-//! `companion.sock` (mode 0600). `HYPERMESH_RUNTIME_DIR` replaces the directory
-//! in tests. Both ends check `SO_PEERCRED` and continue only when the peer uid
-//! is this user. The loopback TCP API cannot lift a user pause.
+//! `companion.sock` (mode 0600). `HYPERMESH_RUNTIME_DIR` replaces the directory.
+//! When `XDG_RUNTIME_DIR` is unset the directory is
+//! `$XDG_STATE_HOME/hypermesh/run`, or `$HOME/.local/state/hypermesh/run`.
+//! Both ends check `SO_PEERCRED` and continue only when the peer uid is this
+//! user. The loopback TCP API cannot lift a user pause. The companion copy of
+//! the path choice in `hypermesh-companion` must stay the same.
 
 use std::fs;
 use std::io;
@@ -23,30 +26,50 @@ use crate::api::{companion_router, AppState};
 
 pub const SOCKET_NAME: &str = "companion.sock";
 
-pub fn runtime_dir() -> PathBuf {
+/// `sun_path` holds 108 bytes including the trailing NUL.
+const SUN_PATH_MAX: usize = 108;
+
+pub fn runtime_dir() -> io::Result<PathBuf> {
     runtime_dir_from(
         std::env::var("HYPERMESH_RUNTIME_DIR").ok().as_deref(),
         std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
-        current_uid(),
-        &std::env::temp_dir(),
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
     )
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))
 }
 
-/// `HYPERMESH_RUNTIME_DIR`, then `$XDG_RUNTIME_DIR/hypermesh`, then a private
-/// directory under the temp dir when the runtime dir is unset.
+/// `HYPERMESH_RUNTIME_DIR`, then `$XDG_RUNTIME_DIR/hypermesh`, then
+/// `$XDG_STATE_HOME/hypermesh/run`, then `$HOME/.local/state/hypermesh/run`.
+/// The socket path has to fit in [`SUN_PATH_MAX`].
 pub fn runtime_dir_from(
     override_dir: Option<&str>,
-    xdg: Option<&str>,
-    uid: u32,
-    temp: &Path,
-) -> PathBuf {
-    if let Some(dir) = nonempty(override_dir) {
-        return PathBuf::from(dir);
+    xdg_runtime: Option<&str>,
+    xdg_state: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, &'static str> {
+    let dir = if let Some(dir) = nonempty(override_dir) {
+        PathBuf::from(dir)
+    } else if let Some(dir) = nonempty(xdg_runtime) {
+        PathBuf::from(dir).join("hypermesh")
+    } else if let Some(dir) = nonempty(xdg_state) {
+        PathBuf::from(dir).join("hypermesh").join("run")
+    } else if let Some(dir) = nonempty(home) {
+        PathBuf::from(dir)
+            .join(".local")
+            .join("state")
+            .join("hypermesh")
+            .join("run")
+    } else {
+        return Err(
+            "companion socket needs HYPERMESH_RUNTIME_DIR, XDG_RUNTIME_DIR, XDG_STATE_HOME, or HOME",
+        );
+    };
+    let socket = dir.join(SOCKET_NAME);
+    if socket.as_os_str().len() >= SUN_PATH_MAX {
+        return Err("companion socket path does not fit in sun_path");
     }
-    if let Some(dir) = nonempty(xdg) {
-        return PathBuf::from(dir).join("hypermesh");
-    }
-    temp.join(format!("hypermesh-{uid}"))
+    Ok(dir)
 }
 
 pub fn socket_file(dir: &Path) -> PathBuf {
@@ -176,20 +199,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_dir_prefers_the_override_then_xdg() {
-        let uid = 42;
+    fn runtime_dir_prefers_the_override_then_xdg_then_state() {
         assert_eq!(
-            runtime_dir_from(Some("/tmp/hm"), Some("/run/user/7"), uid, Path::new("/tmp")),
+            runtime_dir_from(Some("/tmp/hm"), Some("/run/user/7"), None, None).unwrap(),
             PathBuf::from("/tmp/hm")
         );
         assert_eq!(
-            runtime_dir_from(Some("  "), Some("/run/user/7"), uid, Path::new("/tmp")),
+            runtime_dir_from(
+                Some("  "),
+                Some("/run/user/7"),
+                Some("/state"),
+                Some("/home/u")
+            )
+            .unwrap(),
             PathBuf::from("/run/user/7/hypermesh")
         );
         assert_eq!(
-            runtime_dir_from(None, None, uid, Path::new("/tmp")),
-            PathBuf::from("/tmp/hypermesh-42")
+            runtime_dir_from(None, None, Some("/state"), Some("/home/u")).unwrap(),
+            PathBuf::from("/state/hypermesh/run")
         );
+        assert_eq!(
+            runtime_dir_from(None, None, Some(" "), Some("/home/u")).unwrap(),
+            PathBuf::from("/home/u/.local/state/hypermesh/run")
+        );
+        assert!(runtime_dir_from(None, None, None, None).is_err());
+        let long = "a".repeat(120);
+        assert!(runtime_dir_from(Some(&long), None, None, None).is_err());
     }
 
     #[test]

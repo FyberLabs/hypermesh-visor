@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
@@ -48,6 +49,23 @@ pub struct AppState {
     /// Held across injection and across pause, stop, and session close.
     /// Stop waits for an in-flight drive to finish recording, then clears it.
     injection: Mutex<()>,
+    /// Last focused app. `GET /companion` must not probe the compositor on
+    /// every poll; a Wayland probe spawns a helper process.
+    focus_cache: Arc<Mutex<FocusCache>>,
+    focus_refreshing: Arc<AtomicBool>,
+}
+
+struct FocusCache {
+    fetched_at: Option<Instant>,
+    value: Option<FocusedApp>,
+}
+
+/// A focused-app sample younger than this is reused. The companion polls much
+/// faster than a compositor probe needs to run.
+const FOCUS_TTL: Duration = Duration::from_millis(750);
+
+pub(crate) fn focus_fresh(age: Duration, ttl: Duration) -> bool {
+    age < ttl
 }
 
 struct CachedFrame {
@@ -111,6 +129,11 @@ impl AppState {
             frames: Mutex::new(HashMap::new()),
             automation: Mutex::new(automation::Gate::default()),
             injection: Mutex::new(()),
+            focus_cache: Arc::new(Mutex::new(FocusCache {
+                fetched_at: None,
+                value: None,
+            })),
+            focus_refreshing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -198,6 +221,7 @@ impl AppState {
     /// Purpose, verb, and prefer-MCP mode for the desktop companion.
     /// The CLI auth key is not a session secret and is not included.
     fn companion_session(&self) -> Option<CompanionSession> {
+        let focused = self.cached_focus();
         let driving = {
             let gate = lock(&self.automation);
             if gate.phase() == Phase::Off {
@@ -214,12 +238,6 @@ impl AppState {
         .or_else(|| sessions.values().max_by_key(|session| session.touched()))?;
         let mcp_servers = session.mcp().server_names();
         let healthy = session.mcp().healthy_server_names();
-        let focused = self
-            .desktop
-            .focused_app()
-            .ok()
-            .flatten()
-            .filter(|app| !app.is_empty());
         let bindings = load_bindings(&self.mcp_dir).unwrap_or_default().bindings;
         let preferred = focused
             .as_ref()
@@ -239,6 +257,54 @@ impl AppState {
             prefer_mcp,
             idle_ms,
         })
+    }
+
+    /// The last focused app, refreshing it off the request worker when the
+    /// sample is missing or older than [`FOCUS_TTL`]. The poll returns the
+    /// previous sample immediately.
+    fn cached_focus(&self) -> Option<FocusedApp> {
+        let cached = {
+            let cache = lock(&self.focus_cache);
+            let fresh = cache
+                .fetched_at
+                .is_some_and(|at| focus_fresh(at.elapsed(), FOCUS_TTL));
+            if fresh {
+                return cache.value.clone().filter(|app| !app.is_empty());
+            }
+            cache.value.clone()
+        };
+        self.spawn_focus_refresh();
+        cached.filter(|app| !app.is_empty())
+    }
+
+    fn spawn_focus_refresh(&self) {
+        if self.focus_refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if tokio::runtime::Handle::try_current().is_err() {
+            self.focus_refreshing.store(false, Ordering::SeqCst);
+            return;
+        }
+        let desktop = Arc::clone(&self.desktop);
+        let cache = Arc::clone(&self.focus_cache);
+        let flag = Arc::clone(&self.focus_refreshing);
+        tokio::spawn(async move {
+            struct Clear(Arc<AtomicBool>);
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    self.0.store(false, Ordering::SeqCst);
+                }
+            }
+            let _clear = Clear(flag);
+            let probed = match tokio::task::spawn_blocking(move || desktop.focused_app()).await {
+                Ok(Ok(value)) => value,
+                Ok(Err(_)) => None,
+                Err(_) => return,
+            };
+            let mut slot = lock(&cache);
+            slot.fetched_at = Some(Instant::now());
+            slot.value = probed;
+        });
     }
 
     fn drive_blocked(&self, id: Uuid) -> bool {
@@ -312,6 +378,10 @@ struct AutomationBody {
     phase: &'static str,
     /// Bumps on resume and start. A drive records the value from when it happened.
     resume_seq: u64,
+    /// True while mouse or type is inside the desktop call, before the drive is stored.
+    injecting: bool,
+    /// Bumps at the start of each mouse or type call.
+    inject_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     drive: Option<DriveBody>,
 }
@@ -329,6 +399,7 @@ struct DriveBody {
     at_ms: u64,
     pointer_known: bool,
     resume_seq: u64,
+    inject_seq: u64,
 }
 
 #[derive(Serialize)]
@@ -388,7 +459,7 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
 }
 
 pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()> {
-    let runtime = crate::companion_sock::runtime_dir();
+    let runtime = crate::companion_sock::runtime_dir()?;
     crate::companion_sock::prepare_dir(&runtime)?;
     let listener_sock = crate::companion_sock::bind(&runtime).await?;
     let socket_path = crate::companion_sock::socket_file(&runtime);
@@ -636,9 +707,11 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
             gate.reset();
         }
     }
-    let (phase, resume_seq, drive, notice) = {
+    let (phase, resume_seq, injecting, inject_seq, drive, notice) = {
         let gate = lock(&state.automation);
         let resume_seq = gate.resume_seq();
+        let injecting = gate.injecting();
+        let inject_seq = gate.inject_seq();
         let drive = gate.drive().map(|drive| DriveBody {
             kind: drive.kind.as_str(),
             x: drive.x,
@@ -651,10 +724,13 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
             at_ms: drive.at_ms,
             pointer_known: drive.pointer_known,
             resume_seq: drive.resume_seq,
+            inject_seq: drive.inject_seq,
         });
         (
             gate.phase().as_str(),
             resume_seq,
+            injecting,
+            inject_seq,
             drive,
             gate.notice().as_str(),
         )
@@ -666,6 +742,8 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
         automation: AutomationBody {
             phase,
             resume_seq,
+            injecting,
+            inject_seq,
             drive,
         },
         session,
@@ -916,6 +994,23 @@ fn audio_loop(
     }
 }
 
+struct InjectGuard<'a> {
+    gate: &'a Mutex<automation::Gate>,
+}
+
+impl<'a> InjectGuard<'a> {
+    fn arm(gate: &'a Mutex<automation::Gate>) -> Self {
+        lock(gate).begin_inject();
+        Self { gate }
+    }
+}
+
+impl Drop for InjectGuard<'_> {
+    fn drop(&mut self) {
+        lock(self.gate).end_inject();
+    }
+}
+
 async fn mouse(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -940,6 +1035,7 @@ async fn mouse(
         if state2.drive_blocked(id) {
             return Err(ApiError::conflict("automation paused"));
         }
+        let _injecting = InjectGuard::arm(&state2.automation);
         let generation = lock(&state2.automation).generation();
         let from = desktop.pointer_position().ok().flatten();
         desktop.mouse(&op).map_err(ApiError::from_desktop)?;
@@ -1002,6 +1098,7 @@ async fn type_keys(
         if state2.drive_blocked(id) {
             return Err(ApiError::conflict("automation paused"));
         }
+        let _injecting = InjectGuard::arm(&state2.automation);
         let generation = lock(&state2.automation).generation();
         let at = desktop.pointer_position().ok().flatten();
         desktop
@@ -1435,6 +1532,7 @@ mod tests {
         root: AtomicBool,
         focus: Mutex<Option<FocusedApp>>,
         pointer: Mutex<Option<(i32, i32)>>,
+        focus_probes: AtomicUsize,
     }
 
     impl FakeDesktop {
@@ -1449,6 +1547,7 @@ mod tests {
                 root: AtomicBool::new(false),
                 focus: Mutex::new(None),
                 pointer: Mutex::new(None),
+                focus_probes: AtomicUsize::new(0),
             })
         }
 
@@ -1494,6 +1593,7 @@ mod tests {
         }
 
         fn focused_app(&self) -> Result<Option<FocusedApp>, DesktopError> {
+            self.focus_probes.fetch_add(1, Ordering::SeqCst);
             Ok(lock(&self.focus).clone())
         }
 
@@ -1752,12 +1852,22 @@ while True:
         )
         .await;
         assert_eq!(status, 204);
-        let (_, _, body) = send(addr, "GET", "/companion", None).await;
-        let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(companion["session"]["prefer_mcp"], true);
-        assert_eq!(companion["session"]["mcp"], "fixture");
-        assert_eq!(companion["session"]["mode"], "mcp:fixture");
-        assert_eq!(companion["session"]["verb"], "mouse");
+        let mut preferred = false;
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_millis(2_000) {
+            let (_, _, body) = send(addr, "GET", "/companion", None).await;
+            let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if companion["session"]["prefer_mcp"] == true {
+                assert_eq!(companion["session"]["mcp"], "fixture");
+                assert_eq!(companion["session"]["mode"], "mcp:fixture");
+                assert_eq!(companion["session"]["verb"], "mouse");
+                preferred = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(preferred, "focused app should show up within the cache ttl");
+        assert!(desktop.focus_probes.load(Ordering::SeqCst) <= 2);
 
         let (status, _, body) = send(
             addr,
@@ -1855,6 +1965,44 @@ while True:
         assert_eq!(closed["automation"]["phase"], "off");
     }
 
+    #[test]
+    fn focus_cache_is_fresh_until_the_ttl() {
+        let ttl = Duration::from_millis(750);
+        assert!(focus_fresh(Duration::from_millis(499), ttl));
+        assert!(focus_fresh(Duration::from_millis(749), ttl));
+        assert!(!focus_fresh(ttl, ttl));
+        assert!(!focus_fresh(Duration::from_millis(1_000), ttl));
+    }
+
+    #[tokio::test]
+    async fn companion_reuses_a_focused_app_across_polls() {
+        let desktop = FakeDesktop::new();
+        desktop.set_focus(Some(FocusedApp {
+            wm_class: Some("Terminal".into()),
+            app_id: None,
+            executable: None,
+        }));
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let mut focused = false;
+        for _ in 0..50 {
+            let (_, _, body) = send(addr, "GET", "/companion", None).await;
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["session"]["id"], id.to_string());
+            if value["session"]["focused"]["wm_class"] == "Terminal" {
+                focused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(focused);
+        assert_eq!(desktop.focus_probes.load(Ordering::SeqCst), 1);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["session"]["focused"]["wm_class"], "Terminal");
+        assert_eq!(desktop.focus_probes.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn automation_tracks_drive_and_pause_blocks_input() {
         let desktop = FakeDesktop::new();
@@ -1893,6 +2041,9 @@ while True:
         assert_eq!(running["automation"]["drive"]["distance_px"], 290);
         assert_eq!(running["automation"]["resume_seq"], 0);
         assert_eq!(running["automation"]["drive"]["resume_seq"], 0);
+        assert_eq!(running["automation"]["injecting"], false);
+        assert_eq!(running["automation"]["inject_seq"], 2);
+        assert_eq!(running["automation"]["drive"]["inject_seq"], 2);
         assert!(running["session"]["idle_ms"].as_u64().is_some());
 
         let (status, _, _) = send(

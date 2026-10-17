@@ -77,6 +77,10 @@ pub struct Snapshot {
     pub drive: Option<DriveView>,
     /// Visor resume sequence. Bumps on resume and start, and stays put across stop.
     pub resume_seq: u64,
+    /// True while a mouse or type call is in flight, before its drive is recorded.
+    pub injecting: bool,
+    /// Latest injection sequence. A drive records the value from when it ran.
+    pub inject_seq: u64,
     /// How the visor injects. Wayland portal input is not an XTEST device.
     pub backend: InjectionBackend,
 }
@@ -101,6 +105,8 @@ pub struct DriveView {
     pub pointer_known: bool,
     /// Resume sequence when this sample was recorded.
     pub resume_seq: u64,
+    /// Injection sequence when this sample was recorded.
+    pub inject_seq: u64,
 }
 
 impl Snapshot {
@@ -113,6 +119,8 @@ impl Snapshot {
             phase: VisorPhase::Off,
             drive: None,
             resume_seq: 0,
+            injecting: false,
+            inject_seq: 0,
             backend: InjectionBackend::X11,
         }
     }
@@ -155,6 +163,14 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         .pointer("/automation/resume_seq")
         .and_then(|item| item.as_u64())
         .unwrap_or(0);
+    let injecting = value
+        .pointer("/automation/injecting")
+        .and_then(|item| item.as_bool())
+        .unwrap_or(false);
+    let inject_seq = value
+        .pointer("/automation/inject_seq")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0);
     let backend = match value.get("backend").and_then(|item| item.as_str()) {
         Some("wayland") => InjectionBackend::Wayland,
         _ => InjectionBackend::X11,
@@ -167,6 +183,8 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         phase,
         drive,
         resume_seq,
+        injecting,
+        inject_seq,
         backend,
     })
 }
@@ -202,6 +220,10 @@ fn parse_drive(value: &serde_json::Value) -> Option<DriveView> {
             .unwrap_or(true),
         resume_seq: value
             .get("resume_seq")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0),
+        inject_seq: value
+            .get("inject_seq")
             .and_then(|item| item.as_u64())
             .unwrap_or(0),
     })
@@ -267,12 +289,22 @@ mod tests {
         assert_eq!(drive.distance_px, 9);
         assert_eq!(snap.resume_seq, 0);
         assert_eq!(drive.resume_seq, 0);
+        assert!(!snap.injecting);
+        assert_eq!(snap.inject_seq, 0);
+        assert_eq!(drive.inject_seq, 0);
         let stamped = snapshot_from_body(
             r#"{"open":true,"automation":{"phase":"running","resume_seq":4,"drive":{"kind":"click","x":1,"y":2,"at_ms":9,"resume_seq":4}}}"#,
         )
         .unwrap();
         assert_eq!(stamped.resume_seq, 4);
         assert_eq!(stamped.drive.unwrap().resume_seq, 4);
+        let marked = snapshot_from_body(
+            r#"{"open":true,"automation":{"phase":"running","resume_seq":4,"injecting":true,"inject_seq":6,"drive":{"kind":"move","x":1,"y":2,"at_ms":9,"resume_seq":4,"inject_seq":6}}}"#,
+        )
+        .unwrap();
+        assert!(marked.injecting);
+        assert_eq!(marked.inject_seq, 6);
+        assert_eq!(marked.drive.unwrap().inject_seq, 6);
         assert_eq!(stamped.backend, InjectionBackend::X11);
         let wayland = snapshot_from_body(r#"{"open":false,"backend":"wayland"}"#).unwrap();
         assert_eq!(wayland.backend, InjectionBackend::Wayland);

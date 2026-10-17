@@ -28,6 +28,9 @@ pub const FALLBACK_SETTLE_MS: u64 = 150;
 pub const FALLBACK_DISTANCE_PX: i32 = 12;
 /// QueryPointer button bits: Button1 at bit 8 through Button5 at bit 12.
 const FALLBACK_BUTTONS: u32 = 0b1_1111 << 8;
+/// How long a published injection may suppress fallback checks. A hung
+/// `mouse` or `type` must not keep a physical move from pausing.
+pub const INJECT_HOLD_MS: u64 = 2_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -116,13 +119,21 @@ impl Machine {
                 Effect::None
             }
             VisorPhase::Paused => {
-                if self.holding_resume {
+                // A local resume is in flight. A paused snapshot from that
+                // sequence, or an older one, has not seen the resume. A newer
+                // sequence was paused again after the resume landed.
+                let stale = self.holding_resume && resume_seq <= self.pause_mark;
+                if stale {
                     Effect::None
                 } else {
-                    if self.phase != Phase::Paused {
+                    let entered = self.phase != Phase::Paused;
+                    if entered {
                         self.phase = Phase::Paused;
                         self.last_input_ms = now_ms;
                         self.asking = false;
+                    }
+                    self.holding_resume = false;
+                    if entered || resume_seq > self.pause_mark {
                         self.pause_mark = resume_seq;
                     }
                     Effect::None
@@ -306,6 +317,172 @@ pub fn fallback_paused_activity(
 ) -> bool {
     let distance = (x - base_x).saturating_abs() + (y - base_y).saturating_abs();
     distance > FALLBACK_DISTANCE_PX || (mask ^ base_mask) & FALLBACK_BUTTONS != 0
+}
+
+/// One drive sample the pointer fallback can see. `at_ms` is the visor's
+/// clock. The companion's own clock is [`FallbackInput::now_ms`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FallbackDrive {
+    pub x: i32,
+    pub y: i32,
+    pub at_ms: u64,
+    pub pointer_known: bool,
+    pub resume_seq: u64,
+    pub inject_seq: u64,
+}
+
+/// One pointer sample plus the snapshot fields the fallback needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FallbackInput {
+    pub phase: Phase,
+    pub x: i32,
+    pub y: i32,
+    pub mask: u32,
+    /// Milliseconds since the companion started. Not the drive's unix time.
+    pub now_ms: u64,
+    /// Wall clock used only to age a drive sample.
+    pub wall_ms: u64,
+    pub epoch: u64,
+    pub injecting: bool,
+    pub inject_seq: u64,
+    pub drive: Option<FallbackDrive>,
+    pub after_resume: Option<u64>,
+}
+
+/// Baseline, button mask, and injection hold for the pointer fallback.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FallbackTrack {
+    baseline: Option<(i32, i32, u32)>,
+    button_mask: u32,
+    displacement_hold: Option<FallbackHold>,
+    baseline_ready: bool,
+    defer_seq: Option<u64>,
+    defer_since_ms: u64,
+    /// Highest injection sequence that has matched a drive or timed out.
+    /// A later `start` that drops the drive must not defer this sequence again.
+    settled_inject: u64,
+}
+
+/// Pointer-fallback cases.
+///
+/// | Case | Result |
+/// | --- | --- |
+/// | Start, or resume, with no usable drive | The first sample is the baseline. A later move over 12 px or a button change pauses. |
+/// | Type sample with `pointer_known` false | The same baseline. The type point is not a target. |
+/// | Click or drag in flight | Buttons and displacement wait while `injecting` is set, or until `drive.inject_seq` matches, for at most [`INJECT_HOLD_MS`]. The pointer is adopted and does not pause. |
+/// | Click or drag after that drive is visible | Displacement against the drive, confirmed on two later polls. A button pauses only when newly pressed. |
+/// | Injection still unmarked after 2 s | Classification resumes. The position already adopted is not an immediate pause. |
+/// | TCP `start` clears the drive | The baseline still sees a later physical move. |
+/// | Re-pause | [`Machine::see_visor`] accepts a paused snapshot whose `resume_seq` is newer than the local pause. |
+/// | Same or older paused snapshot during a local resume | Ignored. |
+/// | Backend becomes Wayland | The window disables raw events before it drains them, then this fallback runs. |
+/// | Backend becomes X11 | Raw events are enabled before the drain, and this track is cleared. |
+/// | Reconnect | The same `resume_seq` does not undo a local pause. A newer running snapshot follows. |
+/// | Missed poll | The epoch does not bump, so a displacement does not confirm. |
+///
+/// A drive is usable when its pointer is known and [`drive_counts`]. While an
+/// injection is outstanding, the sample is copied into the baseline and no
+/// pause is reported, so the visor's own move does not trip the baseline.
+pub fn classify_fallback(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
+    if input.phase == Phase::Off {
+        *track = FallbackTrack::default();
+        return false;
+    }
+    if injection_deferred(input, track) {
+        track.baseline = Some((input.x, input.y, input.mask));
+        track.button_mask = input.mask;
+        track.displacement_hold = None;
+        track.baseline_ready = true;
+        return false;
+    }
+    if input.phase == Phase::Paused {
+        track.displacement_hold = None;
+        return baseline_moved(input, track);
+    }
+    let usable = input.drive.as_ref().is_some_and(|drive| {
+        drive.pointer_known && drive_counts(drive.resume_seq, input.after_resume)
+    });
+    let Some(drive) = input.drive.filter(|_| usable) else {
+        track.displacement_hold = None;
+        return baseline_moved(input, track);
+    };
+    let age = input.wall_ms.saturating_sub(drive.at_ms);
+    let distance = pointer_distance(input.x, input.y, drive.x, drive.y);
+    let displaced = fallback_displaced(true, drive.resume_seq, input.after_resume, age, distance);
+    let (pause_move, hold) =
+        consider_displacement(displaced, drive.at_ms, input.epoch, track.displacement_hold);
+    track.displacement_hold = hold;
+    let pressed = fallback_button_press(track.button_mask, input.mask);
+    track.button_mask = input.mask;
+    track.baseline = Some((input.x, input.y, input.mask));
+    track.baseline_ready = true;
+    pause_move || pressed
+}
+
+fn pointer_distance(x0: i32, y0: i32, x1: i32, y1: i32) -> i32 {
+    let span = x0.abs_diff(x1).saturating_add(y0.abs_diff(y1));
+    span.min(i32::MAX as u32) as i32
+}
+
+fn baseline_moved(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
+    let Some((x, y, mask)) = track.baseline.filter(|_| track.baseline_ready) else {
+        track.baseline = Some((input.x, input.y, input.mask));
+        track.button_mask = input.mask;
+        track.baseline_ready = true;
+        return false;
+    };
+    let moved = fallback_paused_activity(x, y, mask, input.x, input.y, input.mask);
+    if moved {
+        track.baseline = Some((input.x, input.y, input.mask));
+    }
+    track.button_mask = input.mask;
+    moved
+}
+
+/// An injection is outstanding when the visor says one is running, or its
+/// sequence has not appeared on a drive yet. Sequence 0 means none has started.
+fn injection_outstanding(input: &FallbackInput) -> Option<u64> {
+    if input.injecting {
+        return Some(input.inject_seq);
+    }
+    if input.inject_seq == 0 {
+        return None;
+    }
+    let shown = input
+        .drive
+        .as_ref()
+        .is_some_and(|drive| drive.inject_seq == input.inject_seq);
+    if shown {
+        None
+    } else {
+        Some(input.inject_seq)
+    }
+}
+
+fn injection_deferred(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
+    let Some(seq) = injection_outstanding(input) else {
+        // The drive already shows this sequence, including when the poll
+        // missed the `injecting` flag. A later start that drops the drive
+        // must not treat the same sequence as in flight again.
+        if input.inject_seq > 0 {
+            track.settled_inject = track.settled_inject.max(input.inject_seq);
+        }
+        track.defer_seq = None;
+        return false;
+    };
+    if seq <= track.settled_inject {
+        return false;
+    }
+    if track.defer_seq != Some(seq) {
+        track.defer_seq = Some(seq);
+        track.defer_since_ms = input.now_ms;
+    }
+    if input.now_ms.saturating_sub(track.defer_since_ms) >= INJECT_HOLD_MS {
+        track.settled_inject = track.settled_inject.max(seq);
+        track.defer_seq = None;
+        return false;
+    }
+    true
 }
 
 /// XTEST device ids are synthetic. A real device is anything else.
@@ -767,5 +944,201 @@ mod tests {
         link.miss("down");
         assert!(link.disconnected());
         assert_eq!(link.current(), &"down");
+    }
+
+    fn running_at(x: i32, y: i32, mask: u32, now_ms: u64) -> FallbackInput {
+        FallbackInput {
+            phase: Phase::Running,
+            x,
+            y,
+            mask,
+            now_ms,
+            wall_ms: 10_000,
+            epoch: 1,
+            injecting: false,
+            inject_seq: 0,
+            drive: None,
+            after_resume: None,
+        }
+    }
+
+    #[test]
+    fn a_newer_paused_snapshot_after_resume_is_a_re_pause() {
+        let mut machine = Machine::new(1_000);
+        machine.see_visor(VisorPhase::Running, 0, 3);
+        machine.user_input(10);
+        machine.ask(20);
+        assert_eq!(machine.continue_now(30), Effect::Resume);
+        machine.see_visor(VisorPhase::Paused, 40, 3);
+        assert_eq!(machine.phase(), Phase::Running);
+        machine.see_visor(VisorPhase::Paused, 50, 4);
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Running, 60, 4);
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Running, 70, 5);
+        assert_eq!(machine.phase(), Phase::Running);
+
+        machine.user_input(80);
+        assert_eq!(machine.poll(80 + 1_000), Effect::Resume);
+        machine.see_visor(VisorPhase::Paused, 90, 5);
+        assert_eq!(machine.phase(), Phase::Running);
+        machine.see_visor(VisorPhase::Paused, 100, 6);
+        assert_eq!(machine.phase(), Phase::Paused);
+    }
+
+    #[test]
+    fn fallback_cases_cover_start_resume_type_click_and_a_cleared_drive() {
+        let button = 1 << 8;
+        let mut track = FallbackTrack::default();
+        let mut sample = running_at(0, 0, 0, 0);
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 12;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 13;
+        assert!(classify_fallback(&sample, &mut track));
+
+        track = FallbackTrack::default();
+        sample = running_at(0, 0, 0, 0);
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.mask = button;
+        assert!(classify_fallback(&sample, &mut track));
+
+        track = FallbackTrack::default();
+        sample = running_at(4, 4, 0, 0);
+        sample.inject_seq = 1;
+        sample.drive = Some(FallbackDrive {
+            x: 4,
+            y: 4,
+            at_ms: 9_000,
+            pointer_known: true,
+            resume_seq: 2,
+            inject_seq: 1,
+        });
+        sample.wall_ms = 9_200;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.drive = None;
+        sample.inject_seq = 1;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 30;
+        assert!(classify_fallback(&sample, &mut track));
+
+        track = FallbackTrack::default();
+        sample = running_at(8, 8, 0, 0);
+        sample.injecting = true;
+        sample.inject_seq = 3;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.drive = Some(FallbackDrive {
+            x: 0,
+            y: 0,
+            at_ms: 1,
+            pointer_known: false,
+            resume_seq: 1,
+            inject_seq: 3,
+        });
+        sample.injecting = false;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 40;
+        assert!(classify_fallback(&sample, &mut track));
+
+        track = FallbackTrack::default();
+        sample = running_at(10, 10, 0, 0);
+        sample.after_resume = Some(4);
+        sample.drive = Some(FallbackDrive {
+            x: 200,
+            y: 200,
+            at_ms: 1,
+            pointer_known: true,
+            resume_seq: 4,
+            inject_seq: 0,
+        });
+        assert!(!classify_fallback(&sample, &mut track));
+        assert!(!classify_fallback(&sample, &mut track));
+
+        track = FallbackTrack::default();
+        sample = running_at(0, 0, 0, 0);
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.phase = Phase::Off;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.phase = Phase::Running;
+        sample.x = 80;
+        assert!(!classify_fallback(&sample, &mut track));
+    }
+
+    #[test]
+    fn fallback_defers_an_in_flight_click_until_the_drive_or_the_timeout() {
+        let button = 1 << 8;
+        let mut track = FallbackTrack::default();
+        let mut sample = running_at(20, 20, button, 0);
+        sample.injecting = true;
+        sample.inject_seq = 1;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 80;
+        sample.now_ms = 100;
+        assert!(!classify_fallback(&sample, &mut track));
+
+        sample.injecting = false;
+        sample.mask = 0;
+        sample.x = 20;
+        sample.drive = Some(FallbackDrive {
+            x: 20,
+            y: 20,
+            at_ms: 9_000,
+            pointer_known: true,
+            resume_seq: 1,
+            inject_seq: 1,
+        });
+        sample.epoch = 1;
+        assert!(!classify_fallback(&sample, &mut track));
+
+        sample.injecting = true;
+        sample.inject_seq = 2;
+        sample.mask = button;
+        sample.x = 90;
+        sample.drive = Some(FallbackDrive {
+            x: 20,
+            y: 20,
+            at_ms: 9_000,
+            pointer_known: true,
+            resume_seq: 1,
+            inject_seq: 1,
+        });
+        assert!(!classify_fallback(&sample, &mut track));
+
+        let mut hung = running_at(0, 0, 0, 0);
+        hung.injecting = true;
+        hung.inject_seq = 7;
+        assert!(!classify_fallback(&hung, &mut track));
+        hung.x = 50;
+        hung.now_ms = 10;
+        assert!(!classify_fallback(&hung, &mut track));
+        hung.now_ms = 10 + INJECT_HOLD_MS;
+        assert!(!classify_fallback(&hung, &mut track));
+        hung.x = 70;
+        hung.now_ms += 30;
+        assert!(classify_fallback(&hung, &mut track));
+    }
+
+    #[test]
+    fn fallback_confirms_displacement_only_on_later_polls() {
+        let mut track = FallbackTrack::default();
+        let mut sample = running_at(0, 0, 0, 0);
+        sample.drive = Some(FallbackDrive {
+            x: 0,
+            y: 0,
+            at_ms: 1_000,
+            pointer_known: true,
+            resume_seq: 1,
+            inject_seq: 1,
+        });
+        sample.inject_seq = 1;
+        sample.wall_ms = 2_000;
+        sample.x = 40;
+        sample.epoch = 5;
+        assert!(!classify_fallback(&sample, &mut track));
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.epoch = 6;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.epoch = 7;
+        assert!(classify_fallback(&sample, &mut track));
     }
 }

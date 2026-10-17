@@ -1,4 +1,4 @@
-//! Loopback poll of `GET /companion` and the automation control posts.
+//! Poll of `GET /companion` and the automation control posts.
 //! Both go over the visor's Unix socket, and only after `SO_PEERCRED` says
 //! the peer is this user. Nothing is written to a peer that fails that check.
 //! The companion does not send a key. A few missed polls stay on the last
@@ -15,7 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::auth::{self, Snapshot};
-use crate::automation::{Link, DISCONNECT_MISSES};
+use crate::automation::{Link, VisorPhase, DISCONNECT_MISSES};
 
 /// Visor poll and control posts. Both run off the X11 loop: a slow reply
 /// must not freeze the cursor overlay or hold up a pause.
@@ -106,13 +106,25 @@ fn visor_loop(
         let mut cache = snapshot.lock().unwrap();
         note_poll(&mut cache.epoch, fresh);
         cache.snapshot = link.current().clone();
+        let sleep_ms = poll_sleep_ms(cache.snapshot.phase, cache.snapshot.connected);
         drop(cache);
-        for _ in 0..4 {
+        let slices = (sleep_ms / 10).max(1);
+        for _ in 0..slices {
             if stop.load(Ordering::SeqCst) {
                 return;
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+/// 40 ms while an automation is running or paused, so a physical input is
+/// noticed quickly. 250 ms when nothing is driving.
+pub fn poll_sleep_ms(phase: VisorPhase, connected: bool) -> u64 {
+    if connected && matches!(phase, VisorPhase::Running | VisorPhase::Paused) {
+        40
+    } else {
+        250
     }
 }
 
@@ -169,7 +181,7 @@ fn automation_post(action: &str) -> String {
 }
 
 fn exchange(request: &str) -> Option<String> {
-    exchange_at(&socket_path(), request)
+    exchange_at(socket_path()?.as_path(), request)
 }
 
 fn exchange_at(path: &Path, request: &str) -> Option<String> {
@@ -249,29 +261,59 @@ fn current_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
+/// Same choice as the visor's `runtime_dir_from`. `sun_path` is 108 bytes
+/// including the trailing NUL.
 pub fn runtime_dir_from(
     override_dir: Option<&str>,
-    xdg: Option<&str>,
-    uid: u32,
-    temp: &Path,
-) -> PathBuf {
-    if let Some(dir) = nonempty(override_dir) {
-        return PathBuf::from(dir);
+    xdg_runtime: Option<&str>,
+    xdg_state: Option<&str>,
+    home: Option<&str>,
+) -> Result<PathBuf, &'static str> {
+    let dir = if let Some(dir) = nonempty(override_dir) {
+        PathBuf::from(dir)
+    } else if let Some(dir) = nonempty(xdg_runtime) {
+        PathBuf::from(dir).join("hypermesh")
+    } else if let Some(dir) = nonempty(xdg_state) {
+        PathBuf::from(dir).join("hypermesh").join("run")
+    } else if let Some(dir) = nonempty(home) {
+        PathBuf::from(dir)
+            .join(".local")
+            .join("state")
+            .join("hypermesh")
+            .join("run")
+    } else {
+        return Err(
+            "companion socket needs HYPERMESH_RUNTIME_DIR, XDG_RUNTIME_DIR, XDG_STATE_HOME, or HOME",
+        );
+    };
+    let socket = dir.join("companion.sock");
+    if socket.as_os_str().len() >= 108 {
+        return Err("companion socket path does not fit in sun_path");
     }
-    if let Some(dir) = nonempty(xdg) {
-        return PathBuf::from(dir).join("hypermesh");
-    }
-    temp.join(format!("hypermesh-{uid}"))
+    Ok(dir)
 }
 
-fn socket_path() -> PathBuf {
-    runtime_dir_from(
+fn socket_path() -> Option<PathBuf> {
+    match runtime_dir_from(
         std::env::var("HYPERMESH_RUNTIME_DIR").ok().as_deref(),
         std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
-        current_uid(),
-        &std::env::temp_dir(),
-    )
-    .join("companion.sock")
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    ) {
+        Ok(dir) => Some(dir.join("companion.sock")),
+        Err(err) => {
+            note_socket_path(err);
+            None
+        }
+    }
+}
+
+fn note_socket_path(err: &str) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    eprintln!("hypermesh-companion: {err}");
 }
 
 fn nonempty(value: Option<&str>) -> Option<&str> {
@@ -307,7 +349,7 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::automation::Link;
+    use crate::automation::{Link, VisorPhase};
 
     #[test]
     fn a_missed_poll_does_not_confirm_a_pointer_mismatch() {
@@ -321,17 +363,31 @@ mod tests {
     #[test]
     fn the_socket_path_follows_the_runtime_dir() {
         assert_eq!(
-            runtime_dir_from(Some("/tmp/hm"), Some("/run/user/7"), 9, Path::new("/tmp")),
+            runtime_dir_from(Some("/tmp/hm"), Some("/run/user/7"), None, None).unwrap(),
             PathBuf::from("/tmp/hm")
         );
         assert_eq!(
-            runtime_dir_from(None, Some("/run/user/7"), 9, Path::new("/tmp")),
+            runtime_dir_from(None, Some("/run/user/7"), Some("/state"), Some("/home/u")).unwrap(),
             PathBuf::from("/run/user/7/hypermesh")
         );
         assert_eq!(
-            runtime_dir_from(None, None, 9, Path::new("/tmp")),
-            PathBuf::from("/tmp/hypermesh-9")
+            runtime_dir_from(None, None, Some("/state"), Some("/home/u")).unwrap(),
+            PathBuf::from("/state/hypermesh/run")
         );
+        assert_eq!(
+            runtime_dir_from(None, None, None, Some("/home/u")).unwrap(),
+            PathBuf::from("/home/u/.local/state/hypermesh/run")
+        );
+        assert!(runtime_dir_from(None, None, None, None).is_err());
+        assert!(runtime_dir_from(Some(&"a".repeat(120)), None, None, None).is_err());
+    }
+
+    #[test]
+    fn polls_slow_down_when_nothing_is_driving() {
+        assert_eq!(poll_sleep_ms(VisorPhase::Running, true), 40);
+        assert_eq!(poll_sleep_ms(VisorPhase::Paused, true), 40);
+        assert_eq!(poll_sleep_ms(VisorPhase::Off, true), 250);
+        assert_eq!(poll_sleep_ms(VisorPhase::Running, false), 250);
     }
 
     #[test]

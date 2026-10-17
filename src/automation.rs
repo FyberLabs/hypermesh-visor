@@ -105,6 +105,9 @@ pub struct Drive {
     /// Gate resume sequence at the time this sample was recorded. The
     /// companion ignores a sample from the sequence before a resume.
     pub resume_seq: u64,
+    /// Injection sequence at the time this sample was recorded. The companion
+    /// defers fallback checks until a drive carries the sequence it saw in flight.
+    pub inject_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,6 +125,12 @@ pub struct Gate {
     /// was recorded, so the companion can tell a sample from before the
     /// transition apart from one recorded after it and before the next poll.
     resume_seq: u64,
+    /// Bumped when mouse or type is about to inject. Stays put when that
+    /// injection finishes so a drive can be matched to it.
+    inject_seq: u64,
+    /// True from the moment an injection starts until its drive is recorded,
+    /// or the injection returns an error.
+    injecting: bool,
 }
 
 impl Default for Gate {
@@ -135,6 +144,8 @@ impl Default for Gate {
             notice: Notice::None,
             generation: 0,
             resume_seq: 0,
+            inject_seq: 0,
+            injecting: false,
         }
     }
 }
@@ -168,6 +179,28 @@ impl Gate {
         self.resume_seq
     }
 
+    pub fn inject_seq(&self) -> u64 {
+        self.inject_seq
+    }
+
+    pub fn injecting(&self) -> bool {
+        self.injecting
+    }
+
+    /// Mark an injection before the desktop call. The sequence is the value
+    /// the drive will store if this injection records.
+    pub fn begin_inject(&mut self) -> u64 {
+        self.inject_seq = self.inject_seq.saturating_add(1);
+        self.injecting = true;
+        self.inject_seq
+    }
+
+    /// The desktop call returned. The drive, when one was recorded, keeps the
+    /// sequence. The flag is what the companion watches while the call runs.
+    pub fn end_inject(&mut self) {
+        self.injecting = false;
+    }
+
     /// A pause covers the whole desktop. Every session injects into the same
     /// pointer, so another session must not move it until resume.
     pub fn blocks(&self, _session: Uuid) -> bool {
@@ -195,10 +228,12 @@ impl Gate {
         // Keep the sequence. Rewinding it would make a drive after the next
         // start look older than a cutoff the companion still holds.
         let resume_seq = self.resume_seq;
+        let inject_seq = self.inject_seq;
         *self = Self {
             notice,
             generation,
             resume_seq,
+            inject_seq,
             ..Self::default()
         };
     }
@@ -345,6 +380,7 @@ impl Gate {
             at_ms: now_ms,
             pointer_known,
             resume_seq: self.resume_seq,
+            inject_seq: self.inject_seq,
         });
     }
 }
@@ -639,5 +675,36 @@ mod tests {
         assert!(!lifts_user_pause(Control::Pause, Phase::Paused));
         assert!(!lifts_user_pause(Control::Start, Phase::Off));
         assert!(!lifts_user_pause(Control::Stop, Phase::Running));
+    }
+
+    #[test]
+    fn an_injection_keeps_its_sequence_after_the_flag_drops() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        assert_eq!(gate.begin_inject(), 1);
+        assert!(gate.injecting());
+        gate.record_mouse(
+            id,
+            &MouseOp::Click {
+                x: 4,
+                y: 5,
+                button: Button::Left,
+            },
+            Some((4, 5)),
+            gate.generation(),
+            10,
+        );
+        assert_eq!(gate.drive().unwrap().inject_seq, 1);
+        gate.end_inject();
+        assert!(!gate.injecting());
+        assert_eq!(gate.inject_seq(), 1);
+        gate.begin_inject();
+        gate.reset();
+        assert!(!gate.injecting());
+        assert_eq!(
+            gate.inject_seq(),
+            2,
+            "reset must not reuse an in-flight sequence"
+        );
     }
 }
