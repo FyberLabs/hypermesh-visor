@@ -2,6 +2,8 @@
 
 Optional art for a cursor mode: the desktop beetle drawn as the mouse pointer. The companion binary leaves this directory unused. The on-screen bug still uses `../bug-idle.png` and `../bug-active.png`.
 
+During an automation this cursor is paired with the automation visor on the companion. That pairing is [Automation mode](../../../README.md#automation-mode). Away from an automation, this cursor stays optional.
+
 The frames are top-down. The head points up-left, the same way a standard arrow cursor does. `preview.png` shows pointer, crawl, fly, click, type, and busy at a large size and at 32 px.
 
 These sprites are part of this repository and use the [MIT License](../../../LICENSE).
