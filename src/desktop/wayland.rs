@@ -176,11 +176,6 @@ pub fn capture() -> Result<Frame, DesktopError> {
 
 pub(crate) fn read_local_uri(uri: &str) -> Result<Vec<u8>, DesktopError> {
     let path = file_uri_path(uri)?;
-    if crate::companion_token::is_token_file(&path) {
-        return Err(DesktopError::Unavailable(
-            "screenshot uri is not a local file".into(),
-        ));
-    }
     let bytes = std::fs::read(&path)
         .map_err(|err| DesktopError::Unavailable(format!("screenshot file: {err}")))?;
     std::fs::remove_file(&path)
@@ -401,16 +396,6 @@ mod tests {
         assert!(portal_coord(-PORTAL_COORD_LIMIT).is_ok());
         assert!(portal_coord(i32::MAX).is_err());
         assert!(portal_coord(i32::MIN).is_err());
-    }
-
-    #[test]
-    fn screenshot_uri_cannot_open_the_companion_token() {
-        let path = std::env::temp_dir().join(crate::companion_token::FILE_NAME);
-        std::fs::write(&path, b"secret-token\n").unwrap();
-        let uri = format!("file://{}", path.display());
-        assert!(read_local_uri(&uri).is_err());
-        assert!(path.exists());
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

@@ -144,6 +144,14 @@ impl Watch {
         self.ready && !self.portal
     }
 
+    /// Apply the visor's injection backend before raw events are drained.
+    /// A disconnected snapshot leaves the previous choice in place.
+    pub fn sync_backend(&mut self, connected: bool, wayland: bool) {
+        if connected {
+            self.set_portal(wayland);
+        }
+    }
+
     pub fn set_portal(&mut self, portal: bool) {
         if portal && !self.logged_portal {
             self.logged_portal = true;
@@ -623,6 +631,23 @@ mod tests {
         assert!(watch.accepts_raw());
         watch.ready = false;
         assert!(!watch.accepts_raw());
+    }
+
+    #[test]
+    fn backend_update_disables_raw_events_before_they_are_drained() {
+        let mut watch = Watch {
+            xtest: vec![1],
+            ready: true,
+            portal: false,
+            logged_portal: false,
+            pending_px: 0.0,
+        };
+        watch.sync_backend(true, true);
+        assert!(!watch.accepts_raw());
+        watch.sync_backend(false, false);
+        assert!(!watch.accepts_raw());
+        watch.sync_backend(true, false);
+        assert!(watch.accepts_raw());
     }
 
     #[test]

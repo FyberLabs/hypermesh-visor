@@ -174,10 +174,19 @@ impl Gate {
         self.phase == Phase::Paused
     }
 
+    /// Losing the driving session ends a running automation. A user pause
+    /// stays paused: closing the session must not hand the pointer back.
     pub fn clear_session(&mut self, session: Uuid) {
-        if self.session == Some(session) {
-            self.reset();
+        if self.session != Some(session) {
+            return;
         }
+        if self.phase == Phase::Paused {
+            self.session = None;
+            self.drive = None;
+            self.generation = self.generation.wrapping_add(1);
+            return;
+        }
+        self.reset();
     }
 
     pub fn reset(&mut self) {
@@ -426,6 +435,26 @@ mod tests {
         assert!(gate.drive().is_none());
 
         assert!(gate.control(None, Control::Start).is_err());
+        gate.control(Some(id), Control::Start).unwrap();
+        assert_eq!(gate.phase(), Phase::Running);
+        gate.clear_session(id);
+        assert_eq!(gate.phase(), Phase::Off);
+    }
+
+    #[test]
+    fn a_user_pause_survives_losing_the_driving_session() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.control(Some(id), Control::Start).unwrap();
+        gate.control(None, Control::Pause).unwrap();
+        let generation = gate.generation();
+        gate.clear_session(id);
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert!(gate.session().is_none());
+        assert!(gate.drive().is_none());
+        assert_ne!(gate.generation(), generation);
+        gate.clear_session(id);
+        assert_eq!(gate.phase(), Phase::Paused);
         gate.control(Some(id), Control::Start).unwrap();
         assert_eq!(gate.phase(), Phase::Running);
         gate.clear_session(id);

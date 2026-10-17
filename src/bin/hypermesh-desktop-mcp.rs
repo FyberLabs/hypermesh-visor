@@ -153,12 +153,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn desktop_tools_cannot_read_the_companion_token() {
+    fn desktop_tools_cannot_control_the_companion() {
         let err = call_visor(
             "http://127.0.0.1:9",
             "00000000-0000-0000-0000-000000000001",
             "read_file",
-            &json!({"path": "/home/user/.config/hypermesh/companion.token"}),
+            &json!({"path": "/run/user/1/hypermesh/companion.sock"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown tool"));
+        let err = call_visor(
+            "http://127.0.0.1:9",
+            "00000000-0000-0000-0000-000000000001",
+            "resume",
+            &json!({}),
         )
         .unwrap_err();
         assert!(err.contains("unknown tool"));

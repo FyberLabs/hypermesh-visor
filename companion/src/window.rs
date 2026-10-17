@@ -61,6 +61,9 @@ struct App {
     fallback_after_resume: Option<u64>,
     /// Pointer-fallback: a mismatch has to survive later polls of the same drive.
     displacement_hold: Option<automation::FallbackHold>,
+    /// Pointer and buttons at the moment the fallback path paused. Later
+    /// changes refresh the resume timer. `None` until that sample is taken.
+    pause_pointer: Option<(i32, i32, u32)>,
     /// Menu and continue-prompt scroll, in pixels.
     scroll: i32,
 }
@@ -95,6 +98,7 @@ pub fn run() -> Result<(), String> {
         resume_seq_prior: 0,
         fallback_after_resume: None,
         displacement_hold: None,
+        pause_pointer: None,
         scroll: 0,
     };
     show(app)
@@ -219,6 +223,10 @@ fn show(mut app: App) -> Result<(), String> {
             app.fallback_after_resume = None;
         }
         let was_paused = app.machine.phase() == Phase::Paused;
+        watch.sync_backend(
+            snap.connected,
+            matches!(snap.backend, crate::auth::InjectionBackend::Wayland),
+        );
         let mut click: Option<(i32, i32)> = None;
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
             if let Some(live) = watch.observe(&event) {
@@ -249,52 +257,69 @@ fn show(mut app: App) -> Result<(), String> {
                 }
             }
         }
-        if snap.connected {
-            watch.set_portal(matches!(
-                snap.backend,
-                crate::auth::InjectionBackend::Wayland
-            ));
-        }
-        if !watch.accepts_raw() && app.machine.phase() == Phase::Running {
+        if !watch.accepts_raw() {
             if let Some((x, y, mask)) = pointer::root_pointer_state(&conn, root) {
-                let sample = snap.drive.as_ref().map(|drive| {
-                    let age = wall_ms.saturating_sub(drive.at_ms);
-                    let distance = (x - drive.x).abs() + (y - drive.y).abs();
-                    (drive, age, distance)
-                });
-                let displaced = sample.as_ref().is_some_and(|(drive, age, distance)| {
-                    automation::fallback_displaced(
-                        drive.pointer_known,
-                        drive.resume_seq,
-                        app.fallback_after_resume,
-                        *age,
-                        *distance,
-                    )
-                });
-                let drive_at = sample
-                    .as_ref()
-                    .map(|(drive, _, _)| drive.at_ms)
-                    .unwrap_or(0);
-                // A move can land on screen before this snapshot's poll started,
-                // so the drive here may still be the previous target. Wait until
-                // later polls of that same sample still disagree.
-                let (displaced, hold) = automation::consider_displacement(
-                    displaced,
-                    drive_at,
-                    epoch,
-                    app.displacement_hold,
-                );
-                app.displacement_hold = hold;
-                let pressed = automation::fallback_button_press(app.button_mask, mask);
-                app.button_mask = mask;
-                if displaced || pressed {
-                    let effect = app.machine.user_input(now_ms);
-                    note_effect(&mut app, effect);
-                    app.last_used = Instant::now();
+                if app.machine.phase() == Phase::Running {
+                    app.pause_pointer = None;
+                    let sample = snap.drive.as_ref().map(|drive| {
+                        let age = wall_ms.saturating_sub(drive.at_ms);
+                        let distance = (x - drive.x).abs() + (y - drive.y).abs();
+                        (drive, age, distance)
+                    });
+                    let displaced = sample.as_ref().is_some_and(|(drive, age, distance)| {
+                        automation::fallback_displaced(
+                            drive.pointer_known,
+                            drive.resume_seq,
+                            app.fallback_after_resume,
+                            *age,
+                            *distance,
+                        )
+                    });
+                    let drive_at = sample
+                        .as_ref()
+                        .map(|(drive, _, _)| drive.at_ms)
+                        .unwrap_or(0);
+                    // A move can land on screen before this snapshot's poll started,
+                    // so the drive here may still be the previous target. Wait until
+                    // later polls of that same sample still disagree.
+                    let (displaced, hold) = automation::consider_displacement(
+                        displaced,
+                        drive_at,
+                        epoch,
+                        app.displacement_hold,
+                    );
+                    app.displacement_hold = hold;
+                    let pressed = automation::fallback_button_press(app.button_mask, mask);
+                    app.button_mask = mask;
+                    if displaced || pressed {
+                        let effect = app.machine.user_input(now_ms);
+                        note_effect(&mut app, effect);
+                        app.last_used = Instant::now();
+                    }
+                }
+                if app.machine.phase() == Phase::Paused {
+                    app.displacement_hold = None;
+                    if let Some((base_x, base_y, base_mask)) = app.pause_pointer {
+                        if automation::fallback_paused_activity(
+                            base_x, base_y, base_mask, x, y, mask,
+                        ) {
+                            let effect = app.machine.user_input(now_ms);
+                            note_effect(&mut app, effect);
+                            app.last_used = Instant::now();
+                            app.pause_pointer = Some((x, y, mask));
+                        }
+                    } else {
+                        app.pause_pointer = Some((x, y, mask));
+                    }
+                }
+                if app.machine.phase() == Phase::Off {
+                    app.pause_pointer = None;
+                    app.displacement_hold = None;
                 }
             }
         } else {
             app.displacement_hold = None;
+            app.pause_pointer = None;
         }
         if let Some((x, y)) = click {
             app.last_used = Instant::now();

@@ -294,6 +294,20 @@ pub fn fallback_button_press(previous: u32, mask: u32) -> bool {
     newly_pressed(previous, mask) != 0
 }
 
+/// While paused, the pointer fallback has no fresh drive target. Movement
+/// or a button change from the sample taken at pause time is still the user.
+pub fn fallback_paused_activity(
+    base_x: i32,
+    base_y: i32,
+    base_mask: u32,
+    x: i32,
+    y: i32,
+    mask: u32,
+) -> bool {
+    let distance = (x - base_x).saturating_abs() + (y - base_y).saturating_abs();
+    distance > FALLBACK_DISTANCE_PX || (mask ^ base_mask) & FALLBACK_BUTTONS != 0
+}
+
 /// XTEST device ids are synthetic. A real device is anything else.
 pub fn is_synthetic(device_id: u16, source_id: u16, xtest: &[u16]) -> bool {
     !xtest.is_empty() && (xtest.contains(&device_id) || xtest.contains(&source_id))
@@ -601,6 +615,18 @@ mod tests {
         assert_eq!(machine.poll(60 + 1_000), Effect::Resume);
         machine.see_visor(VisorPhase::Off, 2_000, 0);
         assert_eq!(machine.phase(), Phase::Off);
+    }
+
+    #[test]
+    fn paused_fallback_tracks_later_pointer_and_button_changes() {
+        let button = 1 << 8;
+        assert!(!fallback_paused_activity(10, 10, 0, 10, 10, 0));
+        assert!(!fallback_paused_activity(10, 10, 0, 22, 10, 0));
+        assert!(fallback_paused_activity(10, 10, 0, 23, 10, 0));
+        assert!(fallback_paused_activity(10, 10, 0, 10, 10, button));
+        assert!(!fallback_paused_activity(10, 10, button, 10, 10, button));
+        assert!(fallback_paused_activity(10, 10, button, 10, 10, 0));
+        assert!(!fallback_paused_activity(0, 0, 0, 0, 0, 1));
     }
 
     #[test]
