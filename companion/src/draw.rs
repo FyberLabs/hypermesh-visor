@@ -10,6 +10,11 @@ use crate::auth::Pose;
 use crate::mascot::{self, Mascot};
 
 const TARGET_WIDTH: u32 = 400;
+/// `place` keeps 48 px under the window. This leaves that, plus a small gap,
+/// so a capped menu still sits on the screen.
+pub const VIEW_MARGIN: u32 = 64;
+/// One menu row (48 px card plus the 4 px gap). The wheel scrolls by this.
+pub const MENU_SCROLL_STEP: i32 = 52;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -123,6 +128,8 @@ pub fn render(
     eyes_follow: bool,
     bug_cursor: bool,
     pointer: Option<(i32, i32)>,
+    max_height: u32,
+    scroll: i32,
 ) -> Scene {
     let base = sprites.frame(mascot, frame);
     let mut bug = base.clone_image();
@@ -131,7 +138,11 @@ pub fn render(
     // the idle frame has the two eye shapes and a session is open.
     if eyes_follow && mascot == Mascot::Idle {
         if let (Pose::Active { .. }, Some((px, py))) = (pose, pointer) {
-            let eyes = sprites.idle_eyes.get(frame).map(Vec::as_slice).unwrap_or(&[]);
+            let eyes = sprites
+                .idle_eyes
+                .get(frame)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
             track_eyes(&mut bug, eyes, (px, py - bug_top));
         }
     }
@@ -145,10 +156,7 @@ pub fn render(
     } = pose
     {
         // Prefer-MCP shows `mcp:<id>` on the mode line; mouse/type stay the verb fallback.
-        let mode_line = mode
-            .as_deref()
-            .or(verb.as_deref())
-            .unwrap_or("—");
+        let mode_line = mode.as_deref().or(verb.as_deref()).unwrap_or("—");
         let lines = [
             format!("purpose: {}", sanitize(purpose)),
             format!("verb: {}", sanitize(mode_line)),
@@ -253,19 +261,35 @@ pub fn render(
             y += h + 4;
         }
     }
-    let height = y.max(bug.h as i32).max(1) as u32;
+    let bug_h = bug.h as i32;
+    let natural = y.max(bug_h).max(1);
+    let limit = i32::try_from(max_height.max(1)).unwrap_or(i32::MAX);
+    let height = if natural <= limit {
+        natural
+    } else {
+        limit.max(1)
+    };
+    let scroll = scroll.clamp(0, (natural - height).max(0));
+    // The bug stays pinned. Rows scroll in the space under it, and a value
+    // past the end clamps so the last row lands fully inside the window.
+    let clip_top = if bug_h >= height { 0 } else { bug_h };
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
-    blit(&mut rgba, width, &bug, 0, bug_top);
+    blit(&mut rgba, width, &bug, 0, bug_top, 0);
     let mut hits = vec![Hit {
         x: 0,
         y: 0,
         w: width as i32,
-        h: bug.h as i32,
+        h: bug_h.min(height),
         action: Action::ToggleMenu,
     }];
     for block in &blocks {
-        blit(&mut rgba, width, &block.image, 0, block.y);
-        hits.extend(block.hits.iter().copied());
+        let drawn = block.y - scroll;
+        blit(&mut rgba, width, &block.image, 0, drawn, clip_top);
+        for hit in &block.hits {
+            if let Some(hit) = clip_hit(*hit, scroll, clip_top, height) {
+                hits.push(hit);
+            }
+        }
     }
     // Menu rows sit above the bug in the hit list so a click on a row wins.
     hits.sort_by_key(|hit| match hit.action {
@@ -274,9 +298,25 @@ pub fn render(
     });
     Scene {
         width,
-        height,
+        height: height as u32,
         rgba,
         hits,
+    }
+}
+
+fn clip_hit(mut hit: Hit, scroll: i32, clip_top: i32, height: i32) -> Option<Hit> {
+    hit.y -= scroll;
+    if hit.y < clip_top {
+        hit.h -= clip_top - hit.y;
+        hit.y = clip_top;
+    }
+    if hit.y + hit.h > height {
+        hit.h = height - hit.y;
+    }
+    if hit.h <= 0 {
+        None
+    } else {
+        Some(hit)
     }
 }
 
@@ -300,6 +340,8 @@ pub fn dump_frames(dir: &Path) -> std::io::Result<()> {
         false,
         false,
         None,
+        u32::MAX,
+        0,
     );
     let active = render(
         &sprites,
@@ -316,6 +358,8 @@ pub fn dump_frames(dir: &Path) -> std::io::Result<()> {
         false,
         false,
         None,
+        u32::MAX,
+        0,
     );
     write_png(&dir.join("visor-bug-idle.png"), &idle)?;
     write_png(&dir.join("visor-bug-active.png"), &active)?;
@@ -403,7 +447,10 @@ fn clamp_offset(dx: i32, dy: i32, max_shift: i32) -> (i32, i32) {
         return (dx, dy);
     }
     let scale = max_shift as f32 / dist;
-    ((dx as f32 * scale).round() as i32, (dy as f32 * scale).round() as i32)
+    (
+        (dx as f32 * scale).round() as i32,
+        (dy as f32 * scale).round() as i32,
+    )
 }
 
 fn pupil_blob(image: &Image, eye: Rect) -> Vec<(i32, i32)> {
@@ -556,7 +603,8 @@ fn draw_text(image: &mut Image, scale: i32, x: i32, y: i32, text: &str, color: [
                     for sx in 0..scale {
                         let px_x = cursor + col as i32 * scale + sx;
                         let px_y = y + row as i32 * scale + sy;
-                        if px_x < 0 || px_y < 0 || px_x >= image.w as i32 || px_y >= image.h as i32 {
+                        if px_x < 0 || px_y < 0 || px_x >= image.w as i32 || px_y >= image.h as i32
+                        {
                             continue;
                         }
                         let i = (px_y as u32 * image.w + px_x as u32) as usize * 4;
@@ -570,52 +618,134 @@ fn draw_text(image: &mut Image, scale: i32, x: i32, y: i32, text: &str, color: [
 }
 
 fn glyph(ch: char) -> [u8; 7] {
-    let ch = if ch.is_ascii() { ch.to_ascii_uppercase() } else { '?' };
+    let ch = if ch.is_ascii() {
+        ch.to_ascii_uppercase()
+    } else {
+        '?'
+    };
     match ch {
         ' ' => [0, 0, 0, 0, 0, 0, 0],
-        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-        'C' => [0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110],
-        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
-        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-        'G' => [0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110],
-        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'I' => [0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
-        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100],
-        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010],
-        'X' => [0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001],
-        'Y' => [0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100],
-        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        '5' => [0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110],
-        '6' => [0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b01110, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
         ':' => [0, 0b00100, 0b00100, 0, 0b00100, 0b00100, 0],
         '-' => [0, 0, 0, 0b11111, 0, 0, 0],
         '.' => [0, 0, 0, 0, 0, 0b00100, 0b00100],
         ',' => [0, 0, 0, 0, 0b00100, 0b00100, 0b01000],
-        '(' => [0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010],
-        ')' => [0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000],
-        '/' => [0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000],
+        '(' => [
+            0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010,
+        ],
+        ')' => [
+            0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000,
+        ],
+        '/' => [
+            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
+        ],
         '?' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100],
         _ => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0, 0b00100],
     }
@@ -662,12 +792,15 @@ fn find_eyes(image: &Image) -> Vec<Rect> {
             let cy = min_y + rect_h / 2;
             // The illustrated eyes are smaller than the old still sprites.
             if area > 200 && cy < (h * 70) / 100 && rect_w > 20 && rect_h > 16 {
-                found.push((area, Rect {
-                    x: min_x,
-                    y: min_y,
-                    w: rect_w,
-                    h: rect_h,
-                }));
+                found.push((
+                    area,
+                    Rect {
+                        x: min_x,
+                        y: min_y,
+                        w: rect_w,
+                        h: rect_h,
+                    },
+                ));
             }
         }
     }
@@ -692,12 +825,12 @@ fn fill(image: &mut Image, color: [u8; 4]) {
     }
 }
 
-fn blit(dst: &mut [u8], dst_w: u32, src: &Image, dx: i32, dy: i32) {
+fn blit(dst: &mut [u8], dst_w: u32, src: &Image, dx: i32, dy: i32, min_y: i32) {
     for y in 0..src.h as i32 {
         for x in 0..src.w as i32 {
             let out_x = dx + x;
             let out_y = dy + y;
-            if out_x < 0 || out_y < 0 || out_x >= dst_w as i32 {
+            if out_x < 0 || out_y < min_y || out_x >= dst_w as i32 {
                 continue;
             }
             let dst_h = dst.len() / (dst_w as usize * 4);
@@ -813,7 +946,18 @@ mod tests {
         pointer: Option<(i32, i32)>,
     ) -> Scene {
         render(
-            sprites, pose, mascot, frame, false, false, None, eyes, false, pointer,
+            sprites,
+            pose,
+            mascot,
+            frame,
+            false,
+            false,
+            None,
+            eyes,
+            false,
+            pointer,
+            u32::MAX,
+            0,
         )
     }
 
@@ -878,9 +1022,23 @@ mod tests {
         assert_eq!(band(&left), band(&right));
         assert_eq!(band(&left), band(&still));
         let idle_left = scene(&sprites, &Pose::Idle, Mascot::Idle, 0, true, Some((0, 40)));
-        let idle_right = scene(&sprites, &Pose::Idle, Mascot::Idle, 0, true, Some((390, 40)));
+        let idle_right = scene(
+            &sprites,
+            &Pose::Idle,
+            Mascot::Idle,
+            0,
+            true,
+            Some((390, 40)),
+        );
         assert_eq!(idle_left.rgba, idle_right.rgba);
-        let visor = scene(&sprites, &active, Mascot::Automation, 0, true, Some((0, 80)));
+        let visor = scene(
+            &sprites,
+            &active,
+            Mascot::Automation,
+            0,
+            true,
+            Some((0, 80)),
+        );
         let visor_other = scene(
             &sprites,
             &active,
@@ -906,6 +1064,8 @@ mod tests {
             false,
             false,
             None,
+            u32::MAX,
+            0,
         );
         assert!(scene
             .hits
@@ -925,5 +1085,67 @@ mod tests {
 
     fn corner_clear(scene: &Scene) -> bool {
         scene.rgba[3] == 0
+    }
+
+    #[test]
+    fn menu_keeps_every_row_on_a_short_display() {
+        let sprites = Sprites::load();
+        for screen in [768u32, 900] {
+            let max_height = screen.saturating_sub(VIEW_MARGIN);
+            let top = render(
+                &sprites,
+                &Pose::Idle,
+                Mascot::Idle,
+                0,
+                true,
+                false,
+                None,
+                false,
+                false,
+                None,
+                max_height,
+                0,
+            );
+            assert!(top.height <= max_height);
+            assert!(top.height + VIEW_MARGIN <= screen);
+            let open = top
+                .hits
+                .iter()
+                .find(|hit| hit.action == Action::OpenCli)
+                .expect("open cli");
+            assert_eq!(open.h, row_h());
+            assert!(open.y >= 0 && open.y + open.h <= top.height as i32);
+            let buried = top
+                .hits
+                .iter()
+                .find(|hit| hit.action == Action::ToggleBugCursor);
+            assert!(buried.is_none_or(|hit| hit.h < row_h() || hit.y + hit.h > top.height as i32));
+            let bottom = render(
+                &sprites,
+                &Pose::Idle,
+                Mascot::Idle,
+                0,
+                true,
+                false,
+                None,
+                false,
+                false,
+                None,
+                max_height,
+                i32::MAX,
+            );
+            let bug = bottom
+                .hits
+                .iter()
+                .find(|hit| hit.action == Action::ToggleBugCursor)
+                .expect("bug cursor");
+            assert_eq!(bug.h, row_h(), "{bug:?}");
+            assert!(bug.y >= 0 && bug.y + bug.h <= bottom.height as i32);
+        }
+    }
+
+    fn row_h() -> i32 {
+        // pad 12 * 2 + one 24 px line. Matches text_card for a menu row.
+        48
     }
 }

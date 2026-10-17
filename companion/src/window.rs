@@ -17,7 +17,7 @@ use x11rb::rust_connection::RustConnection;
 use hypermesh_session::{self, KeyringStore};
 
 use crate::auth::{Pose, Snapshot};
-use crate::automation::{self, CursorPose, Effect, Machine, Motion, Phase, VisorPhase};
+use crate::automation::{self, CursorPose, Effect, Machine, Motion, MotionKind, Phase, VisorPhase};
 use crate::credentials;
 use crate::draw::{self, Action, Scene, Sprites};
 use crate::mascot::{self, Mascot, Reel};
@@ -50,6 +50,13 @@ struct App {
     pointer_sample: Option<(i32, i32, u64)>,
     click_at: Option<u64>,
     key_at: Option<u64>,
+    /// Last `QueryPointer` button mask, for the pointer-fallback detector.
+    button_mask: u32,
+    /// Drive samples at or before this unix millisecond are from before the
+    /// last resume. The fallback must not compare the pointer with them.
+    fallback_fresh_after: u64,
+    /// Menu and continue-prompt scroll, in pixels.
+    scroll: i32,
 }
 
 pub fn run() -> Result<(), String> {
@@ -77,6 +84,9 @@ pub fn run() -> Result<(), String> {
         pointer_sample: None,
         click_at: None,
         key_at: None,
+        button_mask: 0,
+        fallback_fresh_after: 0,
+        scroll: 0,
     };
     show(app)
 }
@@ -102,6 +112,10 @@ fn show(mut app: App) -> Result<(), String> {
         app.eyes_follow,
         app.bug_cursor,
         None,
+        u32::from(screen.height_in_pixels)
+            .saturating_sub(draw::VIEW_MARGIN)
+            .max(1),
+        0,
     );
     let (x, y) = place(
         screen.width_in_pixels,
@@ -168,17 +182,20 @@ fn show(mut app: App) -> Result<(), String> {
         let wall_ms = wall_ms();
         let dt = last_frame.elapsed().as_millis() as u64;
         last_frame = Instant::now();
-        app.poller.poll();
-        let snap = app.poller.snapshot().clone();
+        let snap = app.poller.snapshot();
         let visor_phase = if snap.connected {
             snap.phase
         } else {
             VisorPhase::Off
         };
+        let phase_before = app.machine.phase();
         if snap.connected {
             app.machine.see_visor(visor_phase, now_ms);
         } else {
             app.machine.note_disconnect();
+        }
+        if phase_before == Phase::Paused && app.machine.phase() == Phase::Running {
+            app.fallback_fresh_after = wall_ms;
         }
         if app.machine.phase() == Phase::Off {
             app.pending = None;
@@ -187,7 +204,8 @@ fn show(mut app: App) -> Result<(), String> {
         let mut click: Option<(i32, i32)> = None;
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
             if let Some(live) = watch.observe(&event) {
-                note_effect(&mut app.pending, app.machine.user_input(now_ms));
+                let effect = app.machine.user_input(now_ms);
+                note_effect(&mut app, effect, wall_ms);
                 app.last_used = Instant::now();
                 match live {
                     LiveInput::Button => app.click_at = Some(now_ms),
@@ -196,35 +214,80 @@ fn show(mut app: App) -> Result<(), String> {
                 }
             }
             if let Event::ButtonPress(press) = event {
-                if press.detail == 1 && press.event == window {
-                    click = Some((i32::from(press.event_x), i32::from(press.event_y)));
+                if press.event != window {
+                    continue;
+                }
+                match press.detail {
+                    4 | 5 if app.menu || app.machine.asking() => {
+                        let step = draw::MENU_SCROLL_STEP;
+                        if press.detail == 4 {
+                            app.scroll = app.scroll.saturating_sub(step);
+                        } else {
+                            app.scroll = app.scroll.saturating_add(step);
+                        }
+                    }
+                    1 => click = Some((i32::from(press.event_x), i32::from(press.event_y))),
+                    _ => {}
                 }
             }
         }
         if !watch.ready && app.machine.phase() == Phase::Running {
-            if let Some(drive) = snap.drive.as_ref() {
-                let age = wall_ms.saturating_sub(drive.at_ms);
-                if drive.pointer_known && age > 150 {
-                    if let Some((x, y)) = pointer::root_pointer(&conn, root) {
-                        let dx = (x - drive.x).abs();
-                        let dy = (y - drive.y).abs();
-                        if dx + dy > 12 {
-                            note_effect(&mut app.pending, app.machine.user_input(now_ms));
-                            app.last_used = Instant::now();
-                        }
-                    }
+            if let Some((x, y, mask)) = pointer::root_pointer_state(&conn, root) {
+                let sample = snap.drive.as_ref().map(|drive| {
+                    let age = wall_ms.saturating_sub(drive.at_ms);
+                    let distance = (x - drive.x).abs() + (y - drive.y).abs();
+                    (drive, age, distance)
+                });
+                let displaced = sample.as_ref().is_some_and(|(drive, age, distance)| {
+                    automation::fallback_displaced(
+                        drive.pointer_known,
+                        drive.at_ms,
+                        app.fallback_fresh_after,
+                        *age,
+                        *distance,
+                    )
+                });
+                let (click_or_drag, at_ms, age, known, distance) = sample
+                    .as_ref()
+                    .map(|(drive, age, distance)| {
+                        (
+                            matches!(drive.kind, MotionKind::Click | MotionKind::Drag),
+                            drive.at_ms,
+                            *age,
+                            drive.pointer_known,
+                            *distance,
+                        )
+                    })
+                    .unwrap_or((false, 0, 0, false, 0));
+                let pressed = automation::fallback_button_press(
+                    app.button_mask,
+                    mask,
+                    click_or_drag,
+                    at_ms,
+                    age,
+                    known,
+                    app.fallback_fresh_after,
+                    distance,
+                );
+                app.button_mask = mask;
+                if displaced || pressed {
+                    let effect = app.machine.user_input(now_ms);
+                    note_effect(&mut app, effect, wall_ms);
+                    app.last_used = Instant::now();
                 }
             }
         }
         if let Some((x, y)) = click {
             app.last_used = Instant::now();
-            on_click(&mut app, &scene, x, y, was_paused, now_ms);
+            on_click(&mut app, &scene, x, y, was_paused, now_ms, wall_ms);
         }
-        note_effect(&mut app.pending, app.machine.poll(now_ms));
-        if let Some(action) = app.pending {
-            if app.poller.post(action) {
-                app.pending = None;
-            }
+        let effect = app.machine.poll(now_ms);
+        note_effect(&mut app, effect, wall_ms);
+        if let Some(action) = app.pending.take() {
+            app.poller.enqueue(action);
+        }
+        if !app.menu && !app.machine.asking() {
+            app.scroll = 0;
         }
         let mascot = mascot_now(&app, &snap);
         app.reel.set_state(mascot);
@@ -247,6 +310,10 @@ fn show(mut app: App) -> Result<(), String> {
             app.eyes_follow,
             app.bug_cursor,
             pointer,
+            u32::from(screen.height_in_pixels)
+                .saturating_sub(draw::VIEW_MARGIN)
+                .max(1),
+            app.scroll,
         );
         if (scene.width, scene.height) != size {
             let (x, y) = place(
@@ -267,7 +334,9 @@ fn show(mut app: App) -> Result<(), String> {
             size = (scene.width, scene.height);
         }
         put_scene(&conn, window, gc, &scene, depth, lsb, red, green, blue)?;
-        sync_cursor(&mut app, &mut guard, &art, &snap, &conn, root, now_ms, wall_ms)?;
+        sync_cursor(
+            &mut app, &mut guard, &art, &snap, &conn, root, now_ms, wall_ms,
+        )?;
         conn.flush().map_err(|err| err.to_string())?;
         std::thread::sleep(Duration::from_millis(80));
     }
@@ -297,10 +366,15 @@ fn arm_signals() {
     }
 }
 
-fn note_effect(pending: &mut Option<&'static str>, effect: Effect) {
+fn note_effect(app: &mut App, effect: Effect, wall_ms: u64) {
     match effect {
-        Effect::Pause => *pending = Some("pause"),
-        Effect::Resume => *pending = Some("resume"),
+        Effect::Pause => app.pending = Some("pause"),
+        Effect::Resume => {
+            app.pending = Some("resume");
+            // The snapshot can still carry the pre-pause drive until the next
+            // poll. Ignore it, or the pointer fallback pauses on the next frame.
+            app.fallback_fresh_after = wall_ms;
+        }
         Effect::None => {}
     }
 }
@@ -376,12 +450,7 @@ fn sync_cursor(
     Ok(())
 }
 
-fn local_motion(
-    app: &mut App,
-    conn: &RustConnection,
-    root: u32,
-    now_ms: u64,
-) -> Option<Motion> {
+fn local_motion(app: &mut App, conn: &RustConnection, root: u32, now_ms: u64) -> Option<Motion> {
     if let Some(at) = app.click_at {
         if now_ms.saturating_sub(at) < automation::CLICK_FRESH_MS {
             return Some(Motion {
@@ -440,7 +509,15 @@ fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_ms: u64) {
+fn on_click(
+    app: &mut App,
+    scene: &Scene,
+    x: i32,
+    y: i32,
+    was_paused: bool,
+    now_ms: u64,
+    wall_ms: u64,
+) {
     let Some(hit) = scene.hits.iter().find(|hit| hit.contains(x, y)) else {
         return;
     };
@@ -449,7 +526,8 @@ fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_
             if was_paused {
                 app.machine.ask(now_ms);
             } else if app.machine.phase() == Phase::Running {
-                note_effect(&mut app.pending, app.machine.user_input(now_ms));
+                let effect = app.machine.user_input(now_ms);
+                note_effect(app, effect, wall_ms);
             } else if app.machine.phase() == Phase::Paused {
                 // This click is the one that paused the automation.
             } else {
@@ -457,7 +535,8 @@ fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_
             }
         }
         Action::ContinueAutomation => {
-            note_effect(&mut app.pending, app.machine.continue_now(now_ms));
+            let effect = app.machine.continue_now(now_ms);
+            note_effect(app, effect, wall_ms);
         }
         Action::DismissAutomation => app.machine.dismiss(now_ms),
         Action::ToggleBugCursor => {
@@ -600,10 +679,7 @@ fn open_hypermesh_args(extra: &[&str]) -> std::io::Result<()> {
             "alacritty",
             vec!["-e".into(), "sh".into(), "-c".into(), joined.clone()],
         ),
-        (
-            "xterm",
-            vec!["-e".into(), "sh".into(), "-c".into(), joined],
-        ),
+        ("xterm", vec!["-e".into(), "sh".into(), "-c".into(), joined]),
     ];
     for (bin, args) in terminals {
         if std::process::Command::new(bin).args(args).spawn().is_ok() {

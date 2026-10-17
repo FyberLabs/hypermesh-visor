@@ -95,7 +95,11 @@ impl Watch {
             ready: false,
             pending_px: 0.0,
         };
-        if conn.xinput_xi_query_version(2, 2).ok().and_then(|cookie| cookie.reply().ok()).is_none()
+        if conn
+            .xinput_xi_query_version(2, 2)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_none()
         {
             return watch;
         }
@@ -111,7 +115,8 @@ impl Watch {
                 watch.xtest.push(info.deviceid);
             }
         }
-        let mask = XIEventMask::RAW_MOTION | XIEventMask::RAW_BUTTON_PRESS | XIEventMask::RAW_KEY_PRESS;
+        let mask =
+            XIEventMask::RAW_MOTION | XIEventMask::RAW_BUTTON_PRESS | XIEventMask::RAW_KEY_PRESS;
         let select = xinput::EventMask {
             deviceid: 0,
             mask: vec![mask],
@@ -389,7 +394,8 @@ impl BugCursor {
             &data,
         )
         .map_err(|err| err.to_string())?;
-        conn.map_window(self.overlay).map_err(|err| err.to_string())?;
+        conn.map_window(self.overlay)
+            .map_err(|err| err.to_string())?;
         Ok(())
     }
 
@@ -401,8 +407,17 @@ impl BugCursor {
 }
 
 pub fn root_pointer(conn: &RustConnection, root: u32) -> Option<(i32, i32)> {
+    root_pointer_state(conn, root).map(|(x, y, _)| (x, y))
+}
+
+/// Root pointer plus the `QueryPointer` button mask. Button1 is bit 8.
+pub fn root_pointer_state(conn: &RustConnection, root: u32) -> Option<(i32, i32, u32)> {
     let reply = conn.query_pointer(root).ok()?.reply().ok()?;
-    Some((i32::from(reply.root_x), i32::from(reply.root_y)))
+    Some((
+        i32::from(reply.root_x),
+        i32::from(reply.root_y),
+        u32::from(reply.mask),
+    ))
 }
 
 fn define(conn: &RustConnection, window: u32, cursor: u32) -> Result<(), String> {

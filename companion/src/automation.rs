@@ -21,6 +21,16 @@ pub const MOVE_FRESH_MS: u64 = 200;
 pub const CLICK_FRESH_MS: u64 = 200;
 pub const TYPE_FRESH_MS: u64 = 400;
 pub const CURSOR_FRAME_MS: u64 = 100;
+/// Pointer-fallback: ignore a drive sample until it is older than this.
+pub const FALLBACK_SETTLE_MS: u64 = 150;
+/// Pointer-fallback: a root pointer farther than this from the drive target
+/// is a user move. Manhattan, matching the window check.
+pub const FALLBACK_DISTANCE_PX: i32 = 12;
+/// A button that appears with a fresh click or drag this close to the drive
+/// target is the automation's own press.
+pub const FALLBACK_CLICK_MS: u64 = 400;
+/// QueryPointer button bits: Button1 at bit 8 through Button5 at bit 12.
+const FALLBACK_BUTTONS: u32 = 0b1_1111 << 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -52,6 +62,9 @@ pub struct Machine {
     /// A local resume is waiting for the visor to leave `paused`. A poll that
     /// still says paused must not undo it.
     holding_resume: bool,
+    /// The visor has reported this pause. A later `running` report is a
+    /// resume or start from the visor, not a poll from before the pause landed.
+    pause_acked: bool,
 }
 
 impl Machine {
@@ -62,6 +75,7 @@ impl Machine {
             resume_after_ms: resume_after_ms.max(1),
             asking: false,
             holding_resume: false,
+            pause_acked: false,
         }
     }
 
@@ -77,32 +91,42 @@ impl Machine {
         self.resume_after_ms
     }
 
-    /// What the visor last reported. A local pause stays until resume, even if
-    /// a poll still says running from before the pause landed.
+    /// What the visor last reported. A local pause stays until the visor
+    /// confirms it. After that, a `running` report is a resume or start and
+    /// the companion follows it. A poll that still says running from before
+    /// the pause landed does not.
     pub fn see_visor(&mut self, visor: VisorPhase, now_ms: u64) -> Effect {
         match visor {
             VisorPhase::Off => {
                 self.phase = Phase::Off;
                 self.asking = false;
                 self.holding_resume = false;
+                self.pause_acked = false;
                 Effect::None
             }
             VisorPhase::Running => {
                 self.holding_resume = false;
-                if self.phase == Phase::Off {
+                let follow =
+                    self.phase == Phase::Off || (self.phase == Phase::Paused && self.pause_acked);
+                if follow {
                     self.phase = Phase::Running;
+                    self.asking = false;
+                }
+                if self.phase == Phase::Running {
+                    self.pause_acked = false;
                 }
                 Effect::None
             }
             VisorPhase::Paused => {
                 if self.holding_resume {
                     Effect::None
-                } else if self.phase != Phase::Paused {
-                    self.phase = Phase::Paused;
-                    self.last_input_ms = now_ms;
-                    self.asking = false;
-                    Effect::None
                 } else {
+                    if self.phase != Phase::Paused {
+                        self.phase = Phase::Paused;
+                        self.last_input_ms = now_ms;
+                        self.asking = false;
+                    }
+                    self.pause_acked = true;
                     Effect::None
                 }
             }
@@ -118,6 +142,7 @@ impl Machine {
                 self.last_input_ms = now_ms;
                 self.asking = false;
                 self.holding_resume = false;
+                self.pause_acked = false;
                 Effect::Pause
             }
             Phase::Paused => {
@@ -163,6 +188,7 @@ impl Machine {
         self.phase = Phase::Off;
         self.asking = false;
         self.holding_resume = false;
+        self.pause_acked = false;
     }
 
     /// Resume when the wait has elapsed with no user input.
@@ -178,6 +204,52 @@ impl Machine {
         }
         Effect::None
     }
+}
+
+/// The pointer-fallback detector. A sample taken before `fresh_after` is the
+/// drive that was on screen when the automation paused; comparing the pointer
+/// with it pauses again on the next frame.
+pub fn fallback_displaced(
+    pointer_known: bool,
+    drive_at_ms: u64,
+    fresh_after: u64,
+    age_ms: u64,
+    distance: i32,
+) -> bool {
+    pointer_known
+        && drive_at_ms > fresh_after
+        && age_ms > FALLBACK_SETTLE_MS
+        && distance > FALLBACK_DISTANCE_PX
+}
+
+/// Newly pressed buttons in a `QueryPointer` mask (bits 8 through 12).
+pub fn newly_pressed(previous: u32, mask: u32) -> u32 {
+    (mask & !previous) & FALLBACK_BUTTONS
+}
+
+/// A new button pauses. A press that belongs to a fresh click or drag on the
+/// drive point is the automation's own button and is ignored. `drive_at_ms`
+/// must be newer than `fresh_after`, or a sample from before resume would
+/// swallow the user's next click on that same point.
+pub fn fallback_button_press(
+    previous: u32,
+    mask: u32,
+    click_or_drag: bool,
+    drive_at_ms: u64,
+    age_ms: u64,
+    pointer_known: bool,
+    fresh_after: u64,
+    distance: i32,
+) -> bool {
+    if newly_pressed(previous, mask) == 0 {
+        return false;
+    }
+    let own = click_or_drag
+        && pointer_known
+        && drive_at_ms > fresh_after
+        && age_ms < FALLBACK_CLICK_MS
+        && distance <= FALLBACK_DISTANCE_PX;
+    !own
 }
 
 /// XTEST device ids are synthetic. A real device is anything else.
@@ -232,8 +304,7 @@ pub fn cursor_pose(phase: Phase, opt_in: bool, motion: Option<Motion>) -> Cursor
     if motion.kind == MotionKind::Type && motion.age_ms < TYPE_FRESH_MS {
         return CursorPose::Type;
     }
-    if matches!(motion.kind, MotionKind::Move | MotionKind::Drag) && motion.age_ms < MOVE_FRESH_MS
-    {
+    if matches!(motion.kind, MotionKind::Move | MotionKind::Drag) && motion.age_ms < MOVE_FRESH_MS {
         return if flies(&motion) {
             CursorPose::Fly
         } else {
@@ -431,6 +502,27 @@ mod tests {
     }
 
     #[test]
+    fn an_acked_pause_follows_a_later_running_report() {
+        let mut machine = Machine::new(1_000);
+        machine.see_visor(VisorPhase::Running, 0);
+        machine.user_input(10);
+        machine.see_visor(VisorPhase::Running, 20);
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Paused, 30);
+        machine.user_input(40);
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Running, 50);
+        assert_eq!(machine.phase(), Phase::Running);
+
+        machine.user_input(60);
+        machine.see_visor(VisorPhase::Paused, 70);
+        machine.note_disconnect();
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Running, 80);
+        assert_eq!(machine.phase(), Phase::Running);
+    }
+
+    #[test]
     fn pause_is_retried_after_a_disconnect() {
         let mut machine = Machine::new(1_000);
         machine.see_visor(VisorPhase::Running, 0);
@@ -468,6 +560,47 @@ mod tests {
         assert_eq!(machine.poll(60 + 1_000), Effect::Resume);
         machine.see_visor(VisorPhase::Off, 2_000);
         assert_eq!(machine.phase(), Phase::Off);
+    }
+
+    #[test]
+    fn fallback_ignores_a_drive_from_before_resume() {
+        assert!(!fallback_displaced(true, 1_000, 1_000, 500, 80));
+        assert!(!fallback_displaced(true, 900, 1_000, 500, 80));
+        assert!(fallback_displaced(true, 1_001, 1_000, 151, 13));
+        assert!(!fallback_displaced(true, 1_001, 1_000, 150, 13));
+        assert!(!fallback_displaced(true, 1_001, 1_000, 400, 12));
+        assert!(!fallback_displaced(false, 1_001, 1_000, 400, 80));
+    }
+
+    #[test]
+    fn fallback_button_press_ignores_the_automations_own_click() {
+        let button1 = 1 << 8;
+        assert!(fallback_button_press(0, button1, false, 0, 0, false, 0, 0));
+        assert!(!fallback_button_press(
+            button1, button1, false, 0, 0, false, 0, 0
+        ));
+        assert!(!fallback_button_press(
+            0, button1, true, 1_000, 50, true, 100, 10
+        ));
+        assert!(fallback_button_press(
+            0, button1, true, 1_000, 50, true, 100, 13
+        ));
+        assert!(fallback_button_press(
+            0,
+            button1,
+            true,
+            1_000,
+            FALLBACK_CLICK_MS,
+            true,
+            100,
+            0
+        ));
+        assert!(fallback_button_press(
+            0, button1, true, 50, 10, true, 100, 0
+        ));
+        assert!(fallback_button_press(0, 1 << 12, false, 0, 0, false, 0, 0));
+        assert!(!fallback_button_press(0, 1 << 0, false, 0, 0, false, 0, 0));
+        assert_eq!(newly_pressed(0, button1 | 1), button1);
     }
 
     #[test]
@@ -534,13 +667,16 @@ mod tests {
 
     #[test]
     fn hotspot_matches_the_file_and_rounds_half_to_even() {
-        let file: Value = serde_json::from_str(include_str!("../assets/cursor/hotspot.json"))
-            .expect("hotspot");
+        let file: Value =
+            serde_json::from_str(include_str!("../assets/cursor/hotspot.json")).expect("hotspot");
         for size in [32u32, 64, 128] {
             let pair = file["hotspot"][size.to_string()].as_array().unwrap();
             assert_eq!(
                 hotspot_for(size),
-                (pair[0].as_u64().unwrap() as u16, pair[1].as_u64().unwrap() as u16)
+                (
+                    pair[0].as_u64().unwrap() as u16,
+                    pair[1].as_u64().unwrap() as u16
+                )
             );
         }
         assert_eq!(hotspot_for(64), (20, 10));

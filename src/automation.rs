@@ -188,6 +188,9 @@ impl Gate {
                 };
                 self.session = Some(id);
                 self.phase = Phase::Running;
+                // A sample from the previous drive would look like a user move
+                // to the pointer fallback the moment this start is running.
+                self.drive = None;
                 Ok(())
             }
             Control::Pause => {
@@ -199,6 +202,11 @@ impl Gate {
             Control::Resume => {
                 if self.phase == Phase::Paused {
                     self.phase = Phase::Running;
+                    // The pointer is already away from this sample; that is
+                    // why the automation paused. Leave the last point so a
+                    // later type still has somewhere to land, but do not let
+                    // the fallback compare against the pre-pause target.
+                    self.drive = None;
                 }
                 Ok(())
             }
@@ -233,17 +241,7 @@ impl Gate {
                 x, y, to_x, to_y, ..
             } => (DriveKind::Drag, to_x, to_y, x, y, false),
         };
-        self.store(
-            session,
-            kind,
-            x,
-            y,
-            from_x,
-            from_y,
-            clickable,
-            true,
-            now_ms,
-        );
+        self.store(session, kind, x, y, from_x, from_y, clickable, true, now_ms);
     }
 
     pub fn record_type(
@@ -382,6 +380,7 @@ mod tests {
         gate.record_type(id, None, generation, 2_000);
         assert_eq!(gate.drive().unwrap().kind, DriveKind::Move);
         gate.control(Some(id), Control::Resume).unwrap();
+        assert!(gate.drive().is_none());
         gate.record_type(id, None, generation, 2_100);
         assert_eq!(gate.drive().unwrap().kind, DriveKind::Type);
         assert!(gate.drive().unwrap().pointer_known);
@@ -491,5 +490,38 @@ mod tests {
         let drive = gate.drive().unwrap();
         assert!(drive.pointer_known);
         assert_eq!((drive.x, drive.y), (40, 70));
+    }
+
+    #[test]
+    fn resume_and_start_drop_the_drive_sample() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let generation = gate.generation();
+        gate.record_mouse(
+            id,
+            &MouseOp::Move {
+                x: 40,
+                y: 50,
+                clickable: false,
+            },
+            Some((0, 0)),
+            generation,
+            10,
+        );
+        gate.control(Some(id), Control::Pause).unwrap();
+        assert!(gate.drive().is_some());
+        gate.control(Some(id), Control::Resume).unwrap();
+        assert_eq!(gate.phase(), Phase::Running);
+        assert!(gate.drive().is_none());
+        gate.record_type(id, None, generation, 20);
+        let drive = gate.drive().unwrap();
+        assert!(drive.pointer_known);
+        assert_eq!((drive.x, drive.y), (40, 50));
+
+        gate.control(Some(id), Control::Start).unwrap();
+        assert_eq!(gate.phase(), Phase::Running);
+        assert!(gate.drive().is_none());
+        gate.record_type(id, None, generation, 30);
+        assert_eq!((gate.drive().unwrap().x, gate.drive().unwrap().y), (40, 50));
     }
 }
