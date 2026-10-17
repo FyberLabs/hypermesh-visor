@@ -55,6 +55,8 @@ struct App {
     /// Drive samples at or before this unix millisecond are from before the
     /// last resume. The fallback must not compare the pointer with them.
     fallback_fresh_after: u64,
+    /// Pointer-fallback: a mismatch has to survive later polls of the same drive.
+    displacement_hold: Option<automation::FallbackHold>,
     /// Menu and continue-prompt scroll, in pixels.
     scroll: i32,
 }
@@ -86,6 +88,7 @@ pub fn run() -> Result<(), String> {
         key_at: None,
         button_mask: 0,
         fallback_fresh_after: 0,
+        displacement_hold: None,
         scroll: 0,
     };
     show(app)
@@ -182,7 +185,7 @@ fn show(mut app: App) -> Result<(), String> {
         let wall_ms = wall_ms();
         let dt = last_frame.elapsed().as_millis() as u64;
         last_frame = Instant::now();
-        let snap = app.poller.snapshot();
+        let (snap, epoch) = app.poller.snapshot();
         let visor_phase = if snap.connected {
             snap.phase
         } else {
@@ -247,6 +250,20 @@ fn show(mut app: App) -> Result<(), String> {
                         *distance,
                     )
                 });
+                let drive_at = sample
+                    .as_ref()
+                    .map(|(drive, _, _)| drive.at_ms)
+                    .unwrap_or(0);
+                // A move can land on screen before this snapshot's poll started,
+                // so the drive here may still be the previous target. Wait until
+                // later polls of that same sample still disagree.
+                let (displaced, hold) = automation::consider_displacement(
+                    displaced,
+                    drive_at,
+                    epoch,
+                    app.displacement_hold,
+                );
+                app.displacement_hold = hold;
                 let (click_or_drag, at_ms, age, known, distance) = sample
                     .as_ref()
                     .map(|(drive, age, distance)| {
@@ -276,6 +293,8 @@ fn show(mut app: App) -> Result<(), String> {
                     app.last_used = Instant::now();
                 }
             }
+        } else {
+            app.displacement_hold = None;
         }
         if let Some((x, y)) = click {
             app.last_used = Instant::now();

@@ -227,6 +227,48 @@ pub fn newly_pressed(previous: u32, mask: u32) -> u32 {
     (mask & !previous) & FALLBACK_BUTTONS
 }
 
+/// Later polls of the same drive sample required before a pointer mismatch
+/// counts as the user. The poll already in flight can still be the previous
+/// drive after the automation's pointer has moved.
+pub const FALLBACK_CONFIRM_EPOCHS: u8 = 2;
+
+/// The drive sample a mismatch was first seen against, and how many newer
+/// polls have shown that same sample.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FallbackHold {
+    pub at_ms: u64,
+    pub last_epoch: u64,
+    pub later_epochs: u8,
+}
+
+/// Displacement against the snapshot in hand is not enough. Pause only once
+/// later polls still carry that same drive and the pointer is still off it.
+/// A new `at_ms` starts the wait over, which is what a just-recorded move does.
+pub fn consider_displacement(
+    displaced: bool,
+    drive_at_ms: u64,
+    epoch: u64,
+    hold: Option<FallbackHold>,
+) -> (bool, Option<FallbackHold>) {
+    if !displaced {
+        return (false, None);
+    }
+    let mut hold = match hold {
+        Some(hold) if hold.at_ms == drive_at_ms => hold,
+        _ => FallbackHold {
+            at_ms: drive_at_ms,
+            last_epoch: epoch,
+            later_epochs: 0,
+        },
+    };
+    if epoch > hold.last_epoch {
+        hold.later_epochs = hold.later_epochs.saturating_add(1);
+        hold.last_epoch = epoch;
+    }
+    let pause = hold.later_epochs >= FALLBACK_CONFIRM_EPOCHS;
+    (pause, Some(hold))
+}
+
 /// A new button pauses. A press that belongs to a fresh click or drag on the
 /// drive point is the automation's own button and is ignored. `drive_at_ms`
 /// must be newer than `fresh_after`, or a sample from before resume would
@@ -570,6 +612,23 @@ mod tests {
         assert!(!fallback_displaced(true, 1_001, 1_000, 150, 13));
         assert!(!fallback_displaced(true, 1_001, 1_000, 400, 12));
         assert!(!fallback_displaced(false, 1_001, 1_000, 400, 80));
+    }
+
+    #[test]
+    fn displacement_waits_for_a_later_poll_of_the_same_drive() {
+        let (pause, hold) = consider_displacement(true, 10, 5, None);
+        assert!(!pause);
+        let (pause, hold) = consider_displacement(true, 10, 5, hold);
+        assert!(!pause, "the same snapshot is not a new poll");
+        let (pause, hold) = consider_displacement(true, 10, 6, hold);
+        assert!(!pause, "one later poll can still be the pre-move drive");
+        let (pause, hold) = consider_displacement(true, 10, 7, hold);
+        assert!(pause);
+        let (pause, hold) = consider_displacement(true, 80, 8, hold);
+        assert!(!pause, "a newly recorded drive starts the wait over");
+        let (pause, cleared) = consider_displacement(false, 80, 9, hold);
+        assert!(!pause);
+        assert!(cleared.is_none());
     }
 
     #[test]

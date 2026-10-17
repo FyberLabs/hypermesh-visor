@@ -15,8 +15,15 @@ use crate::automation::{Link, DISCONNECT_MISSES};
 
 /// Visor poll and control posts. Both run off the X11 loop: a slow reply
 /// must not freeze the cursor overlay or hold up a pause.
+struct Cache {
+    snapshot: Snapshot,
+    /// Bumps on each successful poll. A repeated snapshot from a missed poll
+    /// keeps the old epoch, so it cannot confirm a pointer mismatch.
+    epoch: u64,
+}
+
 pub struct Poller {
-    snapshot: Arc<Mutex<Snapshot>>,
+    snapshot: Arc<Mutex<Cache>>,
     queue: Arc<Mutex<VecDeque<&'static str>>>,
     stop: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -24,7 +31,10 @@ pub struct Poller {
 
 impl Poller {
     pub fn new() -> Self {
-        let snapshot = Arc::new(Mutex::new(Snapshot::disconnected()));
+        let snapshot = Arc::new(Mutex::new(Cache {
+            snapshot: Snapshot::disconnected(),
+            epoch: 0,
+        }));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let snapshot_thread = Arc::clone(&snapshot);
@@ -42,8 +52,9 @@ impl Poller {
         }
     }
 
-    pub fn snapshot(&self) -> Snapshot {
-        self.snapshot.lock().unwrap().clone()
+    pub fn snapshot(&self) -> (Snapshot, u64) {
+        let cache = self.snapshot.lock().unwrap();
+        (cache.snapshot.clone(), cache.epoch)
     }
 
     pub fn enqueue(&self, action: &'static str) {
@@ -61,7 +72,7 @@ impl Drop for Poller {
 }
 
 fn visor_loop(
-    snapshot: Arc<Mutex<Snapshot>>,
+    snapshot: Arc<Mutex<Cache>>,
     queue: Arc<Mutex<VecDeque<&'static str>>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -78,11 +89,20 @@ fn visor_loop(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        match fetch() {
-            Some(next) => link.ok(next),
-            None => link.miss(disconnect_from(link.current())),
-        }
-        *snapshot.lock().unwrap() = link.current().clone();
+        let fresh = match fetch() {
+            Some(next) => {
+                link.ok(next);
+                true
+            }
+            None => {
+                link.miss(disconnect_from(link.current()));
+                false
+            }
+        };
+        let mut cache = snapshot.lock().unwrap();
+        note_poll(&mut cache.epoch, fresh);
+        cache.snapshot = link.current().clone();
+        drop(cache);
         for _ in 0..4 {
             if stop.load(Ordering::SeqCst) {
                 return;
@@ -119,7 +139,7 @@ pub fn disconnect_misses() -> u32 {
 }
 
 fn fetch() -> Option<Snapshot> {
-    let (host, addr) = endpoint();
+    let (host, addr) = endpoint().ok()?;
     let request = auth::visor_request(&host);
     let text = exchange(&addr, &request)?;
     let body = body_of(&text)?;
@@ -130,7 +150,9 @@ fn fetch() -> Option<Snapshot> {
 }
 
 fn post(action: &str) -> bool {
-    let (host, addr) = endpoint();
+    let Ok((host, addr)) = endpoint() else {
+        return false;
+    };
     let body = format!(r#"{{"action":"{action}"}}"#);
     let request = format!(
         "POST /companion/automation HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -192,18 +214,48 @@ fn lookup(host: &str) -> Option<std::net::SocketAddr> {
     host.to_socket_addrs().ok()?.next()
 }
 
-fn endpoint() -> (String, String) {
+fn endpoint() -> Result<(String, String), &'static str> {
     let raw = std::env::var("HYPERMESH_VISOR_URL").unwrap_or_default();
+    parse_endpoint(&raw).inspect_err(|err| note_endpoint(err))
+}
+
+fn note_poll(epoch: &mut u64, fresh: bool) {
+    if fresh {
+        *epoch = epoch.saturating_add(1);
+    }
+}
+
+fn note_endpoint(err: &str) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
+    if LOGGED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    eprintln!("hypermesh-companion: {err}");
+}
+
+/// Plaintext HTTP only. The visor does not speak TLS, and stripping `https://`
+/// would send that URL in the clear.
+fn parse_endpoint(raw: &str) -> Result<(String, String), &'static str> {
     let raw = raw.trim().trim_end_matches('/');
-    let host = raw
-        .strip_prefix("https://")
-        .or_else(|| raw.strip_prefix("http://"))
-        .unwrap_or(raw);
+    if strip_prefix_ignore_ascii_case(raw, "https://").is_some() {
+        return Err(
+            "HYPERMESH_VISOR_URL uses https, but the companion only speaks plaintext HTTP to the visor",
+        );
+    }
+    let host = strip_prefix_ignore_ascii_case(raw, "http://").unwrap_or(raw);
     let host = host.split('/').next().unwrap_or("");
     if host.is_empty() {
-        ("127.0.0.1:9847".to_string(), "127.0.0.1:9847".to_string())
+        Ok(("127.0.0.1:9847".to_string(), "127.0.0.1:9847".to_string()))
     } else {
-        (host.to_string(), host.to_string())
+        Ok((host.to_string(), host.to_string()))
+    }
+}
+
+fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    if value.len() >= prefix.len() && value[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&value[prefix.len()..])
+    } else {
+        None
     }
 }
 
@@ -213,6 +265,31 @@ mod tests {
 
     use super::*;
     use crate::automation::Link;
+
+    #[test]
+    fn a_missed_poll_does_not_confirm_a_pointer_mismatch() {
+        let mut epoch = 4;
+        note_poll(&mut epoch, false);
+        assert_eq!(epoch, 4);
+        note_poll(&mut epoch, true);
+        assert_eq!(epoch, 5);
+    }
+
+    #[test]
+    fn https_is_refused_and_http_stays_plaintext() {
+        let err = parse_endpoint("https://localhost:9847").unwrap_err();
+        assert!(err.contains("https"));
+        assert!(err.contains("plaintext HTTP"));
+        assert!(parse_endpoint("HTTPS://127.0.0.1:9847/companion").is_err());
+        assert_eq!(
+            parse_endpoint("http://localhost:9847/ignored").unwrap().0,
+            "localhost:9847"
+        );
+        assert_eq!(
+            parse_endpoint("").unwrap(),
+            ("127.0.0.1:9847".into(), "127.0.0.1:9847".into())
+        );
+    }
 
     #[test]
     fn hostname_resolves_to_a_socket() {
