@@ -1,0 +1,73 @@
+{
+  "name": "companion-cursor",
+  "description": "Optional beetle cursor sprites. Art only; the hypermesh-companion binary leaves this directory unused.",
+  "license": "MIT",
+  "orientation": "top-down, head toward the up-left, like a standard arrow cursor",
+  "sizes": [32, 64, 128],
+  "frame_ms": 100,
+  "png_pattern": "{frame}_{size}.png",
+  "hotspot_file": "hotspot.json",
+  "hotspot": {
+    "32": [10, 5],
+    "64": [20, 10],
+    "128": [41, 20]
+  },
+  "hotspot_scale": "Same antenna-tip pixel on every frame. For another size, x = round(41 * size / 128) and y = round(20 * size / 128), with halves rounding to even.",
+  "preview": "preview.png",
+  "states": [
+    {
+      "id": "pointer",
+      "when": "default",
+      "frames": ["pointer"],
+      "gif": "pointer.gif",
+      "gif_frames": 1,
+      "gif_frame_ms": 500
+    },
+    {
+      "id": "crawl",
+      "when": "moving",
+      "frames": ["crawl"],
+      "gif": "crawl.gif",
+      "gif_frames": 2,
+      "gif_frame_ms": 160
+    },
+    {
+      "id": "fly",
+      "when": "fast or long move",
+      "frames": ["fly"],
+      "gif": "fly.gif",
+      "gif_frames": 2,
+      "gif_frame_ms": 80
+    },
+    {
+      "id": "reach",
+      "when": "hovering a clickable",
+      "frames": ["reach"],
+      "gif": null
+    },
+    {
+      "id": "click",
+      "when": "press",
+      "frames": ["click1", "click2"],
+      "gif": "click.gif",
+      "gif_frames": 5,
+      "gif_frame_ms": 110
+    },
+    {
+      "id": "type",
+      "when": "keyboard input",
+      "frames": ["type1", "type2"],
+      "gif": "type.gif",
+      "gif_frames": 2,
+      "gif_frame_ms": 150
+    },
+    {
+      "id": "busy",
+      "when": "working or waiting",
+      "frames": ["busy1", "busy2", "busy3", "busy4"],
+      "gif": "busy.gif",
+      "gif_frames": 4,
+      "gif_frame_ms": 100
+    }
+  ]
+}
