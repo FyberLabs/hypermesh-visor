@@ -4,7 +4,7 @@
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -169,8 +169,20 @@ fn post_raw(addr: &str, request: &str) -> bool {
 }
 
 fn exchange(addr: &str, request: &str) -> Option<String> {
-    let socket = lookup(addr)?;
-    let mut stream = TcpStream::connect_timeout(&socket, Duration::from_millis(200)).ok()?;
+    let sockets = lookup_all(addr);
+    let mut found = None;
+    connect_first(&sockets, |socket| match exchange_one(socket, request) {
+        Some(text) => {
+            found = Some(text);
+            true
+        }
+        None => false,
+    });
+    found
+}
+
+fn exchange_one(socket: &SocketAddr, request: &str) -> Option<String> {
+    let mut stream = TcpStream::connect_timeout(socket, Duration::from_millis(200)).ok()?;
     stream
         .set_read_timeout(Some(Duration::from_millis(300)))
         .ok()?;
@@ -210,8 +222,16 @@ fn disconnect_from(previous: &Snapshot) -> Snapshot {
     down
 }
 
-fn lookup(host: &str) -> Option<std::net::SocketAddr> {
-    host.to_socket_addrs().ok()?.next()
+fn lookup_all(host: &str) -> Vec<SocketAddr> {
+    host.to_socket_addrs()
+        .map(|iter| iter.collect())
+        .unwrap_or_default()
+}
+
+/// True when some address accepts the attempt. A hostname can resolve to an
+/// address the visor is not listening on, so a failure has to try the next.
+fn connect_first(addrs: &[SocketAddr], attempt: impl FnMut(&SocketAddr) -> bool) -> bool {
+    addrs.iter().any(attempt)
 }
 
 fn endpoint() -> Result<(String, String), &'static str> {
@@ -292,11 +312,37 @@ mod tests {
     }
 
     #[test]
-    fn hostname_resolves_to_a_socket() {
-        let addr = lookup("localhost:9847").expect("localhost");
-        assert_eq!(addr.port(), 9847);
-        assert!(addr.ip().is_loopback());
-        assert_eq!(lookup("127.0.0.1:9847").map(|addr| addr.port()), Some(9847));
+    fn hostname_resolves_to_every_loopback() {
+        let addrs = lookup_all("localhost:9847");
+        assert!(!addrs.is_empty());
+        assert!(addrs
+            .iter()
+            .all(|addr| addr.port() == 9847 && addr.ip().is_loopback()));
+        if addrs.iter().any(|addr| addr.is_ipv4()) && addrs.iter().any(|addr| addr.is_ipv6()) {
+            assert!(addrs.len() >= 2);
+        }
+        assert_eq!(
+            lookup_all("127.0.0.1:9847").first().map(|addr| addr.port()),
+            Some(9847)
+        );
+    }
+
+    #[test]
+    fn first_failure_does_not_hide_a_later_address() {
+        let v6: SocketAddr = "[::1]:9847".parse().unwrap();
+        let v4: SocketAddr = "127.0.0.1:9847".parse().unwrap();
+        let mut tried = Vec::new();
+        assert!(connect_first(&[v6, v4], |addr| {
+            tried.push(*addr);
+            addr.is_ipv4()
+        }));
+        assert_eq!(tried, vec![v6, v4]);
+        tried.clear();
+        assert!(!connect_first(&[v6], |addr| {
+            tried.push(*addr);
+            false
+        }));
+        assert_eq!(tried, vec![v6]);
     }
 
     #[test]

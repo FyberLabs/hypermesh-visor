@@ -208,6 +208,9 @@ pub struct BugCursor {
     overlay_gc: u32,
     sprite_hidden: bool,
     hot: (i16, i16),
+    /// True only after this process wrote the root window's cursor. The
+    /// overlay path never does, so restore leaves a custom root cursor alone.
+    root_cursor_set: bool,
     shown: Option<(CursorPose, usize)>,
     depth: u8,
     visual: u32,
@@ -236,6 +239,7 @@ impl BugCursor {
             overlay_gc: 0,
             sprite_hidden: false,
             hot: (0, 0),
+            root_cursor_set: false,
             shown: None,
             depth,
             visual,
@@ -263,21 +267,17 @@ impl BugCursor {
         let (hot_x, hot_y) = automation::hotspot_for(CURSOR_SIZE);
         self.hot = (hot_x as i16, hot_y as i16);
         let cursor = make_cursor(conn, self.root, image, hot_x, hot_y)?;
-        define(conn, self.root, cursor)?;
         define(conn, self.window, cursor)?;
+        let covering = self.cover_pointer(conn, image);
+        if replaces_root_cursor(covering) {
+            define(conn, self.root, cursor)?;
+            self.root_cursor_set = true;
+        }
         let previous = self.current;
         self.current = cursor;
         self.shown = Some((pose, frame));
         if previous != 0 {
             let _ = conn.free_cursor(previous);
-        }
-        if self.depth == 32 {
-            if let Err(err) = self.present_overlay(conn, image) {
-                eprintln!("hypermesh-companion: cursor window: {err}");
-                self.reveal_sprite(conn);
-            } else if !self.conceal_sprite(conn) {
-                self.unmap_overlay(conn);
-            }
         }
         Ok(())
     }
@@ -298,7 +298,10 @@ impl BugCursor {
     pub fn restore(&mut self, conn: &RustConnection) {
         self.reveal_sprite(conn);
         self.unmap_overlay(conn);
-        let _ = define(conn, self.root, 0);
+        if self.root_cursor_set {
+            let _ = define(conn, self.root, 0);
+            self.root_cursor_set = false;
+        }
         let _ = define(conn, self.window, 0);
         if self.current != 0 {
             let _ = conn.free_cursor(self.current);
@@ -306,6 +309,24 @@ impl BugCursor {
         }
         self.shown = None;
         let _ = conn.flush();
+    }
+
+    /// Hide the system sprite and paint the bug on a click-through window.
+    /// False means the caller has to put the cursor on the root window.
+    fn cover_pointer(&mut self, conn: &RustConnection, image: &draw::Rgba) -> bool {
+        if self.depth != 32 {
+            return false;
+        }
+        if let Err(err) = self.present_overlay(conn, image) {
+            eprintln!("hypermesh-companion: cursor window: {err}");
+            self.reveal_sprite(conn);
+            return false;
+        }
+        if self.conceal_sprite(conn) {
+            return true;
+        }
+        self.unmap_overlay(conn);
+        false
     }
 
     fn conceal_sprite(&mut self, conn: &RustConnection) -> bool {
@@ -418,6 +439,13 @@ pub fn root_pointer_state(conn: &RustConnection, root: u32) -> Option<(i32, i32,
         i32::from(reply.root_y),
         u32::from(reply.mask),
     ))
+}
+
+/// The overlay covers the pointer, so the root window's cursor stays as the
+/// user left it. X11 has no request that reads that cursor back. The fallback
+/// path writes it and can only restore the default cursor on the way out.
+pub(crate) fn replaces_root_cursor(overlay_covering: bool) -> bool {
+    !overlay_covering
 }
 
 fn define(conn: &RustConnection, window: u32, cursor: u32) -> Result<(), String> {
@@ -544,7 +572,7 @@ fn pack_visual(image: &draw::Rgba, red: u32, green: u32, blue: u32, lsb: bool) -
 
 #[cfg(test)]
 mod tests {
-    use super::{fp3232, premultiply};
+    use super::{fp3232, premultiply, replaces_root_cursor};
 
     #[test]
     fn negative_fp3232_keeps_the_positive_fraction() {
@@ -555,6 +583,12 @@ mod tests {
         assert!((fp3232(1, 0) - 1.0).abs() < 1e-9);
         assert!((fp3232(-2, 0) + 2.0).abs() < 1e-9);
         assert!((fp3232(0, 0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn overlay_leaves_the_root_cursor_alone() {
+        assert!(!replaces_root_cursor(true));
+        assert!(replaces_root_cursor(false));
     }
 
     #[test]

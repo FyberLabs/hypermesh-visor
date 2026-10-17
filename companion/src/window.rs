@@ -17,7 +17,7 @@ use x11rb::rust_connection::RustConnection;
 use hypermesh_session::{self, KeyringStore};
 
 use crate::auth::{Pose, Snapshot};
-use crate::automation::{self, CursorPose, Effect, Machine, Motion, MotionKind, Phase, VisorPhase};
+use crate::automation::{self, CursorPose, Effect, Machine, Motion, Phase, VisorPhase};
 use crate::credentials;
 use crate::draw::{self, Action, Scene, Sprites};
 use crate::mascot::{self, Mascot, Reel};
@@ -52,9 +52,13 @@ struct App {
     key_at: Option<u64>,
     /// Last `QueryPointer` button mask, for the pointer-fallback detector.
     button_mask: u32,
-    /// Drive samples at or before this unix millisecond are from before the
-    /// last resume. The fallback must not compare the pointer with them.
-    fallback_fresh_after: u64,
+    /// Resume sequence on the last connected snapshot.
+    seen_resume_seq: u64,
+    /// Resume sequence on the snapshot before that.
+    resume_seq_prior: u64,
+    /// Drives at or below this resume sequence were recorded before the last
+    /// resume. `None` until a resume happens.
+    fallback_after_resume: Option<u64>,
     /// Pointer-fallback: a mismatch has to survive later polls of the same drive.
     displacement_hold: Option<automation::FallbackHold>,
     /// Menu and continue-prompt scroll, in pixels.
@@ -87,7 +91,9 @@ pub fn run() -> Result<(), String> {
         click_at: None,
         key_at: None,
         button_mask: 0,
-        fallback_fresh_after: 0,
+        seen_resume_seq: 0,
+        resume_seq_prior: 0,
+        fallback_after_resume: None,
         displacement_hold: None,
         scroll: 0,
     };
@@ -197,18 +203,27 @@ fn show(mut app: App) -> Result<(), String> {
         } else {
             app.machine.note_disconnect();
         }
-        if phase_before == Phase::Paused && app.machine.phase() == Phase::Running {
-            app.fallback_fresh_after = wall_ms;
+        if snap.connected {
+            let prior = app.seen_resume_seq;
+            if phase_before == Phase::Paused && app.machine.phase() == Phase::Running {
+                // This snapshot already carries the post-resume sequence. A
+                // drive recorded between the resume and this poll carries it
+                // too, so the cutoff stays on the sequence from before.
+                app.fallback_after_resume = Some(prior);
+            }
+            app.resume_seq_prior = prior;
+            app.seen_resume_seq = snap.resume_seq;
         }
         if app.machine.phase() == Phase::Off {
             app.pending = None;
+            app.fallback_after_resume = None;
         }
         let was_paused = app.machine.phase() == Phase::Paused;
         let mut click: Option<(i32, i32)> = None;
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
             if let Some(live) = watch.observe(&event) {
                 let effect = app.machine.user_input(now_ms);
-                note_effect(&mut app, effect, wall_ms);
+                note_effect(&mut app, effect);
                 app.last_used = Instant::now();
                 match live {
                     LiveInput::Button => app.click_at = Some(now_ms),
@@ -244,8 +259,8 @@ fn show(mut app: App) -> Result<(), String> {
                 let displaced = sample.as_ref().is_some_and(|(drive, age, distance)| {
                     automation::fallback_displaced(
                         drive.pointer_known,
-                        drive.at_ms,
-                        app.fallback_fresh_after,
+                        drive.resume_seq,
+                        app.fallback_after_resume,
                         *age,
                         *distance,
                     )
@@ -264,32 +279,11 @@ fn show(mut app: App) -> Result<(), String> {
                     app.displacement_hold,
                 );
                 app.displacement_hold = hold;
-                let (click_or_drag, at_ms, age, known, distance) = sample
-                    .as_ref()
-                    .map(|(drive, age, distance)| {
-                        (
-                            matches!(drive.kind, MotionKind::Click | MotionKind::Drag),
-                            drive.at_ms,
-                            *age,
-                            drive.pointer_known,
-                            *distance,
-                        )
-                    })
-                    .unwrap_or((false, 0, 0, false, 0));
-                let pressed = automation::fallback_button_press(
-                    app.button_mask,
-                    mask,
-                    click_or_drag,
-                    at_ms,
-                    age,
-                    known,
-                    app.fallback_fresh_after,
-                    distance,
-                );
+                let pressed = automation::fallback_button_press(app.button_mask, mask);
                 app.button_mask = mask;
                 if displaced || pressed {
                     let effect = app.machine.user_input(now_ms);
-                    note_effect(&mut app, effect, wall_ms);
+                    note_effect(&mut app, effect);
                     app.last_used = Instant::now();
                 }
             }
@@ -298,10 +292,10 @@ fn show(mut app: App) -> Result<(), String> {
         }
         if let Some((x, y)) = click {
             app.last_used = Instant::now();
-            on_click(&mut app, &scene, x, y, was_paused, now_ms, wall_ms);
+            on_click(&mut app, &scene, x, y, was_paused, now_ms);
         }
         let effect = app.machine.poll(now_ms);
-        note_effect(&mut app, effect, wall_ms);
+        note_effect(&mut app, effect);
         if let Some(action) = app.pending.take() {
             app.poller.enqueue(action);
         }
@@ -385,14 +379,19 @@ fn arm_signals() {
     }
 }
 
-fn note_effect(app: &mut App, effect: Effect, wall_ms: u64) {
+fn note_effect(app: &mut App, effect: Effect) {
     match effect {
         Effect::Pause => app.pending = Some("pause"),
         Effect::Resume => {
             app.pending = Some("resume");
             // The snapshot can still carry the pre-pause drive until the next
-            // poll. Ignore it, or the pointer fallback pauses on the next frame.
-            app.fallback_fresh_after = wall_ms;
+            // poll. Ignore that sequence. If this frame's snapshot is already
+            // the post-resume one, `resume_seq_prior` is the sequence before
+            // it, and the minimum keeps a drive recorded after the resume.
+            app.fallback_after_resume = Some(automation::resume_cutoff(
+                app.resume_seq_prior,
+                app.seen_resume_seq,
+            ));
         }
         Effect::None => {}
     }
@@ -528,15 +527,7 @@ fn wall_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn on_click(
-    app: &mut App,
-    scene: &Scene,
-    x: i32,
-    y: i32,
-    was_paused: bool,
-    now_ms: u64,
-    wall_ms: u64,
-) {
+fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_ms: u64) {
     let Some(hit) = scene.hits.iter().find(|hit| hit.contains(x, y)) else {
         return;
     };
@@ -546,7 +537,7 @@ fn on_click(
                 app.machine.ask(now_ms);
             } else if app.machine.phase() == Phase::Running {
                 let effect = app.machine.user_input(now_ms);
-                note_effect(app, effect, wall_ms);
+                note_effect(app, effect);
             } else if app.machine.phase() == Phase::Paused {
                 // This click is the one that paused the automation.
             } else {
@@ -555,7 +546,7 @@ fn on_click(
         }
         Action::ContinueAutomation => {
             let effect = app.machine.continue_now(now_ms);
-            note_effect(app, effect, wall_ms);
+            note_effect(app, effect);
         }
         Action::DismissAutomation => app.machine.dismiss(now_ms),
         Action::ToggleBugCursor => {

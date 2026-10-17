@@ -26,9 +26,6 @@ pub const FALLBACK_SETTLE_MS: u64 = 150;
 /// Pointer-fallback: a root pointer farther than this from the drive target
 /// is a user move. Manhattan, matching the window check.
 pub const FALLBACK_DISTANCE_PX: i32 = 12;
-/// A button that appears with a fresh click or drag this close to the drive
-/// target is the automation's own press.
-pub const FALLBACK_CLICK_MS: u64 = 400;
 /// QueryPointer button bits: Button1 at bit 8 through Button5 at bit 12.
 const FALLBACK_BUTTONS: u32 = 0b1_1111 << 8;
 
@@ -206,18 +203,37 @@ impl Machine {
     }
 }
 
-/// The pointer-fallback detector. A sample taken before `fresh_after` is the
-/// drive that was on screen when the automation paused; comparing the pointer
-/// with it pauses again on the next frame.
+/// Sequence a drive must be newer than before the pointer fallback trusts it.
+///
+/// `prior` is the resume sequence from before the snapshot in hand. `seen` is
+/// the sequence on that snapshot. A server resume snapshot already carries the
+/// bumped sequence, and so does a drive recorded between the resume and this
+/// poll. The cutoff stays at the older of the two so that drive still counts.
+pub fn resume_cutoff(prior: u64, seen: u64) -> u64 {
+    prior.min(seen)
+}
+
+/// A drive counts when no resume has set a cutoff, or it was recorded on a
+/// later resume sequence than that cutoff.
+pub fn drive_counts(drive_resume_seq: u64, after_resume: Option<u64>) -> bool {
+    match after_resume {
+        None => true,
+        Some(seq) => drive_resume_seq > seq,
+    }
+}
+
+/// The pointer-fallback detector. A sample from the resume sequence at or
+/// before the cutoff is the drive that was on screen when the automation
+/// paused; comparing the pointer with it pauses again on the next frame.
 pub fn fallback_displaced(
     pointer_known: bool,
-    drive_at_ms: u64,
-    fresh_after: u64,
+    drive_resume_seq: u64,
+    after_resume: Option<u64>,
     age_ms: u64,
     distance: i32,
 ) -> bool {
     pointer_known
-        && drive_at_ms > fresh_after
+        && drive_counts(drive_resume_seq, after_resume)
         && age_ms > FALLBACK_SETTLE_MS
         && distance > FALLBACK_DISTANCE_PX
 }
@@ -269,29 +285,13 @@ pub fn consider_displacement(
     (pause, Some(hold))
 }
 
-/// A new button pauses. A press that belongs to a fresh click or drag on the
-/// drive point is the automation's own button and is ignored. `drive_at_ms`
-/// must be newer than `fresh_after`, or a sample from before resume would
-/// swallow the user's next click on that same point.
-pub fn fallback_button_press(
-    previous: u32,
-    mask: u32,
-    click_or_drag: bool,
-    drive_at_ms: u64,
-    age_ms: u64,
-    pointer_known: bool,
-    fresh_after: u64,
-    distance: i32,
-) -> bool {
-    if newly_pressed(previous, mask) == 0 {
-        return false;
-    }
-    let own = click_or_drag
-        && pointer_known
-        && drive_at_ms > fresh_after
-        && age_ms < FALLBACK_CLICK_MS
-        && distance <= FALLBACK_DISTANCE_PX;
-    !own
+/// A newly pressed button is a physical press.
+///
+/// The visor publishes a click or drag only after the press and the release
+/// have both finished, so a button that is down once that sample is visible
+/// is not the automation's button.
+pub fn fallback_button_press(previous: u32, mask: u32) -> bool {
+    newly_pressed(previous, mask) != 0
 }
 
 /// XTEST device ids are synthetic. A real device is anything else.
@@ -606,12 +606,19 @@ mod tests {
 
     #[test]
     fn fallback_ignores_a_drive_from_before_resume() {
-        assert!(!fallback_displaced(true, 1_000, 1_000, 500, 80));
-        assert!(!fallback_displaced(true, 900, 1_000, 500, 80));
-        assert!(fallback_displaced(true, 1_001, 1_000, 151, 13));
-        assert!(!fallback_displaced(true, 1_001, 1_000, 150, 13));
-        assert!(!fallback_displaced(true, 1_001, 1_000, 400, 12));
-        assert!(!fallback_displaced(false, 1_001, 1_000, 400, 80));
+        let cutoff = Some(resume_cutoff(3, 4));
+        assert_eq!(cutoff, Some(3));
+        assert!(!drive_counts(3, cutoff));
+        assert!(!drive_counts(2, cutoff));
+        assert!(drive_counts(4, cutoff));
+        assert!(drive_counts(0, None));
+        assert!(!fallback_displaced(true, 3, cutoff, 500, 80));
+        assert!(!fallback_displaced(true, 2, cutoff, 500, 80));
+        assert!(fallback_displaced(true, 4, cutoff, 151, 13));
+        assert!(!fallback_displaced(true, 4, cutoff, 150, 13));
+        assert!(!fallback_displaced(true, 4, cutoff, 400, 12));
+        assert!(!fallback_displaced(false, 4, cutoff, 400, 80));
+        assert!(fallback_displaced(true, 0, None, 151, 13));
     }
 
     #[test]
@@ -632,33 +639,12 @@ mod tests {
     }
 
     #[test]
-    fn fallback_button_press_ignores_the_automations_own_click() {
+    fn fallback_button_press_counts_a_click_on_a_fresh_drive() {
         let button1 = 1 << 8;
-        assert!(fallback_button_press(0, button1, false, 0, 0, false, 0, 0));
-        assert!(!fallback_button_press(
-            button1, button1, false, 0, 0, false, 0, 0
-        ));
-        assert!(!fallback_button_press(
-            0, button1, true, 1_000, 50, true, 100, 10
-        ));
-        assert!(fallback_button_press(
-            0, button1, true, 1_000, 50, true, 100, 13
-        ));
-        assert!(fallback_button_press(
-            0,
-            button1,
-            true,
-            1_000,
-            FALLBACK_CLICK_MS,
-            true,
-            100,
-            0
-        ));
-        assert!(fallback_button_press(
-            0, button1, true, 50, 10, true, 100, 0
-        ));
-        assert!(fallback_button_press(0, 1 << 12, false, 0, 0, false, 0, 0));
-        assert!(!fallback_button_press(0, 1 << 0, false, 0, 0, false, 0, 0));
+        assert!(fallback_button_press(0, button1));
+        assert!(!fallback_button_press(button1, button1));
+        assert!(fallback_button_press(0, 1 << 12));
+        assert!(!fallback_button_press(0, 1 << 0));
         assert_eq!(newly_pressed(0, button1 | 1), button1);
     }
 

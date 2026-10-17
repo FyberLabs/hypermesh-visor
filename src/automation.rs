@@ -102,6 +102,9 @@ pub struct Drive {
     /// False when a type sample had no pointer to record. The companion must
     /// not compare that placeholder with the real pointer.
     pub pointer_known: bool,
+    /// Gate resume sequence at the time this sample was recorded. The
+    /// companion ignores a sample from the sequence before a resume.
+    pub resume_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,6 +118,10 @@ pub struct Gate {
     /// Bumped when the gate is reset. A drive captured before that bump does
     /// not record, so an in-flight mouse cannot revive a stop.
     generation: u64,
+    /// Bumped on resume and start. A drive keeps the sequence from when it
+    /// was recorded, so the companion can tell a sample from before the
+    /// transition apart from one recorded after it and before the next poll.
+    resume_seq: u64,
 }
 
 impl Default for Gate {
@@ -127,6 +134,7 @@ impl Default for Gate {
             last_at_ms: None,
             notice: Notice::None,
             generation: 0,
+            resume_seq: 0,
         }
     }
 }
@@ -156,6 +164,10 @@ impl Gate {
         self.generation
     }
 
+    pub fn resume_seq(&self) -> u64 {
+        self.resume_seq
+    }
+
     /// A pause covers the whole desktop. Every session injects into the same
     /// pointer, so another session must not move it until resume.
     pub fn blocks(&self, _session: Uuid) -> bool {
@@ -171,9 +183,13 @@ impl Gate {
     pub fn reset(&mut self) {
         let notice = self.notice;
         let generation = self.generation.wrapping_add(1);
+        // Keep the sequence. Rewinding it would make a drive after the next
+        // start look older than a cutoff the companion still holds.
+        let resume_seq = self.resume_seq;
         *self = Self {
             notice,
             generation,
+            resume_seq,
             ..Self::default()
         };
     }
@@ -191,6 +207,7 @@ impl Gate {
                 // A sample from the previous drive would look like a user move
                 // to the pointer fallback the moment this start is running.
                 self.drive = None;
+                self.bump_resume();
                 Ok(())
             }
             Control::Pause => {
@@ -207,6 +224,7 @@ impl Gate {
                     // later type still has somewhere to land, but do not let
                     // the fallback compare against the pre-pause target.
                     self.drive = None;
+                    self.bump_resume();
                 }
                 Ok(())
             }
@@ -276,6 +294,10 @@ impl Gate {
         self.generation == generation && self.phase != Phase::Paused
     }
 
+    fn bump_resume(&mut self) {
+        self.resume_seq = self.resume_seq.saturating_add(1);
+    }
+
     fn store(
         &mut self,
         session: Uuid,
@@ -313,6 +335,7 @@ impl Gate {
             elapsed_ms,
             at_ms: now_ms,
             pointer_known,
+            resume_seq: self.resume_seq,
         });
     }
 }
@@ -523,5 +546,43 @@ mod tests {
         assert!(gate.drive().is_none());
         gate.record_type(id, None, generation, 30);
         assert_eq!((gate.drive().unwrap().x, gate.drive().unwrap().y), (40, 50));
+    }
+
+    #[test]
+    fn resume_and_start_bump_a_sequence_the_drive_keeps() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let generation = gate.generation();
+        assert_eq!(gate.resume_seq(), 0);
+        gate.record_mouse(
+            id,
+            &MouseOp::Move {
+                x: 4,
+                y: 5,
+                clickable: false,
+            },
+            Some((0, 0)),
+            generation,
+            10,
+        );
+        assert_eq!(gate.drive().unwrap().resume_seq, 0);
+        gate.control(Some(id), Control::Pause).unwrap();
+        assert_eq!(gate.resume_seq(), 0, "pause does not start a new drive");
+        gate.control(Some(id), Control::Resume).unwrap();
+        assert_eq!(gate.resume_seq(), 1);
+        assert!(gate.drive().is_none());
+        gate.record_type(id, None, generation, 20);
+        assert_eq!(gate.drive().unwrap().resume_seq, 1);
+        gate.control(Some(id), Control::Resume).unwrap();
+        assert_eq!(
+            gate.resume_seq(),
+            1,
+            "resume while running is not a transition"
+        );
+        gate.control(Some(id), Control::Start).unwrap();
+        assert_eq!(gate.resume_seq(), 2);
+        assert!(gate.drive().is_none());
+        gate.control(None, Control::Stop).unwrap();
+        assert_eq!(gate.resume_seq(), 2, "stop must not rewind the sequence");
     }
 }

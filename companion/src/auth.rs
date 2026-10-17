@@ -75,6 +75,8 @@ pub struct Snapshot {
     pub idle_ms: Option<u64>,
     pub phase: VisorPhase,
     pub drive: Option<DriveView>,
+    /// Visor resume sequence. Bumps on resume and start, and stays put across stop.
+    pub resume_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +91,8 @@ pub struct DriveView {
     /// False for a type sample that had no pointer. The distance fallback
     /// must ignore it.
     pub pointer_known: bool,
+    /// Resume sequence when this sample was recorded.
+    pub resume_seq: u64,
 }
 
 impl Snapshot {
@@ -100,6 +104,7 @@ impl Snapshot {
             idle_ms: None,
             phase: VisorPhase::Off,
             drive: None,
+            resume_seq: 0,
         }
     }
 }
@@ -137,6 +142,10 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
     } else {
         value.pointer("/automation/drive").and_then(parse_drive)
     };
+    let resume_seq = value
+        .pointer("/automation/resume_seq")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0);
     Some(Snapshot {
         connected: true,
         upgrading,
@@ -144,6 +153,7 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         idle_ms,
         phase,
         drive,
+        resume_seq,
     })
 }
 
@@ -176,6 +186,10 @@ fn parse_drive(value: &serde_json::Value) -> Option<DriveView> {
             .get("pointer_known")
             .and_then(|item| item.as_bool())
             .unwrap_or(true),
+        resume_seq: value
+            .get("resume_seq")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0),
     })
 }
 
@@ -237,6 +251,14 @@ mod tests {
         assert_eq!(drive.kind, MotionKind::Move);
         assert!(drive.clickable);
         assert_eq!(drive.distance_px, 9);
+        assert_eq!(snap.resume_seq, 0);
+        assert_eq!(drive.resume_seq, 0);
+        let stamped = snapshot_from_body(
+            r#"{"open":true,"automation":{"phase":"running","resume_seq":4,"drive":{"kind":"click","x":1,"y":2,"at_ms":9,"resume_seq":4}}}"#,
+        )
+        .unwrap();
+        assert_eq!(stamped.resume_seq, 4);
+        assert_eq!(stamped.drive.unwrap().resume_seq, 4);
         assert!(snapshot_from_body("not-json").is_none());
         let idle = snapshot_from_body(r#"{"open":false}"#).unwrap();
         assert!(idle.connected);

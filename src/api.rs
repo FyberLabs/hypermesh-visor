@@ -245,13 +245,7 @@ impl AppState {
         lock(&self.automation).blocks(id)
     }
 
-    fn record_mouse(
-        &self,
-        id: Uuid,
-        op: &MouseOp,
-        from: Option<(i32, i32)>,
-        generation: u64,
-    ) {
+    fn record_mouse(&self, id: Uuid, op: &MouseOp, from: Option<(i32, i32)>, generation: u64) {
         lock(&self.automation).record_mouse(id, op, from, generation, automation::unix_ms());
     }
 
@@ -287,6 +281,8 @@ struct CompanionBody {
 struct AutomationBody {
     /// `off`, `running`, or `paused`.
     phase: &'static str,
+    /// Bumps on resume and start. A drive records the value from when it happened.
+    resume_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     drive: Option<DriveBody>,
 }
@@ -303,6 +299,7 @@ struct DriveBody {
     elapsed_ms: u32,
     at_ms: u64,
     pointer_known: bool,
+    resume_seq: u64,
 }
 
 #[derive(Serialize)]
@@ -583,8 +580,9 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
             gate.reset();
         }
     }
-    let (phase, drive, notice) = {
+    let (phase, resume_seq, drive, notice) = {
         let gate = lock(&state.automation);
+        let resume_seq = gate.resume_seq();
         let drive = gate.drive().map(|drive| DriveBody {
             kind: drive.kind.as_str(),
             x: drive.x,
@@ -596,13 +594,23 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
             elapsed_ms: drive.elapsed_ms,
             at_ms: drive.at_ms,
             pointer_known: drive.pointer_known,
+            resume_seq: drive.resume_seq,
         });
-        (gate.phase().as_str(), drive, gate.notice().as_str())
+        (
+            gate.phase().as_str(),
+            resume_seq,
+            drive,
+            gate.notice().as_str(),
+        )
     };
     Json(CompanionBody {
         open: session.is_some(),
         notice,
-        automation: AutomationBody { phase, drive },
+        automation: AutomationBody {
+            phase,
+            resume_seq,
+            drive,
+        },
         session,
     })
 }
@@ -618,9 +626,8 @@ async fn companion_automation(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AutomationRequest>,
 ) -> Result<StatusCode, ApiError> {
-    let action = Control::parse(&body.action).ok_or_else(|| {
-        ApiError::bad("action must be start, pause, resume, or stop")
-    })?;
+    let action = Control::parse(&body.action)
+        .ok_or_else(|| ApiError::bad("action must be start, pause, resume, or stop"))?;
     state
         .control_automation(action)
         .map_err(|_| ApiError::bad("start needs an open session"))?;
@@ -1733,13 +1740,7 @@ while True:
         let addr = spawn(Arc::clone(&desktop)).await;
         let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
 
-        let (status, _, _) = send(
-            addr,
-            "POST",
-            &format!("/session/{id}/view"),
-            None,
-        )
-        .await;
+        let (status, _, _) = send(addr, "POST", &format!("/session/{id}/view"), None).await;
         assert_eq!(status, 200);
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let viewed: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -1769,6 +1770,8 @@ while True:
         assert_eq!(running["automation"]["drive"]["kind"], "move");
         assert_eq!(running["automation"]["drive"]["clickable"], true);
         assert_eq!(running["automation"]["drive"]["distance_px"], 290);
+        assert_eq!(running["automation"]["resume_seq"], 0);
+        assert_eq!(running["automation"]["drive"]["resume_seq"], 0);
         assert!(running["session"]["idle_ms"].as_u64().is_some());
 
         let (status, _, _) = send(
@@ -1818,6 +1821,8 @@ while True:
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let resumed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(resumed["automation"]["phase"], "running");
+        assert_eq!(resumed["automation"]["resume_seq"], 1);
+        assert!(resumed["automation"]["drive"].is_null());
         assert_eq!(resumed["notice"], "upgrading");
 
         let (status, _, _) = send(
@@ -1831,6 +1836,7 @@ while True:
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let stopped: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(stopped["automation"]["phase"], "off");
+        assert_eq!(stopped["automation"]["resume_seq"], 1);
         assert_eq!(stopped["notice"], "upgrading");
 
         let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
