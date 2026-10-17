@@ -3,7 +3,7 @@
 //! snapshot so one slow visor call does not flash the disconnected state.
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use crate::auth::{self, Snapshot};
@@ -27,7 +27,7 @@ impl Poller {
     pub fn poll(&mut self) {
         match fetch() {
             Some(snapshot) => self.link.ok(snapshot),
-            None => self.link.miss(Snapshot::disconnected()),
+            None => self.link.miss(disconnect_from(self.link.current())),
         }
     }
 
@@ -65,7 +65,7 @@ fn post_raw(addr: &str, request: &str) -> bool {
 }
 
 fn exchange(addr: &str, request: &str) -> Option<String> {
-    let socket: std::net::SocketAddr = addr.parse().ok()?;
+    let socket = lookup(addr)?;
     let mut stream = TcpStream::connect_timeout(&socket, Duration::from_millis(200)).ok()?;
     stream.set_read_timeout(Some(Duration::from_millis(300))).ok()?;
     stream.write_all(request.as_bytes()).ok()?;
@@ -96,6 +96,18 @@ fn status_ok(text: &str) -> bool {
         .is_some_and(|line| line.contains(" 200 ") || line.contains(" 204 "))
 }
 
+/// A failed poll keeps the last upgrading notice. A later successful poll is
+/// what clears it, including a body with no notice.
+fn disconnect_from(previous: &Snapshot) -> Snapshot {
+    let mut down = Snapshot::disconnected();
+    down.upgrading = previous.upgrading;
+    down
+}
+
+fn lookup(host: &str) -> Option<std::net::SocketAddr> {
+    host.to_socket_addrs().ok()?.next()
+}
+
 fn endpoint() -> (String, String) {
     let raw = std::env::var("HYPERMESH_VISOR_URL").unwrap_or_default();
     let raw = raw.trim().trim_end_matches('/');
@@ -111,5 +123,41 @@ fn endpoint() -> (String, String) {
         )
     } else {
         (host.to_string(), host.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::automation::Link;
+
+    #[test]
+    fn hostname_resolves_to_a_socket() {
+        let addr = lookup("localhost:9847").expect("localhost");
+        assert_eq!(addr.port(), 9847);
+        assert!(addr.ip().is_loopback());
+        assert_eq!(
+            lookup("127.0.0.1:9847").map(|addr| addr.port()),
+            Some(9847)
+        );
+    }
+
+    #[test]
+    fn missed_polls_keep_the_upgrading_notice() {
+        let mut up = Snapshot::disconnected();
+        up.connected = true;
+        up.upgrading = true;
+        let mut link = Link::new(Snapshot::disconnected());
+        link.ok(up);
+        link.miss(disconnect_from(link.current()));
+        link.miss(disconnect_from(link.current()));
+        assert!(link.current().upgrading);
+        link.miss(disconnect_from(link.current()));
+        assert!(link.disconnected());
+        assert!(link.current().upgrading);
+        let mut cleared = Snapshot::disconnected();
+        cleared.connected = true;
+        link.ok(cleared);
+        assert!(!link.current().upgrading);
     }
 }

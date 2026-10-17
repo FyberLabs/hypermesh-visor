@@ -157,7 +157,7 @@ fn show(mut app: App) -> Result<(), String> {
     let art = pointer::Art::load();
     let mut guard = CursorGuard {
         conn: &conn,
-        cursor: BugCursor::new(root, window),
+        cursor: BugCursor::new(root, window, depth, visual_id, colormap, red, green, blue),
     };
     let mut last_frame = Instant::now();
     loop {
@@ -175,7 +175,11 @@ fn show(mut app: App) -> Result<(), String> {
         } else {
             VisorPhase::Off
         };
-        app.machine.see_visor(visor_phase, now_ms);
+        if snap.connected {
+            app.machine.see_visor(visor_phase, now_ms);
+        } else {
+            app.machine.note_disconnect();
+        }
         if app.machine.phase() == Phase::Off {
             app.pending = None;
         }
@@ -200,7 +204,7 @@ fn show(mut app: App) -> Result<(), String> {
         if !watch.ready && app.machine.phase() == Phase::Running {
             if let Some(drive) = snap.drive.as_ref() {
                 let age = wall_ms.saturating_sub(drive.at_ms);
-                if age > 150 {
+                if drive.pointer_known && age > 150 {
                     if let Some((x, y)) = pointer::root_pointer(&conn, root) {
                         let dx = (x - drive.x).abs();
                         let dy = (y - drive.y).abs();
@@ -357,12 +361,17 @@ fn sync_cursor(
     let age = motion.map(|item| item.age_ms).unwrap_or(now_ms);
     let frame = automation::cursor_frame(pose, age);
     if guard.cursor.shown() == Some((pose, frame)) {
+        if let Some((x, y)) = pointer::root_pointer(conn, root) {
+            guard.cursor.follow(conn, x, y);
+        }
         return Ok(());
     }
     let image = art.frame(automation::cursor_frame_name(pose, frame));
     if let Err(err) = guard.cursor.apply(conn, image, pose, frame) {
         eprintln!("hypermesh-companion: cursor: {err}");
         guard.cursor.restore(conn);
+    } else if let Some((x, y)) = pointer::root_pointer(conn, root) {
+        guard.cursor.follow(conn, x, y);
     }
     Ok(())
 }

@@ -8,12 +8,25 @@
 //!
 //! If XInput2 or the XTEST devices cannot be identified, the companion falls
 //! back to comparing the pointer with the last drive coordinate after the move
-//! has settled. That fallback cannot see key presses.
+//! has settled. That fallback cannot see key presses. A type sample with no
+//! known pointer is left out of that comparison.
+//!
+//! Client windows that set their own cursor would cover a cursor defined only
+//! on the root. XFixes `ChangeCursorByName` replaces those cursor resources
+//! and frees the originals, so the text caret could not be restored.
+//! `XGrabPointer` would keep the bug sprite on top and would also take pointer
+//! events away from the window being clicked. While the bug cursor is showing,
+//! the system sprite is hidden and a click-through window follows the pointer.
 
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType};
+use x11rb::protocol::shape::{self, ConnectionExt as _};
+use x11rb::protocol::xfixes::ConnectionExt as _;
 use x11rb::protocol::xinput::{self, ConnectionExt as _, XIEventMask};
-use x11rb::protocol::xproto::{self, ConnectionExt as _, ImageFormat, ImageOrder};
+use x11rb::protocol::xproto::{
+    self, ClipOrdering, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, ImageFormat,
+    ImageOrder, StackMode, WindowClass,
+};
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 
@@ -166,25 +179,65 @@ pub enum LiveInput {
 }
 
 fn fp_abs(value: xinput::Fp3232) -> f64 {
-    let frac = f64::from(value.frac) / 4_294_967_296.0;
-    let signed = f64::from(value.integral) + if value.integral < 0 { -frac } else { frac };
-    signed.abs()
+    fp3232(value.integral, value.frac).abs()
+}
+
+/// XI2 `FP3232` is `integral + frac / 2^32`. A negative value is stored with
+/// the integral rounded toward -inf and a positive fraction, so -0.25 is
+/// integral -1 and fraction 0.75.
+pub(crate) fn fp3232(integral: i32, frac: u32) -> f64 {
+    f64::from(integral) + f64::from(frac) / 4_294_967_296.0
+}
+
+pub(crate) fn premultiply(px: [u8; 4]) -> [u8; 4] {
+    let alpha = u32::from(px[3]);
+    let scale = |channel: u8| ((u32::from(channel) * alpha + 127) / 255) as u8;
+    [scale(px[0]), scale(px[1]), scale(px[2]), px[3]]
 }
 
 pub struct BugCursor {
     current: u32,
     root: u32,
     window: u32,
+    overlay: u32,
+    overlay_gc: u32,
+    sprite_hidden: bool,
+    hot: (i16, i16),
     shown: Option<(CursorPose, usize)>,
+    depth: u8,
+    visual: u32,
+    colormap: u32,
+    red: u32,
+    green: u32,
+    blue: u32,
 }
 
 impl BugCursor {
-    pub fn new(root: u32, window: u32) -> Self {
+    pub fn new(
+        root: u32,
+        window: u32,
+        depth: u8,
+        visual: u32,
+        colormap: u32,
+        red: u32,
+        green: u32,
+        blue: u32,
+    ) -> Self {
         Self {
             current: 0,
             root,
             window,
+            overlay: 0,
+            overlay_gc: 0,
+            sprite_hidden: false,
+            hot: (0, 0),
             shown: None,
+            depth,
+            visual,
+            colormap,
+            red,
+            green,
+            blue,
         }
     }
 
@@ -203,6 +256,7 @@ impl BugCursor {
             return Ok(());
         }
         let (hot_x, hot_y) = automation::hotspot_for(CURSOR_SIZE);
+        self.hot = (hot_x as i16, hot_y as i16);
         let cursor = make_cursor(conn, self.root, image, hot_x, hot_y)?;
         define(conn, self.root, cursor)?;
         define(conn, self.window, cursor)?;
@@ -212,10 +266,33 @@ impl BugCursor {
         if previous != 0 {
             let _ = conn.free_cursor(previous);
         }
+        if self.depth == 32 {
+            if let Err(err) = self.present_overlay(conn, image) {
+                eprintln!("hypermesh-companion: cursor window: {err}");
+                self.reveal_sprite(conn);
+            } else if !self.conceal_sprite(conn) {
+                self.unmap_overlay(conn);
+            }
+        }
         Ok(())
     }
 
+    pub fn follow(&mut self, conn: &RustConnection, x: i32, y: i32) {
+        if self.overlay == 0 || !self.sprite_hidden {
+            return;
+        }
+        let _ = conn.configure_window(
+            self.overlay,
+            &ConfigureWindowAux::new()
+                .x(x - i32::from(self.hot.0))
+                .y(y - i32::from(self.hot.1))
+                .stack_mode(StackMode::ABOVE),
+        );
+    }
+
     pub fn restore(&mut self, conn: &RustConnection) {
+        self.reveal_sprite(conn);
+        self.unmap_overlay(conn);
         let _ = define(conn, self.root, 0);
         let _ = define(conn, self.window, 0);
         if self.current != 0 {
@@ -224,6 +301,102 @@ impl BugCursor {
         }
         self.shown = None;
         let _ = conn.flush();
+    }
+
+    fn conceal_sprite(&mut self, conn: &RustConnection) -> bool {
+        if self.sprite_hidden {
+            return true;
+        }
+        if conn
+            .xfixes_query_version(4, 0)
+            .ok()
+            .and_then(|cookie| cookie.reply().ok())
+            .is_none()
+        {
+            return false;
+        }
+        let Ok(cookie) = conn.xfixes_hide_cursor(self.root) else {
+            return false;
+        };
+        if cookie.check().is_err() {
+            return false;
+        }
+        self.sprite_hidden = true;
+        true
+    }
+
+    fn reveal_sprite(&mut self, conn: &RustConnection) {
+        if !self.sprite_hidden {
+            return;
+        }
+        if let Ok(cookie) = conn.xfixes_show_cursor(self.root) {
+            let _ = cookie.check();
+        }
+        self.sprite_hidden = false;
+    }
+
+    fn present_overlay(&mut self, conn: &RustConnection, image: &draw::Rgba) -> Result<(), String> {
+        if self.overlay == 0 {
+            let overlay = conn.generate_id().map_err(|err| err.to_string())?;
+            conn.create_window(
+                self.depth,
+                overlay,
+                self.root,
+                0,
+                0,
+                image.width as u16,
+                image.height as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                self.visual,
+                &CreateWindowAux::new()
+                    .colormap(self.colormap)
+                    .border_pixel(0)
+                    .background_pixel(0)
+                    .override_redirect(1u32),
+            )
+            .map_err(|err| err.to_string())?;
+            let gc = conn.generate_id().map_err(|err| err.to_string())?;
+            conn.create_gc(gc, overlay, &xproto::CreateGCAux::new())
+                .map_err(|err| err.to_string())?;
+            conn.shape_rectangles(
+                shape::SO::SET,
+                shape::SK::INPUT,
+                ClipOrdering::UNSORTED,
+                overlay,
+                0,
+                0,
+                &[],
+            )
+            .map_err(|err| err.to_string())?
+            .check()
+            .map_err(|err| err.to_string())?;
+            self.overlay = overlay;
+            self.overlay_gc = gc;
+        }
+        let lsb = conn.setup().image_byte_order == ImageOrder::LSB_FIRST;
+        let data = pack_visual(image, self.red, self.green, self.blue, lsb);
+        conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            self.overlay,
+            self.overlay_gc,
+            image.width as u16,
+            image.height as u16,
+            0,
+            0,
+            0,
+            self.depth,
+            &data,
+        )
+        .map_err(|err| err.to_string())?;
+        conn.map_window(self.overlay).map_err(|err| err.to_string())?;
+        Ok(())
+    }
+
+    fn unmap_overlay(&mut self, conn: &RustConnection) {
+        if self.overlay != 0 {
+            let _ = conn.unmap_window(self.overlay);
+        }
     }
 }
 
@@ -308,6 +481,7 @@ fn argb_format(conn: &RustConnection) -> Result<render::Pictforminfo, String> {
 fn pack_argb(image: &draw::Rgba, format: &render::Directformat, lsb: bool) -> Vec<u8> {
     let mut data = Vec::with_capacity(image.rgba.len());
     for px in image.rgba.chunks_exact(4) {
+        let px = premultiply([px[0], px[1], px[2], px[3]]);
         let mut pixel = 0u32;
         pixel |= u32::from(px[0]) << format.red_shift;
         pixel |= u32::from(px[1]) << format.green_shift;
@@ -321,4 +495,57 @@ fn pack_argb(image: &draw::Rgba, format: &render::Directformat, lsb: bool) -> Ve
         data.extend_from_slice(&bytes);
     }
     data
+}
+
+fn pack_visual(image: &draw::Rgba, red: u32, green: u32, blue: u32, lsb: bool) -> Vec<u8> {
+    let shift = |mask: u32| mask.trailing_zeros();
+    let used = red | green | blue;
+    let alpha = (!used) & 0xffff_ffff;
+    let mut data = Vec::with_capacity(image.rgba.len());
+    for px in image.rgba.chunks_exact(4) {
+        let px = premultiply([px[0], px[1], px[2], px[3]]);
+        let mut pixel = 0u32;
+        if red != 0 {
+            pixel |= u32::from(px[0]) << shift(red);
+        }
+        if green != 0 {
+            pixel |= u32::from(px[1]) << shift(green);
+        }
+        if blue != 0 {
+            pixel |= u32::from(px[2]) << shift(blue);
+        }
+        if alpha != 0 {
+            pixel |= u32::from(px[3]) << shift(alpha);
+        }
+        let bytes = if lsb {
+            pixel.to_le_bytes()
+        } else {
+            pixel.to_be_bytes()
+        };
+        data.extend_from_slice(&bytes);
+    }
+    data
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fp3232, premultiply};
+
+    #[test]
+    fn negative_fp3232_keeps_the_positive_fraction() {
+        let frac = (0.75 * 4_294_967_296.0) as u32;
+        let value = fp3232(-1, frac);
+        assert!((value + 0.25).abs() < 1e-6, "{value}");
+        assert!(value.abs() < 1.0);
+        assert!((fp3232(1, 0) - 1.0).abs() < 1e-9);
+        assert!((fp3232(-2, 0) + 2.0).abs() < 1e-9);
+        assert!((fp3232(0, 0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cursor_colors_are_premultiplied_by_alpha() {
+        assert_eq!(premultiply([255, 0, 0, 128]), [128, 0, 0, 128]);
+        assert_eq!(premultiply([255, 255, 255, 0]), [0, 0, 0, 0]);
+        assert_eq!(premultiply([10, 20, 30, 255]), [10, 20, 30, 255]);
+    }
 }

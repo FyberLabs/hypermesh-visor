@@ -154,6 +154,17 @@ impl Machine {
         }
     }
 
+    /// The visor could not be polled. A local pause stays paused so the
+    /// unsent pause can be posted again when the visor returns.
+    pub fn note_disconnect(&mut self) {
+        if self.phase == Phase::Paused {
+            return;
+        }
+        self.phase = Phase::Off;
+        self.asking = false;
+        self.holding_resume = false;
+    }
+
     /// Resume when the wait has elapsed with no user input.
     pub fn poll(&mut self, now_ms: u64) -> Effect {
         if self.phase != Phase::Paused {
@@ -417,6 +428,29 @@ mod tests {
         machine.user_input(100);
         machine.see_visor(VisorPhase::Running, 200);
         assert_eq!(machine.phase(), Phase::Paused);
+    }
+
+    #[test]
+    fn pause_is_retried_after_a_disconnect() {
+        let mut machine = Machine::new(1_000);
+        machine.see_visor(VisorPhase::Running, 0);
+        assert_eq!(machine.user_input(10), Effect::Pause);
+        machine.note_disconnect();
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Running, 20);
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Off, 30);
+        assert_eq!(machine.phase(), Phase::Off);
+    }
+
+    #[test]
+    fn disconnect_without_a_pause_clears_a_running_automation() {
+        let mut machine = Machine::new(1_000);
+        machine.see_visor(VisorPhase::Running, 0);
+        machine.note_disconnect();
+        assert_eq!(machine.phase(), Phase::Off);
+        machine.see_visor(VisorPhase::Running, 10);
+        assert_eq!(machine.phase(), Phase::Running);
     }
 
     #[test]

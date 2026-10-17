@@ -99,6 +99,9 @@ pub struct Drive {
     pub distance_px: u32,
     pub elapsed_ms: u32,
     pub at_ms: u64,
+    /// False when a type sample had no pointer to record. The companion must
+    /// not compare that placeholder with the real pointer.
+    pub pointer_known: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,6 +112,9 @@ pub struct Gate {
     pointer: Option<(i32, i32)>,
     last_at_ms: Option<u64>,
     notice: Notice,
+    /// Bumped when the gate is reset. A drive captured before that bump does
+    /// not record, so an in-flight mouse cannot revive a stop.
+    generation: u64,
 }
 
 impl Default for Gate {
@@ -120,6 +126,7 @@ impl Default for Gate {
             pointer: None,
             last_at_ms: None,
             notice: Notice::None,
+            generation: 0,
         }
     }
 }
@@ -145,8 +152,14 @@ impl Gate {
         self.notice = notice;
     }
 
-    pub fn blocks(&self, session: Uuid) -> bool {
-        self.phase == Phase::Paused && self.session == Some(session)
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// A pause covers the whole desktop. Every session injects into the same
+    /// pointer, so another session must not move it until resume.
+    pub fn blocks(&self, _session: Uuid) -> bool {
+        self.phase == Phase::Paused
     }
 
     pub fn clear_session(&mut self, session: Uuid) {
@@ -157,8 +170,10 @@ impl Gate {
 
     pub fn reset(&mut self) {
         let notice = self.notice;
+        let generation = self.generation.wrapping_add(1);
         *self = Self {
             notice,
+            generation,
             ..Self::default()
         };
     }
@@ -199,9 +214,10 @@ impl Gate {
         session: Uuid,
         op: &MouseOp,
         from: Option<(i32, i32)>,
+        generation: u64,
         now_ms: u64,
     ) {
-        if self.blocks(session) {
+        if !self.accepts(generation) {
             return;
         }
         let (kind, x, y, from_x, from_y, clickable) = match *op {
@@ -225,16 +241,41 @@ impl Gate {
             from_x,
             from_y,
             clickable,
+            true,
             now_ms,
         );
     }
 
-    pub fn record_type(&mut self, session: Uuid, now_ms: u64) {
-        if self.blocks(session) {
+    pub fn record_type(
+        &mut self,
+        session: Uuid,
+        at: Option<(i32, i32)>,
+        generation: u64,
+        now_ms: u64,
+    ) {
+        if !self.accepts(generation) {
             return;
         }
-        let (x, y) = self.pointer.unwrap_or((0, 0));
-        self.store(session, DriveKind::Type, x, y, x, y, false, now_ms);
+        let known = at.or(self.pointer);
+        let (x, y, pointer_known) = match known {
+            Some((x, y)) => (x, y, true),
+            None => (0, 0, false),
+        };
+        self.store(
+            session,
+            DriveKind::Type,
+            x,
+            y,
+            x,
+            y,
+            false,
+            pointer_known,
+            now_ms,
+        );
+    }
+
+    fn accepts(&self, generation: u64) -> bool {
+        self.generation == generation && self.phase != Phase::Paused
     }
 
     fn store(
@@ -246,6 +287,7 @@ impl Gate {
         from_x: i32,
         from_y: i32,
         clickable: bool,
+        pointer_known: bool,
         now_ms: u64,
     ) {
         let elapsed_ms = self
@@ -254,7 +296,9 @@ impl Gate {
             .unwrap_or(0);
         self.session = Some(session);
         self.phase = Phase::Running;
-        self.pointer = Some((x, y));
+        if pointer_known {
+            self.pointer = Some((x, y));
+        }
         self.last_at_ms = Some(now_ms);
         self.drive = Some(Drive {
             kind,
@@ -263,9 +307,14 @@ impl Gate {
             from_x,
             from_y,
             clickable,
-            distance_px: distance(from_x, from_y, x, y),
+            distance_px: if pointer_known {
+                distance(from_x, from_y, x, y)
+            } else {
+                0
+            },
             elapsed_ms,
             at_ms: now_ms,
+            pointer_known,
         });
     }
 }
@@ -293,6 +342,7 @@ mod tests {
         let mut gate = Gate::default();
         let id = Uuid::new_v4();
         assert!(!gate.blocks(id));
+        let generation = gate.generation();
         gate.record_mouse(
             id,
             &MouseOp::Move {
@@ -301,6 +351,7 @@ mod tests {
                 clickable: false,
             },
             Some((0, 0)),
+            generation,
             1_000,
         );
         assert_eq!(gate.phase(), Phase::Running);
@@ -317,6 +368,7 @@ mod tests {
                 clickable: true,
             },
             None,
+            generation,
             1_100,
         );
         let drive = gate.drive().unwrap();
@@ -327,11 +379,13 @@ mod tests {
 
         gate.control(Some(id), Control::Pause).unwrap();
         assert!(gate.blocks(id));
-        gate.record_type(id, 2_000);
+        gate.record_type(id, None, generation, 2_000);
         assert_eq!(gate.drive().unwrap().kind, DriveKind::Move);
         gate.control(Some(id), Control::Resume).unwrap();
-        gate.record_type(id, 2_100);
+        gate.record_type(id, None, generation, 2_100);
         assert_eq!(gate.drive().unwrap().kind, DriveKind::Type);
+        assert!(gate.drive().unwrap().pointer_known);
+        assert_eq!((gate.drive().unwrap().x, gate.drive().unwrap().y), (300, 0));
 
         gate.control(None, Control::Stop).unwrap();
         assert_eq!(gate.phase(), Phase::Off);
@@ -359,6 +413,7 @@ mod tests {
                 button: Button::Left,
             },
             None,
+            gate.generation(),
             50,
         );
         assert_eq!(gate.drive().unwrap().distance_px, 5);
@@ -367,5 +422,74 @@ mod tests {
         assert_eq!(gate.notice(), Notice::Upgrading);
         assert_eq!(Notice::parse("upgrading"), Some(Notice::Upgrading));
         assert_eq!(Notice::parse("nope"), None);
+    }
+
+    #[test]
+    fn pause_blocks_every_session_and_stop_drops_a_stale_drive() {
+        let mut gate = Gate::default();
+        let driving = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let generation = gate.generation();
+        gate.record_mouse(
+            driving,
+            &MouseOp::Move {
+                x: 8,
+                y: 9,
+                clickable: false,
+            },
+            Some((8, 9)),
+            generation,
+            10,
+        );
+        gate.control(Some(driving), Control::Pause).unwrap();
+        assert!(gate.blocks(other));
+        gate.record_mouse(
+            other,
+            &MouseOp::Move {
+                x: 1,
+                y: 1,
+                clickable: false,
+            },
+            Some((0, 0)),
+            generation,
+            20,
+        );
+        gate.record_type(other, Some((3, 4)), generation, 30);
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert_eq!(gate.session(), Some(driving));
+        assert_eq!(gate.drive().unwrap().kind, DriveKind::Move);
+
+        gate.control(Some(driving), Control::Resume).unwrap();
+        let seen = gate.generation();
+        gate.control(None, Control::Stop).unwrap();
+        assert_ne!(gate.generation(), seen);
+        gate.record_mouse(
+            other,
+            &MouseOp::Click {
+                x: 1,
+                y: 1,
+                button: Button::Left,
+            },
+            Some((1, 1)),
+            seen,
+            40,
+        );
+        gate.record_type(driving, Some((5, 6)), seen, 50);
+        assert_eq!(gate.phase(), Phase::Off);
+        assert!(gate.drive().is_none());
+    }
+
+    #[test]
+    fn type_without_a_pointer_does_not_invent_the_origin() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.record_type(id, None, gate.generation(), 10);
+        let drive = gate.drive().unwrap();
+        assert_eq!(drive.kind, DriveKind::Type);
+        assert!(!drive.pointer_known);
+        gate.record_type(id, Some((40, 70)), gate.generation(), 20);
+        let drive = gate.drive().unwrap();
+        assert!(drive.pointer_known);
+        assert_eq!((drive.x, drive.y), (40, 70));
     }
 }

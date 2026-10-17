@@ -45,6 +45,9 @@ pub struct AppState {
     frames: Mutex<HashMap<Uuid, CachedFrame>>,
     /// Driving phase for the desktop companion. Mouse and type enter it.
     automation: Mutex<automation::Gate>,
+    /// Held across injection and across pause, stop, and session close.
+    /// Stop waits for an in-flight drive to finish recording, then clears it.
+    injection: Mutex<()>,
 }
 
 struct CachedFrame {
@@ -107,10 +110,12 @@ impl AppState {
             mcp_audit: Mutex::new(McpAuditor::default()),
             frames: Mutex::new(HashMap::new()),
             automation: Mutex::new(automation::Gate::default()),
+            injection: Mutex::new(()),
         }
     }
 
     fn close_all(&self) {
+        let _injection = lock(&self.injection);
         lock(&self.sessions).clear();
         lock(&self.frames).clear();
         lock(&self.automation).reset();
@@ -193,8 +198,20 @@ impl AppState {
     /// Purpose, verb, and prefer-MCP mode for the desktop companion.
     /// The CLI auth key is not a session secret and is not included.
     fn companion_session(&self) -> Option<CompanionSession> {
+        let driving = {
+            let gate = lock(&self.automation);
+            if gate.phase() == Phase::Off {
+                None
+            } else {
+                gate.session()
+            }
+        };
         let sessions = lock(&self.sessions);
-        let session = sessions.values().max_by_key(|session| session.touched())?;
+        let session = match driving {
+            Some(id) => sessions.get(&id),
+            None => None,
+        }
+        .or_else(|| sessions.values().max_by_key(|session| session.touched()))?;
         let mcp_servers = session.mcp().server_names();
         let healthy = session.mcp().healthy_server_names();
         let focused = self
@@ -228,15 +245,22 @@ impl AppState {
         lock(&self.automation).blocks(id)
     }
 
-    fn record_mouse(&self, id: Uuid, op: &MouseOp, from: Option<(i32, i32)>) {
-        lock(&self.automation).record_mouse(id, op, from, automation::unix_ms());
+    fn record_mouse(
+        &self,
+        id: Uuid,
+        op: &MouseOp,
+        from: Option<(i32, i32)>,
+        generation: u64,
+    ) {
+        lock(&self.automation).record_mouse(id, op, from, generation, automation::unix_ms());
     }
 
-    fn record_type(&self, id: Uuid) {
-        lock(&self.automation).record_type(id, automation::unix_ms());
+    fn record_type(&self, id: Uuid, at: Option<(i32, i32)>, generation: u64) {
+        lock(&self.automation).record_type(id, at, generation, automation::unix_ms());
     }
 
     fn control_automation(&self, action: Control) -> Result<(), ()> {
+        let _injection = lock(&self.injection);
         let session = {
             let sessions = lock(&self.sessions);
             sessions
@@ -278,6 +302,7 @@ struct DriveBody {
     distance_px: u32,
     elapsed_ms: u32,
     at_ms: u64,
+    pointer_known: bool,
 }
 
 #[derive(Serialize)]
@@ -558,27 +583,21 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
             gate.reset();
         }
     }
-    let shown = session.as_ref().map(|item| item.id);
     let (phase, drive, notice) = {
         let gate = lock(&state.automation);
-        let owned = gate.session().is_none() || gate.session() == shown;
-        let phase = if owned { gate.phase() } else { Phase::Off };
-        let drive = if owned {
-            gate.drive().map(|drive| DriveBody {
-                kind: drive.kind.as_str(),
-                x: drive.x,
-                y: drive.y,
-                from_x: drive.from_x,
-                from_y: drive.from_y,
-                clickable: drive.clickable,
-                distance_px: drive.distance_px,
-                elapsed_ms: drive.elapsed_ms,
-                at_ms: drive.at_ms,
-            })
-        } else {
-            None
-        };
-        (phase.as_str(), drive, gate.notice().as_str())
+        let drive = gate.drive().map(|drive| DriveBody {
+            kind: drive.kind.as_str(),
+            x: drive.x,
+            y: drive.y,
+            from_x: drive.from_x,
+            from_y: drive.from_y,
+            clickable: drive.clickable,
+            distance_px: drive.distance_px,
+            elapsed_ms: drive.elapsed_ms,
+            at_ms: drive.at_ms,
+            pointer_known: drive.pointer_known,
+        });
+        (gate.phase().as_str(), drive, gate.notice().as_str())
     };
     Json(CompanionBody {
         open: session.is_some(),
@@ -633,6 +652,7 @@ async fn close_session(
         return Err(ApiError::missing());
     }
     lock(&state.frames).remove(&id);
+    let _injection = lock(&state.injection);
     lock(&state.automation).clear_session(id);
     Ok(StatusCode::NO_CONTENT)
 }
@@ -847,15 +867,17 @@ async fn mouse(
     let state2 = Arc::clone(&state);
     let op_for_drive = op.clone();
     tokio::task::spawn_blocking(move || {
+        let _injection = lock(&state2.injection);
         if !state2.has_session(id) {
             return Err(ApiError::missing());
         }
         if state2.drive_blocked(id) {
             return Err(ApiError::conflict("automation paused"));
         }
+        let generation = lock(&state2.automation).generation();
         let from = desktop.pointer_position().ok().flatten();
         desktop.mouse(&op).map_err(ApiError::from_desktop)?;
-        state2.record_mouse(id, &op_for_drive, from);
+        state2.record_mouse(id, &op_for_drive, from, generation);
         Ok(())
     })
     .await
@@ -907,14 +929,19 @@ async fn type_keys(
     let desktop = Arc::clone(&state.desktop);
     let state2 = Arc::clone(&state);
     tokio::task::spawn_blocking(move || {
+        let _injection = lock(&state2.injection);
         if !state2.has_session(id) {
             return Err(ApiError::missing());
         }
         if state2.drive_blocked(id) {
             return Err(ApiError::conflict("automation paused"));
         }
-        desktop.type_input(&strokes).map_err(ApiError::from_desktop)?;
-        state2.record_type(id);
+        let generation = lock(&state2.automation).generation();
+        let at = desktop.pointer_position().ok().flatten();
+        desktop
+            .type_input(&strokes)
+            .map_err(ApiError::from_desktop)?;
+        state2.record_type(id, at, generation);
         Ok(())
     })
     .await
@@ -1334,6 +1361,7 @@ mod tests {
         audio_opens: AtomicUsize,
         root: AtomicBool,
         focus: Mutex<Option<FocusedApp>>,
+        pointer: Mutex<Option<(i32, i32)>>,
     }
 
     impl FakeDesktop {
@@ -1347,6 +1375,7 @@ mod tests {
                 audio_opens: AtomicUsize::new(0),
                 root: AtomicBool::new(false),
                 focus: Mutex::new(None),
+                pointer: Mutex::new(None),
             })
         }
 
@@ -1393,6 +1422,10 @@ mod tests {
 
         fn focused_app(&self) -> Result<Option<FocusedApp>, DesktopError> {
             Ok(lock(&self.focus).clone())
+        }
+
+        fn pointer_position(&self) -> Result<Option<(i32, i32)>, DesktopError> {
+            Ok(*lock(&self.pointer))
         }
     }
 
@@ -1802,6 +1835,97 @@ while True:
 
         let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn driving_session_stays_visible_and_pause_covers_the_desktop() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, driving) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{driving}/mouse"),
+            Some(r#"{"action":"move","x":12,"y":14}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, other) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(addr, "POST", &format!("/session/{other}/view"), None).await;
+        assert_eq!(status, 200);
+
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let shown: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(shown["automation"]["phase"], "running");
+        assert_eq!(shown["session"]["id"], driving.to_string());
+        assert_eq!(shown["automation"]["drive"]["pointer_known"], true);
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"pause"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let before = lock(&desktop.mice).len();
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{other}/mouse"),
+            Some(r#"{"action":"move","x":1,"y":1}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 409);
+        assert_eq!(lock(&desktop.mice).len(), before);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let paused: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paused["automation"]["phase"], "paused");
+        assert_eq!(paused["session"]["id"], driving.to_string());
+    }
+
+    #[tokio::test]
+    async fn type_records_the_live_pointer() {
+        let desktop = FakeDesktop::new();
+        *lock(&desktop.pointer) = Some((40, 70));
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"text":"hi"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let typed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(typed["automation"]["drive"]["kind"], "type");
+        assert_eq!(typed["automation"]["drive"]["x"], 40);
+        assert_eq!(typed["automation"]["drive"]["y"], 70);
+        assert_eq!(typed["automation"]["drive"]["pointer_known"], true);
+
+        *lock(&desktop.pointer) = None;
+        let (_, _, fresh) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"stop"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{fresh}/type"),
+            Some(r#"{"text":"yo"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let unknown: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unknown["automation"]["drive"]["pointer_known"], false);
     }
 
     #[tokio::test]

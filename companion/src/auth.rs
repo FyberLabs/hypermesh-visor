@@ -86,6 +86,9 @@ pub struct DriveView {
     pub clickable: bool,
     pub x: i32,
     pub y: i32,
+    /// False for a type sample that had no pointer. The distance fallback
+    /// must ignore it.
+    pub pointer_known: bool,
 }
 
 impl Snapshot {
@@ -169,6 +172,10 @@ fn parse_drive(value: &serde_json::Value) -> Option<DriveView> {
             .unwrap_or(false),
         x: value.get("x").and_then(|item| item.as_i64()).unwrap_or(0) as i32,
         y: value.get("y").and_then(|item| item.as_i64()).unwrap_or(0) as i32,
+        pointer_known: value
+            .get("pointer_known")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(true),
     })
 }
 
