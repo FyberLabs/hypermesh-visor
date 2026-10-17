@@ -73,7 +73,7 @@ impl WaylandInput {
 
     pub fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError> {
         match *op {
-            MouseOp::Move { x, y } => self.move_abs(x, y),
+            MouseOp::Move { x, y, .. } => self.move_abs(x, y),
             MouseOp::Click { x, y, button } => {
                 self.move_abs(x, y)?;
                 self.button(button, true)?;

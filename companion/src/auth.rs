@@ -1,6 +1,8 @@
 //! Visor pose for the desktop bug. Sign-in lives in `hypermesh-session`.
 //! The access token is not written down. The visor session vault is not touched.
 
+use crate::automation::{MotionKind, VisorPhase};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pose {
     Idle,
@@ -63,6 +65,113 @@ pub fn pose_from_companion(body: &str) -> Pose {
     }
 }
 
+/// One successful `GET /companion` body. `connected` is false only for the
+/// disconnected placeholder; a parsed body is always connected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    pub connected: bool,
+    pub upgrading: bool,
+    pub pose: Pose,
+    pub idle_ms: Option<u64>,
+    pub phase: VisorPhase,
+    pub drive: Option<DriveView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DriveView {
+    pub kind: MotionKind,
+    pub at_ms: u64,
+    pub distance_px: u32,
+    pub elapsed_ms: u32,
+    pub clickable: bool,
+    pub x: i32,
+    pub y: i32,
+}
+
+impl Snapshot {
+    pub fn disconnected() -> Self {
+        Self {
+            connected: false,
+            upgrading: false,
+            pose: Pose::Idle,
+            idle_ms: None,
+            phase: VisorPhase::Off,
+            drive: None,
+        }
+    }
+}
+
+pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    if !value.is_object() {
+        return None;
+    }
+    let pose = pose_from_companion(body);
+    let open = value.get("open").and_then(|open| open.as_bool()) == Some(true);
+    let upgrading = value.get("notice").and_then(|notice| notice.as_str()) == Some("upgrading");
+    let idle_ms = if open {
+        value
+            .pointer("/session/idle_ms")
+            .and_then(|idle| idle.as_u64())
+    } else {
+        None
+    };
+    let phase = if open {
+        match value
+            .pointer("/automation/phase")
+            .and_then(|phase| phase.as_str())
+            .unwrap_or("off")
+        {
+            "running" => VisorPhase::Running,
+            "paused" => VisorPhase::Paused,
+            _ => VisorPhase::Off,
+        }
+    } else {
+        VisorPhase::Off
+    };
+    let drive = if phase == VisorPhase::Off {
+        None
+    } else {
+        value.pointer("/automation/drive").and_then(parse_drive)
+    };
+    Some(Snapshot {
+        connected: true,
+        upgrading,
+        pose,
+        idle_ms,
+        phase,
+        drive,
+    })
+}
+
+fn parse_drive(value: &serde_json::Value) -> Option<DriveView> {
+    let kind = match value.get("kind").and_then(|kind| kind.as_str())? {
+        "move" => MotionKind::Move,
+        "click" => MotionKind::Click,
+        "drag" => MotionKind::Drag,
+        "type" => MotionKind::Type,
+        _ => return None,
+    };
+    Some(DriveView {
+        kind,
+        at_ms: value.get("at_ms").and_then(|item| item.as_u64())?,
+        distance_px: value
+            .get("distance_px")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0) as u32,
+        elapsed_ms: value
+            .get("elapsed_ms")
+            .and_then(|item| item.as_u64())
+            .unwrap_or(0) as u32,
+        clickable: value
+            .get("clickable")
+            .and_then(|item| item.as_bool())
+            .unwrap_or(false),
+        x: value.get("x").and_then(|item| item.as_i64()).unwrap_or(0) as i32,
+        y: value.get("y").and_then(|item| item.as_i64()).unwrap_or(0) as i32,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +214,26 @@ mod tests {
             }
             Pose::Idle => panic!("expected active"),
         }
+    }
+
+    #[test]
+    fn snapshot_reads_automation_and_notice() {
+        let snap = snapshot_from_body(
+            r#"{"open":true,"notice":"upgrading","automation":{"phase":"running","drive":{"kind":"move","x":4,"y":5,"distance_px":9,"elapsed_ms":40,"clickable":true,"at_ms":80}},"session":{"id":"x","purpose":"drive","verb":"mouse","idle_ms":12}}"#,
+        )
+        .unwrap();
+        assert!(snap.connected);
+        assert!(snap.upgrading);
+        assert_eq!(snap.idle_ms, Some(12));
+        assert_eq!(snap.phase, VisorPhase::Running);
+        let drive = snap.drive.unwrap();
+        assert_eq!(drive.kind, MotionKind::Move);
+        assert!(drive.clickable);
+        assert_eq!(drive.distance_px, 9);
+        assert!(snapshot_from_body("not-json").is_none());
+        let idle = snapshot_from_body(r#"{"open":false}"#).unwrap();
+        assert!(idle.connected);
+        assert_eq!(idle.phase, VisorPhase::Off);
+        assert_eq!(idle.pose, Pose::Idle);
     }
 }

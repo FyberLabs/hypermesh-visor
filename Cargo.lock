@@ -797,7 +797,9 @@ name = "hypermesh-companion"
 version = "0.1.0"
 dependencies = [
  "hypermesh-session",
+ "libc",
  "png",
+ "serde",
  "serde_json",
  "x11rb",
 ]

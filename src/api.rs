@@ -19,6 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 use zeroize::Zeroize;
 
+use crate::automation::{self, Control, Notice, Phase};
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
 use crate::input::{keys_activity, mouse_activity, plan_type, MouseOp, PlanError, TypeBody};
@@ -42,6 +43,8 @@ pub struct AppState {
     /// Latest view/watch frame per session. The feed serves this cache.
     /// It does not call `Desktop::view` again.
     frames: Mutex<HashMap<Uuid, CachedFrame>>,
+    /// Driving phase for the desktop companion. Mouse and type enter it.
+    automation: Mutex<automation::Gate>,
 }
 
 struct CachedFrame {
@@ -103,12 +106,14 @@ impl AppState {
             mcp_dir,
             mcp_audit: Mutex::new(McpAuditor::default()),
             frames: Mutex::new(HashMap::new()),
+            automation: Mutex::new(automation::Gate::default()),
         }
     }
 
     fn close_all(&self) {
         lock(&self.sessions).clear();
         lock(&self.frames).clear();
+        lock(&self.automation).reset();
     }
 
     fn has_session(&self, id: Uuid) -> bool {
@@ -205,6 +210,7 @@ impl AppState {
         let verb = session.verb().map(Verb::as_str);
         let mode = companion_mode(preferred.as_deref(), verb);
         let prefer_mcp = preferred.is_some();
+        let idle_ms = u64::try_from(session.touched().elapsed().as_millis()).unwrap_or(u64::MAX);
         Some(CompanionSession {
             id: session.id(),
             purpose: session.purpose().to_string(),
@@ -214,15 +220,64 @@ impl AppState {
             mcp_servers,
             focused,
             prefer_mcp,
+            idle_ms,
         })
+    }
+
+    fn drive_blocked(&self, id: Uuid) -> bool {
+        lock(&self.automation).blocks(id)
+    }
+
+    fn record_mouse(&self, id: Uuid, op: &MouseOp, from: Option<(i32, i32)>) {
+        lock(&self.automation).record_mouse(id, op, from, automation::unix_ms());
+    }
+
+    fn record_type(&self, id: Uuid) {
+        lock(&self.automation).record_type(id, automation::unix_ms());
+    }
+
+    fn control_automation(&self, action: Control) -> Result<(), ()> {
+        let session = {
+            let sessions = lock(&self.sessions);
+            sessions
+                .values()
+                .max_by_key(|session| session.touched())
+                .map(|session| session.id())
+        };
+        lock(&self.automation).control(session, action)
     }
 }
 
 #[derive(Serialize)]
 struct CompanionBody {
     open: bool,
+    /// `upgrading` when an updater published that notice. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice: Option<&'static str>,
+    automation: AutomationBody,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<CompanionSession>,
+}
+
+#[derive(Serialize)]
+struct AutomationBody {
+    /// `off`, `running`, or `paused`.
+    phase: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    drive: Option<DriveBody>,
+}
+
+#[derive(Serialize)]
+struct DriveBody {
+    kind: &'static str,
+    x: i32,
+    y: i32,
+    from_x: i32,
+    from_y: i32,
+    clickable: bool,
+    distance_px: u32,
+    elapsed_ms: u32,
+    at_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -241,11 +296,15 @@ struct CompanionSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     focused: Option<FocusedApp>,
     prefer_mcp: bool,
+    /// Milliseconds since this session was last used.
+    idle_ms: u64,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/companion", get(companion))
+        .route("/companion/automation", post(companion_automation))
+        .route("/companion/notice", post(companion_notice))
         .route("/session", post(open_session))
         .route("/session/:id", delete(close_session))
         .route("/session/:id/view", post(view))
@@ -488,10 +547,81 @@ async fn list_mcp_audit(State(state): State<Arc<AppState>>) -> Json<Vec<McpAudit
 
 async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
     let session = state.companion_session();
+    let gate_session = lock(&state.automation).session();
+    let stale = gate_session.filter(|id| !state.has_session(*id));
+    if let Some(id) = stale {
+        lock(&state.automation).clear_session(id);
+    }
+    if session.is_none() {
+        let mut gate = lock(&state.automation);
+        if gate.phase() != Phase::Off {
+            gate.reset();
+        }
+    }
+    let shown = session.as_ref().map(|item| item.id);
+    let (phase, drive, notice) = {
+        let gate = lock(&state.automation);
+        let owned = gate.session().is_none() || gate.session() == shown;
+        let phase = if owned { gate.phase() } else { Phase::Off };
+        let drive = if owned {
+            gate.drive().map(|drive| DriveBody {
+                kind: drive.kind.as_str(),
+                x: drive.x,
+                y: drive.y,
+                from_x: drive.from_x,
+                from_y: drive.from_y,
+                clickable: drive.clickable,
+                distance_px: drive.distance_px,
+                elapsed_ms: drive.elapsed_ms,
+                at_ms: drive.at_ms,
+            })
+        } else {
+            None
+        };
+        (phase.as_str(), drive, gate.notice().as_str())
+    };
     Json(CompanionBody {
         open: session.is_some(),
+        notice,
+        automation: AutomationBody { phase, drive },
         session,
     })
+}
+
+#[derive(Deserialize)]
+struct AutomationRequest {
+    action: String,
+}
+
+/// `start`, `pause`, `resume`, or `stop`. `start` and `stop` are the seam for
+/// a runner that is not the mouse and type verbs. `start` needs an open session.
+async fn companion_automation(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AutomationRequest>,
+) -> Result<StatusCode, ApiError> {
+    let action = Control::parse(&body.action).ok_or_else(|| {
+        ApiError::bad("action must be start, pause, resume, or stop")
+    })?;
+    state
+        .control_automation(action)
+        .map_err(|_| ApiError::bad("start needs an open session"))?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct NoticeRequest {
+    notice: String,
+}
+
+/// `upgrading` or `clear`. Nothing in this process publishes an update by itself.
+async fn companion_notice(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<NoticeRequest>,
+) -> Result<StatusCode, ApiError> {
+    let notice = Notice::parse(&body.notice)
+        .ok_or_else(|| ApiError::bad("notice must be upgrading or clear"))?;
+    lock(&state.automation).set_notice(notice);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn close_session(
@@ -503,6 +633,7 @@ async fn close_session(
         return Err(ApiError::missing());
     }
     lock(&state.frames).remove(&id);
+    lock(&state.automation).clear_session(id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -705,17 +836,27 @@ async fn mouse(
     Json(op): Json<MouseOp>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
+    if state.drive_blocked(id) {
+        return Err(ApiError::conflict("automation paused"));
+    }
     if !state.mark_verb(id, Verb::Mouse) {
         return Err(ApiError::missing());
     }
     let activity = mouse_activity(&op);
     let desktop = Arc::clone(&state.desktop);
     let state2 = Arc::clone(&state);
+    let op_for_drive = op.clone();
     tokio::task::spawn_blocking(move || {
         if !state2.has_session(id) {
             return Err(ApiError::missing());
         }
-        desktop.mouse(&op).map_err(ApiError::from_desktop)
+        if state2.drive_blocked(id) {
+            return Err(ApiError::conflict("automation paused"));
+        }
+        let from = desktop.pointer_position().ok().flatten();
+        desktop.mouse(&op).map_err(ApiError::from_desktop)?;
+        state2.record_mouse(id, &op_for_drive, from);
+        Ok(())
     })
     .await
     .map_err(|_| ApiError::internal("desktop task failed"))??;
@@ -729,6 +870,9 @@ async fn type_keys(
     Json(mut body): Json<TypeBody>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
+    if state.drive_blocked(id) {
+        return Err(ApiError::conflict("automation paused"));
+    }
     let (secret, typed, secret_handle, key_line) = {
         let mut sessions = lock(&state.sessions);
         let session = sessions.get_mut(&id).ok_or_else(ApiError::missing)?;
@@ -766,7 +910,12 @@ async fn type_keys(
         if !state2.has_session(id) {
             return Err(ApiError::missing());
         }
-        desktop.type_input(&strokes).map_err(ApiError::from_desktop)
+        if state2.drive_blocked(id) {
+            return Err(ApiError::conflict("automation paused"));
+        }
+        desktop.type_input(&strokes).map_err(ApiError::from_desktop)?;
+        state2.record_type(id);
+        Ok(())
     })
     .await
     .map_err(|_| ApiError::internal("desktop task failed"))??;
@@ -1077,6 +1226,13 @@ impl ApiError {
     fn bad(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
         }
     }
@@ -1535,6 +1691,117 @@ while True:
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let closed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(closed["open"], false);
+        assert_eq!(closed["automation"]["phase"], "off");
+    }
+
+    #[tokio::test]
+    async fn automation_tracks_drive_and_pause_blocks_input() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/view"),
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let viewed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(viewed["automation"]["phase"], "off");
+        assert_eq!(viewed["session"]["verb"], "view");
+        let _ = body;
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":10,"y":0}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":300,"y":0,"clickable":true}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let running: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(running["automation"]["phase"], "running");
+        assert_eq!(running["automation"]["drive"]["kind"], "move");
+        assert_eq!(running["automation"]["drive"]["clickable"], true);
+        assert_eq!(running["automation"]["drive"]["distance_px"], 290);
+        assert!(running["session"]["idle_ms"].as_u64().is_some());
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"pause"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let before = lock(&desktop.mice).len();
+        let (status, _, paused_body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"click","x":1,"y":1}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 409, "{}", String::from_utf8_lossy(&paused_body));
+        assert_eq!(lock(&desktop.mice).len(), before);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"text":"hi"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 409);
+        assert!(lock(&desktop.typed).is_empty());
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/notice",
+            Some(r#"{"notice":"upgrading"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"resume"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let resumed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resumed["automation"]["phase"], "running");
+        assert_eq!(resumed["notice"], "upgrading");
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"stop"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let stopped: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stopped["automation"]["phase"], "off");
+        assert_eq!(stopped["notice"], "upgrading");
+
+        let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
+        assert_eq!(status, 204);
     }
 
     #[tokio::test]

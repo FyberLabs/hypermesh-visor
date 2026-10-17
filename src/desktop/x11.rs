@@ -121,12 +121,23 @@ pub fn capture(display: Option<&str>) -> Result<Frame, DesktopError> {
     Ok(Frame::png(bytes))
 }
 
+pub fn pointer(display: Option<&str>) -> Result<(i32, i32), DesktopError> {
+    let (conn, screen_num) = connect(display)?;
+    let root = conn.setup().roots[screen_num].root;
+    let reply = conn
+        .query_pointer(root)
+        .map_err(unavailable)?
+        .reply()
+        .map_err(unavailable)?;
+    Ok((i32::from(reply.root_x), i32::from(reply.root_y)))
+}
+
 pub fn mouse(display: Option<&str>, op: &MouseOp) -> Result<(), DesktopError> {
     let (conn, screen_num) = connect(display)?;
     ensure_xtest(&conn)?;
     let root = conn.setup().roots[screen_num].root;
     match *op {
-        MouseOp::Move { x, y } => move_abs(&conn, root, x, y)?,
+        MouseOp::Move { x, y, .. } => move_abs(&conn, root, x, y)?,
         MouseOp::Click { x, y, button } => {
             move_abs(&conn, root, x, y)?;
             button_event(&conn, root, button, true)?;

@@ -62,6 +62,12 @@ pub trait Desktop: Send + Sync {
     fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError>;
     fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError>;
 
+    /// Current pointer, when the backend can read it. Used to tell a long
+    /// automation move from a short one. Default: unknown.
+    fn pointer_position(&self) -> Result<Option<(i32, i32)>, DesktopError> {
+        Ok(None)
+    }
+
     /// Focused window identity for MCP prefer detection. Default: unknown.
     fn focused_app(&self) -> Result<Option<crate::mcp::FocusedApp>, DesktopError> {
         Ok(None)
@@ -174,6 +180,13 @@ impl Desktop for LinuxDesktop {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::type_strokes(self.env.display.as_deref(), strokes),
             BackendKind::Wayland => self.with_wayland(|input| input.type_strokes(strokes)),
+        }
+    }
+
+    fn pointer_position(&self) -> Result<Option<(i32, i32)>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => x11::pointer(self.env.display.as_deref()).map(Some),
+            BackendKind::Wayland => Ok(None),
         }
     }
 

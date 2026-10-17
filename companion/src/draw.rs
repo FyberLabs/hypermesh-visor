@@ -1,17 +1,15 @@
-//! The desktop bug. Idle and active frames blit the shipped sprites and, when
-//! a session is open, draw the session purpose and current verb under the bug.
+//! The desktop bug. Frames come from `assets/states`. When a session is open
+//! the purpose and current verb are drawn under the bug.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::Path;
 
 use crate::auth::Pose;
+use crate::mascot::{self, Mascot};
 
 const TARGET_WIDTH: u32 = 400;
-
-// Drawn by companion/assets/render_sprites.py and committed so a clean checkout builds.
-const IDLE_PNG: &[u8] = include_bytes!("../assets/bug-idle.png");
-const ACTIVE_PNG: &[u8] = include_bytes!("../assets/bug-active.png");
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -22,8 +20,11 @@ pub enum Action {
     OpenRent,
     OpenDashboard,
     ToggleEyes,
+    ToggleBugCursor,
     McpProfiles,
     McpDoctor,
+    ContinueAutomation,
+    DismissAutomation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -62,57 +63,81 @@ struct Rect {
     h: i32,
 }
 
+pub struct Rgba {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
 pub struct Sprites {
-    idle: Image,
-    active: Image,
-    idle_eyes: Vec<Rect>,
-    active_eyes: Vec<Rect>,
+    frames: HashMap<(Mascot, usize), Image>,
+    idle_eyes: Vec<Vec<Rect>>,
+    catalog: mascot::Catalog,
 }
 
 impl Sprites {
     pub fn load() -> Self {
-        let idle = scale_width(&decode_png(IDLE_PNG), TARGET_WIDTH);
-        let active = scale_width(&decode_png(ACTIVE_PNG), TARGET_WIDTH);
-        let idle_eyes = find_eyes(&idle);
-        let active_eyes = find_eyes(&active);
-        Self {
-            idle,
-            active,
-            idle_eyes,
-            active_eyes,
+        let catalog = mascot::Catalog::load();
+        let mut frames = HashMap::new();
+        let mut idle_eyes = Vec::new();
+        for state in Mascot::ALL {
+            let clip = catalog.clip(state);
+            for (index, name) in clip.files.iter().enumerate() {
+                let bytes = mascot::state_png(name).unwrap_or_else(|| panic!("missing {name}"));
+                let image = decode_png(bytes);
+                if state == Mascot::Idle {
+                    idle_eyes.push(find_eyes(&image));
+                }
+                frames.insert((state, index), image);
+            }
         }
+        Self {
+            frames,
+            idle_eyes,
+            catalog,
+        }
+    }
+
+    pub fn frame(&self, state: Mascot, index: usize) -> &Image {
+        let count = self.catalog.clip(state).files.len();
+        let index = if count == 0 { 0 } else { index % count };
+        self.frames
+            .get(&(state, index))
+            .unwrap_or_else(|| &self.frames[&(state, 0)])
+    }
+
+    pub fn timing(&self, state: Mascot) -> (u64, usize, bool) {
+        let clip = self.catalog.clip(state);
+        (clip.ms_per_frame, clip.files.len(), clip.looped)
     }
 }
 
 pub fn render(
     sprites: &Sprites,
     pose: &Pose,
-    tick: u32,
+    mascot: Mascot,
+    frame: usize,
     menu: bool,
+    ask_continue: bool,
     status: Option<&str>,
     eyes_follow: bool,
+    bug_cursor: bool,
     pointer: Option<(i32, i32)>,
 ) -> Scene {
-    let (base, eyes) = match pose {
-        Pose::Idle => (&sprites.idle, &sprites.idle_eyes),
-        Pose::Active { .. } => (&sprites.active, &sprites.active_eyes),
-    };
+    let base = sprites.frame(mascot, frame);
     let mut bug = base.clone_image();
-    let bob = bob_offset(tick);
-    let bob_room = 14i32;
-    let bug_top = bob_room / 2 + bob;
-    // Pupils move only while the option is on and a session is open.
-    if eyes_follow {
+    let bug_top = 0i32;
+    // The illustrated frames already blink and bob. Pupils still track when
+    // the idle frame has the two eye shapes and a session is open.
+    if eyes_follow && mascot == Mascot::Idle {
         if let (Pose::Active { .. }, Some((px, py))) = (pose, pointer) {
+            let eyes = sprites.idle_eyes.get(frame).map(Vec::as_slice).unwrap_or(&[]);
             track_eyes(&mut bug, eyes, (px, py - bug_top));
         }
     }
-    if blinking(tick) {
-        paint_lids(&mut bug, eyes);
-    }
-    let width = bug.w;
+    let width = bug.w.max(TARGET_WIDTH);
     let mut blocks: Vec<Block> = Vec::new();
-    let mut y = bug.h as i32 + bob_room;
+    let mut y = bug.h as i32;
     if let Pose::Active {
         purpose,
         verb,
@@ -151,11 +176,48 @@ pub fn render(
         });
         y += blocks.last().unwrap().image.h as i32 + 8;
     }
-    if menu {
+    if ask_continue {
+        let rows = [
+            ("Continue the automation?", None),
+            ("Continue", Some(Action::ContinueAutomation)),
+            ("Not now", Some(Action::DismissAutomation)),
+        ];
+        for (label, action) in rows {
+            let row = text_card(
+                width,
+                3,
+                &[label.to_string()],
+                [16, 32, 36, 245],
+                [236, 244, 236, 255],
+            );
+            let h = row.h as i32;
+            let hits = action
+                .map(|action| Hit {
+                    x: 0,
+                    y,
+                    w: width as i32,
+                    h,
+                    action,
+                })
+                .into_iter()
+                .collect();
+            blocks.push(Block {
+                y,
+                image: row,
+                hits,
+            });
+            y += h + 4;
+        }
+    } else if menu {
         let eyes_label = if eyes_follow {
             "Eyes follow: on"
         } else {
             "Eyes follow: off"
+        };
+        let bug_label = if bug_cursor {
+            "Bug cursor: on"
+        } else {
+            "Bug cursor: off"
         };
         let rows = [
             ("Open CLI", Action::OpenCli),
@@ -166,6 +228,7 @@ pub fn render(
             ("Rent", Action::OpenRent),
             ("Dashboards", Action::OpenDashboard),
             (eyes_label, Action::ToggleEyes),
+            (bug_label, Action::ToggleBugCursor),
         ];
         for (label, action) in rows {
             let row = text_card(
@@ -190,14 +253,14 @@ pub fn render(
             y += h + 4;
         }
     }
-    let height = y.max(bug.h as i32 + bob_room).max(1) as u32;
+    let height = y.max(bug.h as i32).max(1) as u32;
     let mut rgba = vec![0u8; width as usize * height as usize * 4];
     blit(&mut rgba, width, &bug, 0, bug_top);
     let mut hits = vec![Hit {
         x: 0,
         y: 0,
         w: width as i32,
-        h: bug.h as i32 + bob_room,
+        h: bug.h as i32,
         action: Action::ToggleMenu,
     }];
     for block in &blocks {
@@ -226,7 +289,18 @@ struct Block {
 pub fn dump_frames(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)?;
     let sprites = Sprites::load();
-    let idle = render(&sprites, &Pose::Idle, 6, false, None, false, None);
+    let idle = render(
+        &sprites,
+        &Pose::Idle,
+        Mascot::Idle,
+        0,
+        false,
+        false,
+        None,
+        false,
+        false,
+        None,
+    );
     let active = render(
         &sprites,
         &Pose::Active {
@@ -234,9 +308,12 @@ pub fn dump_frames(dir: &Path) -> std::io::Result<()> {
             verb: Some("view".into()),
             mode: Some("view".into()),
         },
-        6,
+        Mascot::Automation,
+        0,
+        false,
         false,
         None,
+        false,
         false,
         None,
     );
@@ -245,17 +322,13 @@ pub fn dump_frames(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn bob_offset(tick: u32) -> i32 {
-    let phase = (tick % 24) as i32;
-    if phase < 12 {
-        phase - 6
-    } else {
-        18 - phase
+pub fn decode_rgba(bytes: &[u8]) -> Rgba {
+    let image = decode_png(bytes);
+    Rgba {
+        width: image.w,
+        height: image.h,
+        rgba: image.rgba,
     }
-}
-
-fn blinking(tick: u32) -> bool {
-    tick % 48 < 3
 }
 
 fn track_eyes(image: &mut Image, eyes: &[Rect], pointer: (i32, i32)) {
@@ -548,33 +621,6 @@ fn glyph(ch: char) -> [u8; 7] {
     }
 }
 
-fn paint_lids(image: &mut Image, eyes: &[Rect]) {
-    for eye in eyes {
-        let cover = ((eye.h as f32) * 0.72) as i32;
-        for y in eye.y..eye.y + cover {
-            for x in eye.x..eye.x + eye.w {
-                if x < 0 || y < 0 || x >= image.w as i32 || y >= image.h as i32 {
-                    continue;
-                }
-                let i = (y as u32 * image.w + x as u32) as usize * 4;
-                let (r, g, b, a) = (
-                    image.rgba[i],
-                    image.rgba[i + 1],
-                    image.rgba[i + 2],
-                    image.rgba[i + 3],
-                );
-                if a < 200 || r < 170 || g < 150 || b < 140 {
-                    continue;
-                }
-                image.rgba[i] = 18;
-                image.rgba[i + 1] = 70;
-                image.rgba[i + 2] = 64;
-                image.rgba[i + 3] = 255;
-            }
-        }
-    }
-}
-
 fn find_eyes(image: &Image) -> Vec<Rect> {
     let w = image.w as i32;
     let h = image.h as i32;
@@ -614,7 +660,8 @@ fn find_eyes(image: &Image) -> Vec<Rect> {
             let rect_w = max_x - min_x + 1;
             let rect_h = max_y - min_y + 1;
             let cy = min_y + rect_h / 2;
-            if area > 400 && cy < (h * 70) / 100 && rect_w > 20 && rect_h > 20 {
+            // The illustrated eyes are smaller than the old still sprites.
+            if area > 200 && cy < (h * 70) / 100 && rect_w > 20 && rect_h > 16 {
                 found.push((area, Rect {
                     x: min_x,
                     y: min_y,
@@ -757,49 +804,56 @@ fn write_png(path: &Path, scene: &Scene) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn scene(
+        sprites: &Sprites,
+        pose: &Pose,
+        mascot: Mascot,
+        frame: usize,
+        eyes: bool,
+        pointer: Option<(i32, i32)>,
+    ) -> Scene {
+        render(
+            sprites, pose, mascot, frame, false, false, None, eyes, false, pointer,
+        )
+    }
+
     #[test]
-    fn idle_and_active_use_the_shipped_sprites() {
+    fn animated_frames_replace_the_stills() {
         let sprites = Sprites::load();
-        assert_eq!(sprites.idle_eyes.len(), 2, "idle eyes {:?}", sprites.idle_eyes);
-        assert_eq!(
-            sprites.active_eyes.len(),
-            2,
-            "active eyes {:?}",
-            sprites.active_eyes
-        );
-        let idle = render(&sprites, &Pose::Idle, 6, false, None, false, None);
-        let active = render(
+        assert_eq!(sprites.idle_eyes[0].len(), 2, "{:?}", sprites.idle_eyes[0]);
+        let idle = scene(&sprites, &Pose::Idle, Mascot::Idle, 0, false, None);
+        let next = scene(&sprites, &Pose::Idle, Mascot::Idle, 1, false, None);
+        assert_ne!(idle.rgba, next.rgba);
+        let active = scene(
             &sprites,
             &Pose::Active {
                 purpose: "review the desktop".into(),
                 verb: Some("view".into()),
                 mode: Some("view".into()),
             },
-            6,
-            false,
-            None,
+            Mascot::Idle,
+            0,
             false,
             None,
         );
-        let other = render(
+        let other = scene(
             &sprites,
             &Pose::Active {
                 purpose: "review the desktop".into(),
                 verb: Some("listen".into()),
                 mode: Some("listen".into()),
             },
-            6,
-            false,
-            None,
+            Mascot::Idle,
+            0,
             false,
             None,
         );
         assert!(idle.height < active.height);
         assert_ne!(active.rgba, other.rgba);
-        assert_eq!(opaque_center(&idle), true);
+        assert!(painted_body(&idle));
         assert!(corner_clear(&idle));
-        let blink = render(&sprites, &Pose::Idle, 0, false, None, false, None);
-        assert_ne!(idle.rgba, blink.rgba);
+        let (ms, count, looped) = sprites.timing(Mascot::Disconnected);
+        assert_eq!((ms, count, looped), (110, 6, true));
     }
 
     #[test]
@@ -810,11 +864,11 @@ mod tests {
             verb: Some("view".into()),
             mode: Some("view".into()),
         };
-        let still = render(&sprites, &active, 6, false, None, false, Some((0, 80)));
-        let ignored = render(&sprites, &active, 6, false, None, false, Some((390, 80)));
+        let still = scene(&sprites, &active, Mascot::Idle, 0, false, Some((0, 80)));
+        let ignored = scene(&sprites, &active, Mascot::Idle, 0, false, Some((390, 80)));
         assert_eq!(still.rgba, ignored.rgba);
-        let left = render(&sprites, &active, 6, false, None, true, Some((0, 80)));
-        let right = render(&sprites, &active, 6, false, None, true, Some((390, 200)));
+        let left = scene(&sprites, &active, Mascot::Idle, 0, true, Some((0, 80)));
+        let right = scene(&sprites, &active, Mascot::Idle, 0, true, Some((390, 200)));
         assert_ne!(left.rgba, right.rgba);
         let band = |scene: &Scene| {
             let rows = 90.min(scene.height as usize);
@@ -823,16 +877,50 @@ mod tests {
         };
         assert_eq!(band(&left), band(&right));
         assert_eq!(band(&left), band(&still));
-        let idle_left = render(&sprites, &Pose::Idle, 6, false, None, true, Some((0, 40)));
-        let idle_right = render(&sprites, &Pose::Idle, 6, false, None, true, Some((390, 40)));
+        let idle_left = scene(&sprites, &Pose::Idle, Mascot::Idle, 0, true, Some((0, 40)));
+        let idle_right = scene(&sprites, &Pose::Idle, Mascot::Idle, 0, true, Some((390, 40)));
         assert_eq!(idle_left.rgba, idle_right.rgba);
+        let visor = scene(&sprites, &active, Mascot::Automation, 0, true, Some((0, 80)));
+        let visor_other = scene(
+            &sprites,
+            &active,
+            Mascot::Automation,
+            0,
+            true,
+            Some((390, 200)),
+        );
+        assert_eq!(visor.rgba, visor_other.rgba);
     }
 
-    fn opaque_center(scene: &Scene) -> bool {
-        let x = scene.width / 2;
-        let y = scene.height / 3;
-        let i = (y * scene.width + x) as usize * 4;
-        scene.rgba[i + 3] > 200
+    #[test]
+    fn paused_prompt_offers_continue() {
+        let sprites = Sprites::load();
+        let scene = render(
+            &sprites,
+            &Pose::Idle,
+            Mascot::Idle,
+            0,
+            false,
+            true,
+            None,
+            false,
+            false,
+            None,
+        );
+        assert!(scene
+            .hits
+            .iter()
+            .any(|hit| hit.action == Action::ContinueAutomation));
+        assert!(scene
+            .hits
+            .iter()
+            .any(|hit| hit.action == Action::DismissAutomation));
+    }
+
+    fn painted_body(scene: &Scene) -> bool {
+        // The beetle sits low on the 400x520 canvas, so a single center pixel
+        // can land in the gap above the shell.
+        scene.rgba.chunks(4).filter(|px| px[3] > 200).count() > 1_000
     }
 
     fn corner_clear(scene: &Scene) -> bool {

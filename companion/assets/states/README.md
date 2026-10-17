@@ -1,6 +1,6 @@
 # Companion mascot states
 
-Optional animated frames for the desktop beetle. The companion binary leaves this directory unused. The on-screen bug still uses `../bug-idle.png` and `../bug-active.png`.
+Animated frames for the desktop beetle. The companion plays the `400x520` row. `states.json` chooses the frame list, the hold time, and whether the state loops.
 
 The automation state is paired with the bug cursor. That pairing is [Automation mode](../../../README.md#automation-mode).
 

@@ -26,7 +26,7 @@ impl Button {
 /// What the renter feed may show for a mouse verb. Coordinates only.
 pub fn mouse_activity(op: &MouseOp) -> String {
     match op {
-        MouseOp::Move { x, y } => format!("move {x},{y}"),
+        MouseOp::Move { x, y, .. } => format!("move {x},{y}"),
         MouseOp::Click { x, y, button } => format!("click {x},{y} {}", button.as_str()),
         MouseOp::Drag {
             x,
@@ -82,6 +82,10 @@ pub enum MouseOp {
     Move {
         x: i32,
         y: i32,
+        /// The caller knows the pointer is over something that can be clicked.
+        /// The visor does not discover that itself.
+        #[serde(default)]
+        clickable: bool,
     },
     Click {
         x: i32,

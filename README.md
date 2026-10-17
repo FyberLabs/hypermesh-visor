@@ -47,21 +47,37 @@ The raw release assets `hypermesh-visor-x86_64` and `hypermesh-visor-aarch64` st
 
 ## Desktop companion
 
-`hypermesh-companion` is a Linux-only bug on the desktop. It draws the beetle sprites in `companion/assets`, bobs them, and blinks by covering the eyes. While a visor session is open it paints that session's purpose and the prefer-MCP mode (`mcp:<id>` when a healthy binding matches, else `view` / `watch` / `listen` / `mouse` / `type`) under the bug in a built-in bitmap face. It does not copy the screen into the window. With no session the bug is idle. Clicking it opens a short menu: a terminal running `hypermesh`, MCP profiles, MCP doctor, login, billing (`https://hyperme.sh/#pricing`), renting (`https://hyperme.sh/#offers`), the desk (`https://portal.test.hyperme.sh/dashboard/hypermesh`), and Eyes follow. Eyes follow is off unless that menu row turns it on. The choice is stored in `~/.config/hypermesh/companion.toml` as `eyes_follow_pointer`. While a session is open and the option is on, the pupils track the pointer and the purpose and verb stay on the label. Idle eyes do not follow the pointer.
+`hypermesh-companion` is a Linux-only bug on the desktop. It plays the animated states in [`companion/assets/states`](companion/assets/states/README.md). Frame order, `ms_per_frame`, and `loop` come from `states.json`. The window uses the `400x520` frames.
 
-Optional cursor art, for a mode that would draw this beetle as the mouse pointer, is in [`companion/assets/cursor`](companion/assets/cursor/README.md). Animated mascot states (idle, automation, upgrading, disconnected, and sleeping) are in [`companion/assets/states`](companion/assets/states/README.md). Those files are art only. The running companion still draws `bug-idle.png` and `bug-active.png`. How the cursor and the automation visor go together is [Automation mode](#automation-mode).
+| State | When it shows |
+| --- | --- |
+| idle | The visor is reachable and was used recently, and while an automation is paused |
+| automation | The visor is driving the desktop, or a caller started an automation |
+| upgrading | An updater published that notice (see below). This wins even if the visor is down |
+| disconnected | The visor does not answer. Three missed polls in a row count as down |
+| sleeping | The visor is up, nothing is driving, and neither the companion nor the open session has been used for `sleep_after_secs` (default 900) |
+
+While a visor session is open it paints that session's purpose and the prefer-MCP mode (`mcp:<id>` when a healthy binding matches, else `view` / `watch` / `listen` / `mouse` / `type`) under the bug in a built-in bitmap face. It does not copy the screen into the window. Clicking it opens a short menu: a terminal running `hypermesh`, MCP profiles, MCP doctor, login, billing (`https://hyperme.sh/#pricing`), renting (`https://hyperme.sh/#offers`), the desk (`https://portal.test.hyperme.sh/dashboard/hypermesh`), Eyes follow, and Bug cursor. Eyes follow and the bug cursor are off unless that menu row turns them on. Both choices are stored in `~/.config/hypermesh/companion.toml` (`eyes_follow_pointer`, `bug_cursor`). Pupils track the pointer only on the idle animation, and only while a session is open and eyes follow is on. `sleep_after_secs` and `automation_resume_secs` (default 120) are read from that file when the companion starts.
+
+The bug cursor art is in [`companion/assets/cursor`](companion/assets/cursor/README.md). How it pairs with the automation state is [Automation mode](#automation-mode).
 
 ### Automation mode
 
-The top-down bug cursor and the automation state are one behavior. The visor is the bug using VR to do the tasks. The frames for that pairing live in [`companion/assets/cursor`](companion/assets/cursor/README.md) and [`companion/assets/states`](companion/assets/states/README.md). The running companion still draws the two still sprites and leaves the system pointer in place.
+The top-down bug cursor and the automation state are one behavior. The visor is the bug using VR to do the tasks.
 
-While an automation runs, the on-screen companion shows the automation state (the visor), and the pointer is the bug cursor. That cursor plays crawl, fly, reach, click, and type as the automation moves, clicks, and types.
+While an automation runs, the companion shows the automation state and the X11 pointer is the bug cursor. The click point is the antenna tip in `hotspot.json`. The cursor plays crawl, fly (a long move, or a fast one), reach, click, type, and busy from the latest drive sample. Reach shows only after a move has settled and that move's JSON set `"clickable": true`. The visor does not discover clickable targets. Busy shows while the automation is running and the latest sample is not a fresh move, click, or type.
 
-If the user moves the mouse or types during an automation, the automation pauses. The companion drops the visor and switches to idle. The cursor goes back to the normal system pointer.
+`POST /session/{id}/mouse` and `POST /session/{id}/type` enter `running`. `view`, `watch`, and `listen` do not. There is no separate automation runner. `POST /companion/automation` with `{"action":"start"}` or `"stop"` is that seam. `start` needs an open session. `stop` ends the phase without closing the session.
 
-Clicking the companion bug while it is paused asks whether to continue the automation. Continuing puts the visor and the bug cursor back. The automation also resumes on its own after 2 minutes with no user input, and the visor and the bug cursor come back then too. Further mouse or keyboard input during that wait keeps it paused.
+A real mouse move, button press, or key press pauses the automation. The companion posts `pause`. Until that lands, a drive already in flight can still inject. After it lands, mouse and type return 409 `{"error":"automation paused"}` and do not inject. XInput2 raw events whose device or source is an XTEST device are the visor's own input and are ignored. If XInput2 or that device cannot be identified, the companion compares the pointer with the last drive point once the move is older than 150 ms, and pauses when it is more than 12 px away. That fallback cannot see key presses. On pause the companion drops the visor, shows idle, and the system cursor comes back.
 
-Away from an automation, the bug cursor stays optional.
+While paused, clicking the companion bug asks whether to continue. Continue posts `resume`. The automation also resumes after `automation_resume_secs` (default 120) with no user input. Further mouse or keyboard input during that wait keeps it paused and restarts the timer. On resume the visor state and the bug cursor come back.
+
+Away from an automation the bug cursor stays off unless `bug_cursor` is true.
+
+The system cursor is restored when the companion exits, when the visor is disconnected, and if the window loop unwinds. The X server also drops a client's cursor when the connection closes. The pointer change is the X11 cursor, including XWayland. A Wayland-native cursor that does not go through XWayland is left as it is.
+
+Upgrading is not inferred. Publish it with `POST /companion/notice` and `{"notice":"upgrading"}` (`{"notice":"clear"}` removes it), or write the single word `upgrading` to `~/.config/hypermesh/companion-notice`.
 
 ```mermaid
 stateDiagram-v2

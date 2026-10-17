@@ -86,7 +86,7 @@ impl Desktop for FixtureDesktop {
 
 fn mouse_event(op: &MouseOp) -> serde_json::Value {
     match op {
-        MouseOp::Move { x, y } => serde_json::json!({
+        MouseOp::Move { x, y, .. } => serde_json::json!({
             "kind": "mouse",
             "action": "move",
             "x": x,
