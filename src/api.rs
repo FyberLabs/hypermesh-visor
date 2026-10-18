@@ -616,18 +616,34 @@ pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()
     let _ = std::fs::remove_file(state.mcp_dir.join("companion.token"));
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let app = router(Arc::clone(&state));
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown_rx.wait_for(|stop| *stop).await;
+    // The task is polled immediately. Waiting for the signal before the
+    // first poll leaves the listen socket open and never accepts.
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_rx.wait_for(|stop| *stop).await;
+            })
+            .await
     });
-    shutdown_signal().await;
-    let outcome = wait_bounded(automation::SHUTDOWN_DEADLINE, async move {
-        state.close_all();
-        let _ = shutdown_tx.send(true);
-        server.await
-    })
-    .await;
+    tokio::select! {
+        result = &mut server => {
+            return match result {
+                Ok(server_result) => server_result,
+                Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
+            };
+        }
+        _ = shutdown_signal() => {}
+    }
+    // The deadline starts when the signal arrives, not when the process does.
+    state.close_all();
+    let _ = shutdown_tx.send(true);
+    let outcome = wait_bounded(automation::SHUTDOWN_DEADLINE, server).await;
     match outcome {
-        ShutdownWait::Finished(result) => result,
+        ShutdownWait::Finished(Ok(result)) => result,
+        ShutdownWait::Finished(Err(err)) => Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            err.to_string(),
+        )),
         ShutdownWait::Deadline => {
             // A desktop call stuck in one request never reaches the injection
             // lock. The X server drops this client's grabs when the process
