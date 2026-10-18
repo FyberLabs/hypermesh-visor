@@ -848,10 +848,13 @@ PY
     echo "attempt $attempt status $code sent ${n:-none}"
     if [[ $code == 409 && -n $n && $n -gt 0 && $n -lt 4000 ]]; then
       local qcount
+      # Press and release both carry the keysym, and xev may also log the
+      # XI2 copy. 2000 q characters are 4000 keystrokes; a full delivery is
+      # well above two lines per keystroke the server says it sent.
       qcount=$(xev_since | grep -c 'keysym 0x71, q' || true)
-      echo "xev q keypresses $qcount"
-      if (( qcount >= 2000 )); then
-        die "xev received the whole string"
+      echo "xev q keysym lines $qcount"
+      if (( qcount > n * 2 + 64 )); then
+        die "xev kept receiving q after the pause ($qcount lines, $n keystrokes)"
       fi
       return 0
     fi
