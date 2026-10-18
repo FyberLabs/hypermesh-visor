@@ -34,11 +34,11 @@ bash ci/display/run.sh x11 inject-lands
 bash ci/display/run.sh wayland
 ```
 
-X11 scenarios: `inject-lands`, `uinput-key-pauses-type`, `uinput-move-pauses`, `pausing-click-does-not-ask`, `xtest-click-does-nothing`, `watchdog-pauses`, `held-release`, `auto-resume`, `tcp-start-without-poll`.
+X11 scenarios: `key-down-detects`, `inject-lands`, `stop-resume-during-type`, `uinput-key-pauses-type`, `uinput-move-pauses`, `pausing-click-does-not-ask`, `off-bug-toggles-menu`, `xtest-click-does-nothing`, `watchdog-pauses`, `held-release`, `auto-resume`, `tcp-start-without-poll`. An unknown name exits non-zero and lists these names. `key-down-detects` holds an XTEST key down with no up and checks that `key[$code]=down` is reported. `stop-resume-during-type` posts stop and then resume while a long type is still injecting; the type is cancelled and the phase is running again. `off-bug-toggles-menu` clicks the bug while automation is off and expects the menu to open and close.
 
 `auto-resume` sets `HYPERMESH_AUTOMATION_RESUME_SECS` on the companion process so the idle resume is a couple of seconds. Unset, or set to anything that is not a positive integer, the companion keeps `automation_resume_secs` from `companion.toml`, or 120 seconds. That variable does not change the default.
 
-Wayland runs sway with `WLR_BACKENDS=headless` and `WLR_RENDERER=pixman` (no DRM node on the runner), or weston `--backend=headless` if sway does not stay up. `start`, `mouse`, and `type` must fail with the issue #17 error, and the companion must still be running. Portal and libei checks are a skipped placeholder in that script until issue #17 lands.
+The hosted Wayland job uses weston `--backend=headless` and `--socket=hm-display`. Sway does not stay up on these runners: it exits with no DRM render node, and `WLR_RENDERER=pixman` does not change that, so sway is not the path this job runs. The script still tries sway first. If a local sway stays up, the script takes the `wayland-N` socket from sway's log or from a new socket in `XDG_RUNTIME_DIR`, not a name the client exported. `start`, `mouse`, and `type` must fail with the issue #17 error, and the companion must still be running. Portal and libei checks are a skipped placeholder in that script until issue #17 lands. An unknown Wayland scenario name exits non-zero and lists `wayland-refuses-automation` and `portal-libei`.
 
 ## Release packages
 

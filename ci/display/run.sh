@@ -16,7 +16,7 @@
 set -euo pipefail
 set -m
 
-root=$(cd "$(dirname "$0")/../.." && pwd)
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
 
 DISPLAY_LOG_DIR=$root/display-logs
@@ -49,6 +49,7 @@ XTEST_POINTER='Virtual core XTEST pointer'
 XTEST_KEYBOARD='Virtual core XTEST keyboard'
 ROOT_W=
 ROOT_H=
+WAYLAND_SOCK_BEFORE=
 
 export HYPERMESH_RUNTIME_DIR=$RUNTIME
 export HYPERMESH_CONFIG_DIR=$CONFIG
@@ -57,6 +58,25 @@ unset HYPERMESH_AUTOMATION_RESUME_SECS || true
 die() {
   echo "FAIL: $*" >&2
   exit 1
+}
+
+# True when /proc/$pid still belongs to this executable. A recycled pid must
+# not be signalled. `exe` is the inode the process started; cmdline covers a
+# replaced binary whose symlink reads "(deleted)".
+pid_matches_exe() {
+  local pid=$1 expected=$2 exe raw cmd
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  [[ -r /proc/$pid/cmdline ]] || return 1
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  if [[ -n $exe && $exe == "$expected" ]]; then
+    return 0
+  fi
+  raw=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  if [[ $raw == "$expected" || $raw == "$expected (deleted)" ]]; then
+    return 0
+  fi
+  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+  [[ $cmd == "$expected" || $cmd == "$expected "* ]]
 }
 
 MAIN_BASHPID=$BASHPID
@@ -74,7 +94,14 @@ cleanup() {
     kill "$XEV_PID" 2>/dev/null || true
   fi
   if [[ -f $COMPANION_PID_FILE ]]; then
-    kill "$(cat "$COMPANION_PID_FILE")" 2>/dev/null || true
+    local cpid
+    cpid=$(cat "$COMPANION_PID_FILE" 2>/dev/null || true)
+    rm -f "$COMPANION_PID_FILE"
+    if pid_matches_exe "$cpid" "$COMPANION_BIN"; then
+      kill "$cpid" 2>/dev/null || true
+    elif [[ -n $cpid ]]; then
+      echo "not signalling pid $cpid; it is not $COMPANION_BIN" >&2
+    fi
   fi
   if [[ -n ${VISOR_PID:-} ]]; then
     kill "$VISOR_PID" 2>/dev/null || true
@@ -261,15 +288,18 @@ start_visor() {
 }
 
 stop_companion() {
-  local pid=
-  if [[ -f $COMPANION_PID_FILE ]]; then
-    pid=$(cat "$COMPANION_PID_FILE")
+  if [[ ! -f $COMPANION_PID_FILE ]]; then
+    return 0
   fi
-  if [[ -n $pid ]]; then
+  local pid
+  pid=$(cat "$COMPANION_PID_FILE" 2>/dev/null || true)
+  rm -f "$COMPANION_PID_FILE"
+  if pid_matches_exe "$pid" "$COMPANION_BIN"; then
     kill "$pid" 2>/dev/null || true
     sleep 0.2
+  elif [[ -n $pid ]]; then
+    echo "not signalling pid $pid; it is not $COMPANION_BIN" >&2
   fi
-  rm -f "$COMPANION_PID_FILE"
 }
 
 start_companion() {
@@ -347,7 +377,7 @@ ensure_companion() {
   if [[ -f $COMPANION_PID_FILE ]]; then
     pid=$(cat "$COMPANION_PID_FILE")
   fi
-  if [[ -n $pid ]] && kill -0 "$pid" 2>/dev/null; then
+  if pid_matches_exe "$pid" "$COMPANION_BIN" && kill -0 "$pid" 2>/dev/null; then
     return 0
   fi
   start_companion
@@ -453,7 +483,21 @@ button_is_down() {
 
 key_is_down() {
   local code=$1
+  # The whole token. A shorter pattern would treat key[1]=down as key 1
+  # inside key[10]=down, or stop at the first bracket.
   query_state "$XTEST_KEYBOARD" | grep -q "key\\[$code\\]=down"
+}
+
+# KeyPress records only. KeyRelease and a later event's keysym do not count.
+count_keypress() {
+  local sym=$1
+  awk -v sym="$sym" '
+    /^KeyPress / { kind = "press"; next }
+    /^KeyRelease / { kind = "release"; next }
+    /^[A-Za-z]/ { kind = ""; next }
+    kind == "press" && index($0, sym) { n++ }
+    END { print n + 0 }
+  '
 }
 
 keycode_for() {
@@ -781,6 +825,113 @@ setup_x11() {
   xinput list
 }
 
+scenario_key_down_detects() {
+  local code
+  code=$(keycode_for a)
+  [[ -n $code ]] || die "keymap has no a"
+  if key_is_down "$code"; then
+    xdotool keyup a || true
+    key_is_down "$code" && die "a was already down"
+  fi
+  # Leave the key down. key_is_down has to report that, or a later check
+  # that expects a release would pass while the key was still held.
+  xdotool keydown a
+  sleep 0.15
+  if ! key_is_down "$code"; then
+    query_state "$XTEST_KEYBOARD" >&2 || true
+    xdotool keyup a || true
+    die "key_is_down missed a held XTEST a (keycode $code)"
+  fi
+  xdotool keyup a
+  sleep 0.1
+  if key_is_down "$code"; then
+    query_state "$XTEST_KEYBOARD" >&2 || true
+    die "a stayed down after keyup"
+  fi
+  echo "key_is_down saw key[$code]=down"
+}
+
+scenario_stop_resume_during_type() {
+  ensure_companion
+  python3 - <<'PY' >"$DISPLAY_LOG_DIR/stop-resume-type.json"
+import json
+print(json.dumps({"text": "q" * 2000}))
+PY
+  local attempt code
+  for attempt in 1 2 3; do
+    ensure_running
+    http_code "$DISPLAY_LOG_DIR/type.code" POST "$BASE/session/$SID/type" @"$DISPLAY_LOG_DIR/stop-resume-type.json" &
+    local curl_pid=$!
+    local i saw=0
+    for i in $(seq 1 50); do
+      if ! kill -0 "$curl_pid" 2>/dev/null; then
+        break
+      fi
+      if [[ $(injecting) == true ]]; then
+        saw=1
+        break
+      fi
+      sleep 0.02
+    done
+    if (( saw == 0 )); then
+      wait "$curl_pid" || true
+      echo "attempt $attempt type ended before injection was visible"
+      continue
+    fi
+    socket_action stop
+    socket_action resume
+    wait "$curl_pid" || true
+    code=$(cat "$DISPLAY_LOG_DIR/type.code")
+    echo "attempt $attempt type status $code $(error_text "$HTTP_BODY")"
+    if [[ $code != 409 ]]; then
+      echo "stop did not cancel the type"
+      continue
+    fi
+    if wait_phase running 40; then
+      http_code "$DISPLAY_LOG_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":40,"y":40}'
+      [[ $(cat "$DISPLAY_LOG_DIR/last.code") == 204 ]] \
+        || die "move after resume returned $(cat "$DISPLAY_LOG_DIR/last.code") $(cat "$HTTP_BODY")"
+      [[ $(phase) == running ]] || die "move after resume left $(phase)"
+      echo "stop then resume during injection left running"
+      return 0
+    fi
+    echo "attempt $attempt ended at $(phase)"
+  done
+  die "stop then resume during injection did not leave running"
+}
+
+scenario_off_bug_toggles_menu() {
+  ensure_companion
+  ensure_off
+  local ox oy h_off h_menu h_back i
+  read -r ox oy < <(window_origin)
+  warp $((ox + 30)) $((oy + 30))
+  sleep 0.3
+  h_off=$(window_height)
+  uinput_cmd click
+  h_menu=$h_off
+  for i in $(seq 1 30); do
+    h_menu=$(window_height)
+    if (( h_menu > h_off + 40 )); then
+      break
+    fi
+    sleep 0.1
+  done
+  (( h_menu > h_off + 40 )) || die "off bug click did not open the menu ($h_off -> $h_menu)"
+  [[ $(phase) == off ]] || die "menu click moved the phase to $(phase)"
+  uinput_cmd click
+  h_back=$h_menu
+  for i in $(seq 1 30); do
+    h_back=$(window_height)
+    if (( h_back < h_off + 40 )); then
+      echo "menu toggle $h_off -> $h_menu -> $h_back"
+      return 0
+    fi
+    sleep 0.1
+  done
+  die "second off click did not close the menu ($h_menu -> $h_back)"
+}
+
 scenario_tcp_start_without_poll() {
   stop_companion
   if [[ -n $COMPANION_WAS_UP ]]; then
@@ -847,14 +998,19 @@ PY
     n=$(sent_after keystrokes)
     echo "attempt $attempt status $code sent ${n:-none}"
     if [[ $code == 409 && -n $n && $n -gt 0 && $n -lt 4000 ]]; then
-      local qcount
-      # Press and release both carry the keysym, and xev may also log the
-      # XI2 copy. 2000 q characters are 4000 keystrokes; a full delivery is
-      # well above two lines per keystroke the server says it sent.
-      qcount=$(xev_since | grep -c 'keysym 0x71, q' || true)
-      echo "xev q keysym lines $qcount"
-      if (( qcount > n * 2 + 64 )); then
-        die "xev kept receiving q after the pause ($qcount lines, $n keystrokes)"
+      sleep 0.3
+      local qpress
+      # One KeyPress per character down. Release lines and other events
+      # are ignored. The server's sent count is the ceiling: a full 2000
+      # q characters are 4000 keystrokes, and xev must not keep going.
+      qpress=$(xev_since | count_keypress 'keysym 0x71, q')
+      echo "xev q KeyPress $qpress sent $n"
+      if (( qpress == 0 )); then
+        echo "xev had not logged the q KeyPress yet"
+        continue
+      fi
+      if (( qpress > n + 64 )); then
+        die "xev KeyPress count $qpress exceeded the $n keystrokes the server sent"
       fi
       return 0
     fi
@@ -931,6 +1087,7 @@ scenario_watchdog_pauses() {
   ensure_running
   local pid start now got
   pid=$(cat "$COMPANION_PID_FILE")
+  pid_matches_exe "$pid" "$COMPANION_BIN" || die "companion pid $pid is not $COMPANION_BIN"
   kill "$pid"
   rm -f "$COMPANION_PID_FILE"
   start=$(date +%s)
@@ -1062,32 +1219,62 @@ scenario_auto_resume() {
   echo "idle resume returned to running"
 }
 
+X11_SCENARIOS=(
+  key-down-detects
+  tcp-start-without-poll
+  inject-lands
+  stop-resume-during-type
+  uinput-key-pauses-type
+  uinput-move-pauses
+  pausing-click-does-not-ask
+  off-bug-toggles-menu
+  xtest-click-does-nothing
+  watchdog-pauses
+  held-release
+  auto-resume
+)
+
+WAYLAND_SCENARIOS=(
+  wayland-refuses-automation
+  portal-libei
+)
+
+require_scenario() {
+  local only=$1
+  shift
+  local name
+  [[ -z $only ]] && return 0
+  for name in "$@"; do
+    [[ $name == "$only" ]] && return 0
+  done
+  echo "unknown scenario: $only" >&2
+  echo "valid scenarios: $*" >&2
+  exit 1
+}
+
 run_x11() {
   local only=${1:-}
+  require_scenario "$only" "${X11_SCENARIOS[@]}"
   setup_x11
-  local names=(
-    tcp-start-without-poll
-    inject-lands
-    uinput-key-pauses-type
-    uinput-move-pauses
-    pausing-click-does-not-ask
-    xtest-click-does-nothing
-    watchdog-pauses
-    held-release
-    auto-resume
-  )
-  local name limit
-  for name in "${names[@]}"; do
+  local name limit ran=0
+  for name in "${X11_SCENARIOS[@]}"; do
     if [[ -n $only && $only != "$name" ]]; then
       continue
     fi
     case $name in
-      uinput-key-pauses-type | held-release) limit=60 ;;
+      uinput-key-pauses-type | held-release | stop-resume-during-type) limit=60 ;;
       auto-resume) limit=30 ;;
+      key-down-detects) limit=20 ;;
       *) limit=45 ;;
     esac
     run_named "$name" "$limit" "scenario_${name//-/_}"
+    ran=$((ran + 1))
   done
+  if (( ran == 0 )); then
+    echo "no scenarios ran" >&2
+    echo "valid scenarios: ${X11_SCENARIOS[*]}" >&2
+    exit 1
+  fi
   echo "PHYSICAL driver=$PHYSICAL_DRIVER"
 }
 
@@ -1095,12 +1282,47 @@ x11_sockets() {
   ls /tmp/.X11-unix 2>/dev/null | sed 's/^X/:/' | sort || true
 }
 
+runtime_sockets() {
+  local dir=${XDG_RUNTIME_DIR:-}
+  [[ -n $dir && -d $dir ]] || return 0
+  find "$dir" -maxdepth 1 -type s -printf '%f\n' 2>/dev/null | sort
+}
+
+# Sway picks wayland-N itself. Weston is asked for hm-display.
+discover_wayland_socket() {
+  local before=$1 named fresh
+  if [[ -f $DISPLAY_LOG_DIR/compositor.log ]]; then
+    named=$(awk -F"'" '/wayland display/ { sock = $2 } END { print sock }' \
+      "$DISPLAY_LOG_DIR/compositor.log")
+    if [[ -n $named && -S ${XDG_RUNTIME_DIR}/$named ]]; then
+      printf '%s\n' "$named"
+      return 0
+    fi
+  fi
+  fresh=$(comm -13 <(printf '%s\n' "$before") <(runtime_sockets) \
+    | grep -E '^wayland-[0-9]+$' | head -n 1 || true)
+  if [[ -n $fresh && -S ${XDG_RUNTIME_DIR}/$fresh ]]; then
+    printf '%s\n' "$fresh"
+    return 0
+  fi
+  return 1
+}
+
 wait_for_new_display() {
-  local before=$1 label=$2 i now extra
+  local before_x11=$1 socket_mode=$2 label=$3 i sock now extra
   for i in $(seq 1 40); do
-    if [[ -S ${XDG_RUNTIME_DIR:-}/hm-display ]]; then
+    sock=
+    if [[ $socket_mode == hm-display ]]; then
+      if [[ -S ${XDG_RUNTIME_DIR:-}/hm-display ]]; then
+        sock=hm-display
+      fi
+    else
+      sock=$(discover_wayland_socket "$WAYLAND_SOCK_BEFORE" || true)
+    fi
+    if [[ -n $sock ]]; then
+      export WAYLAND_DISPLAY=$sock
       now=$(x11_sockets)
-      extra=$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$now") | head -n 1 || true)
+      extra=$(comm -13 <(printf '%s\n' "$before_x11") <(printf '%s\n' "$now") | head -n 1 || true)
       if [[ -n $extra ]]; then
         export DISPLAY=$extra
         echo "wayland compositor=$label DISPLAY=$DISPLAY WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
@@ -1116,11 +1338,11 @@ wait_for_new_display() {
 }
 
 start_compositor() {
-  local before=$1
-  shift
+  local before_x11=$1 socket_mode=$2
+  shift 2
   "$@" >"$DISPLAY_LOG_DIR/compositor.log" 2>&1 &
   COMPOSITOR_PID=$!
-  wait_for_new_display "$before" "$1"
+  wait_for_new_display "$before_x11" "$socket_mode" "$1"
 }
 
 start_wayland() {
@@ -1128,7 +1350,7 @@ start_wayland() {
   mkdir -p "$XDG_RUNTIME_DIR"
   chmod 0700 "$XDG_RUNTIME_DIR"
   export XDG_SESSION_TYPE=wayland
-  export WAYLAND_DISPLAY=hm-display
+  unset WAYLAND_DISPLAY || true
   export WLR_BACKENDS=headless
   export WLR_RENDERER=pixman
   export WLR_LIBINPUT_NO_DEVICES=1
@@ -1138,7 +1360,9 @@ start_wayland() {
 xwayland enable
 output * resolution 1280x720
 EOF
-  if start_compositor "$before" sway -c "$DISPLAY_LOG_DIR/sway.conf"; then
+  # Sway ignores a client-side WAYLAND_DISPLAY and binds wayland-N.
+  WAYLAND_SOCK_BEFORE=$(runtime_sockets)
+  if start_compositor "$before" discover sway -c "$DISPLAY_LOG_DIR/sway.conf"; then
     return 0
   fi
   echo "sway did not provide Xwayland; trying weston headless" >&2
@@ -1147,6 +1371,7 @@ EOF
     kill "$COMPOSITOR_PID" 2>/dev/null || true
     COMPOSITOR_PID=
   fi
+  unset WAYLAND_DISPLAY || true
   before=$(x11_sockets)
   cat >"$DISPLAY_LOG_DIR/weston.ini" <<'EOF'
 [core]
@@ -1157,7 +1382,8 @@ xwayland=true
 name=headless
 mode=1280x720
 EOF
-  if start_compositor "$before" weston --config "$DISPLAY_LOG_DIR/weston.ini" --socket=hm-display; then
+  WAYLAND_SOCK_BEFORE=$(runtime_sockets)
+  if start_compositor "$before" hm-display weston --config "$DISPLAY_LOG_DIR/weston.ini" --socket=hm-display; then
     return 0
   fi
   echo "weston did not provide Xwayland" >&2
@@ -1202,13 +1428,24 @@ scenario_portal_libei_placeholder() {
 
 run_wayland() {
   local only=${1:-}
+  require_scenario "$only" "${WAYLAND_SCENARIOS[@]}"
   build_bins
   start_wayland || die "no headless compositor"
-  if [[ -z $only || $only == wayland-refuses-automation ]]; then
-    run_named wayland-refuses-automation 45 scenario_wayland_refuses_automation
-  fi
-  if [[ -z $only || $only == portal-libei ]]; then
-    run_named portal-libei 15 scenario_portal_libei_placeholder
+  local name ran=0
+  for name in "${WAYLAND_SCENARIOS[@]}"; do
+    if [[ -n $only && $only != "$name" ]]; then
+      continue
+    fi
+    case $name in
+      portal-libei) run_named "$name" 15 scenario_portal_libei_placeholder ;;
+      *) run_named "$name" 45 "scenario_${name//-/_}" ;;
+    esac
+    ran=$((ran + 1))
+  done
+  if (( ran == 0 )); then
+    echo "no scenarios ran" >&2
+    echo "valid scenarios: ${WAYLAND_SCENARIOS[*]}" >&2
+    exit 1
   fi
 }
 
@@ -1232,4 +1469,6 @@ main() {
   echo "display scenarios passed"
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
