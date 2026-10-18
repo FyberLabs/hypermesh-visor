@@ -65,6 +65,12 @@ struct App {
     scroll: i32,
     /// The Wayland automation note has already been logged.
     wayland_note_logged: bool,
+    /// Config directory captured at startup. The frame loop does not look it up again.
+    config: std::path::PathBuf,
+    /// `companion-notice`, stat'ed at most once a second.
+    notice: settings::NoticeCache,
+    /// Last root pointer sample used by the fallback, including its button mask.
+    fallback_sample: Option<(i32, i32, u32)>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -99,6 +105,9 @@ pub fn run() -> Result<(), String> {
         sample_age: automation::SampleAge::default(),
         scroll: 0,
         wayland_note_logged: false,
+        config,
+        notice: settings::NoticeCache::default(),
+        fallback_sample: None,
     };
     show(app)
 }
@@ -288,6 +297,7 @@ fn show(mut app: App) -> Result<(), String> {
         }
         if !watch.accepts_raw() {
             if let Some((x, y, mask)) = pointer::root_pointer_state(&conn, root) {
+                app.fallback_sample = Some((x, y, mask));
                 let drive = snap.drive.as_ref().map(|drive| automation::FallbackDrive {
                     x: drive.x,
                     y: drive.y,
@@ -323,6 +333,7 @@ fn show(mut app: App) -> Result<(), String> {
             }
         } else {
             app.fallback = automation::FallbackTrack::default();
+            app.fallback_sample = None;
         }
         if let Some((x, y)) = click {
             app.last_used = Instant::now();
@@ -336,7 +347,13 @@ fn show(mut app: App) -> Result<(), String> {
         if !app.menu && !app.machine.asking() {
             app.scroll = 0;
         }
-        let mascot = mascot_now(&app, &snap);
+        // The frame loop does not read settings or spawn processes. Menu
+        // toggles, login, and xdg-open run only from a click. The poller
+        // snapshot is already in memory. This stat of companion-notice is
+        // skipped until a second has passed, and the file is read only when
+        // its mtime changes.
+        let upgrading_file = app.notice.current(&app.config, Instant::now());
+        let mascot = mascot_now(&app, &snap, upgrading_file);
         app.reel.set_state(mascot);
         let (frame_ms, count, looped) = app.sprites.timing(mascot);
         app.reel.advance(dt, frame_ms, count, looped);
@@ -444,12 +461,12 @@ fn note_effect(app: &mut App, effect: Effect) {
     }
 }
 
-fn mascot_now(app: &App, snap: &Snapshot) -> Mascot {
+fn mascot_now(app: &App, snap: &Snapshot, upgrading_file: bool) -> Mascot {
     let session_idle = if snap.connected { snap.idle_ms } else { None };
     let unused = mascot::unused_for_ms(app.last_used.elapsed().as_millis() as u64, session_idle);
     mascot::choose(&mascot::Signals {
         connected: snap.connected,
-        upgrading: snap.upgrading || settings::upgrading_notice(&credentials::config_dir()),
+        upgrading: snap.upgrading || upgrading_file,
         automation_running: app.machine.phase() == Phase::Running,
         unused_for_ms: unused,
         sleep_after_ms: app.sleep_after_ms,
@@ -587,6 +604,11 @@ fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_
         Action::ContinueAutomation => {
             let effect = app.machine.continue_now(now_ms);
             note_effect(app, effect);
+            if effect == Effect::Resume {
+                if let Some((x, y, mask)) = app.fallback_sample {
+                    app.fallback.rebaseline(x, y, mask);
+                }
+            }
         }
         Action::DismissAutomation => app.machine.dismiss(now_ms),
         Action::ToggleBugCursor => {

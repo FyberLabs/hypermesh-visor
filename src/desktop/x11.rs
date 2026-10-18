@@ -166,7 +166,11 @@ pub fn mouse(display: Option<&str>, op: &MouseOp) -> Result<(), DesktopError> {
         } => {
             move_abs(&conn, root, x, y)?;
             button_event(&conn, root, button, true)?;
-            move_abs(&conn, root, to_x, to_y)?;
+            if let Err(err) = move_abs(&conn, root, to_x, to_y) {
+                let _ = button_event(&conn, root, button, false);
+                let _ = conn.flush().map_err(input_err);
+                return Err(err);
+            }
             button_event(&conn, root, button, false)?;
         }
     }

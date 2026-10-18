@@ -24,9 +24,9 @@ use crate::automation::{self, Control, Notice, Phase};
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
 use crate::input::{
-    drag_steps, drag_waypoints, keys_activity, keystroke_count, mouse_activity, plan_type,
-    take_keystrokes, MouseOp, PlanError, PointerStep, TypeBody, TYPE_CHUNK_KEYSTROKES,
-    TYPE_MAX_KEYSTROKES,
+    drag_point_count, drag_steps, keys_activity, keystroke_count, mouse_activity, mouse_in_bounds,
+    plan_type, take_keystrokes, Button, MouseOp, PlanError, PointerStep, Stroke, TypeBody,
+    TYPE_CHUNK_KEYSTROKES, TYPE_MAX_KEYSTROKES,
 };
 use crate::mcp::{
     self, companion_mode, resolve_preferred, BindingCache, FocusedApp, McpAuditRow, McpAuditor,
@@ -343,22 +343,23 @@ impl AppState {
     }
 
     fn control_automation(&self, action: Control, companion: bool) -> Result<(), ApiError> {
+        if action == Control::Pause {
+            // First action of a pause: visible to an in-flight injection
+            // before this thread waits on any mutex. The phase write is the
+            // next step, under the automation lock, with no session lookup
+            // in between. Pause does not take the injection lock.
+            self.pause_epoch.fetch_add(1, Ordering::SeqCst);
+            let mut gate = lock(&self.automation);
+            return gate
+                .control(None, action)
+                .map_err(|_| ApiError::bad("start needs an open session"));
+        }
         if matches!(action, Control::Start | Control::Resume)
             && self.desktop.backend_name() == "wayland"
         {
             return Err(ApiError::not_implemented(
                 crate::desktop::WAYLAND_AUTOMATION,
             ));
-        }
-        if action == Control::Pause {
-            // Visible to an in-flight injection before this thread waits on
-            // any mutex, including the injection lock it must not take.
-            self.pause_epoch.fetch_add(1, Ordering::SeqCst);
-            let session = self.control_session();
-            let mut gate = lock(&self.automation);
-            return gate
-                .control(session, action)
-                .map_err(|_| ApiError::bad("start needs an open session"));
         }
         let _injection = lock(&self.injection);
         let session = self.control_session();
@@ -1070,12 +1071,113 @@ fn paused_after(sent: usize, unit: &str) -> ApiError {
     }
 }
 
+/// True when a pause landed after the request captured `epoch`, or the gate
+/// is already paused. Checked before admission and again before every
+/// injection call.
+fn injection_cancelled(captured: u64, current: u64, blocked: bool) -> bool {
+    current != captured || blocked
+}
+
+/// Buttons and keys this request pressed and has not released.
+enum Held {
+    Button(Button),
+    Key(u32),
+}
+
+/// Best-effort release of whatever this request pressed. Drop covers error,
+/// cancel, and panic. A finished request disarms so an intentional key-down
+/// stays down.
+struct ReleaseGuard<'a> {
+    desktop: &'a dyn Desktop,
+    held: Vec<Held>,
+    armed: bool,
+}
+
+impl<'a> ReleaseGuard<'a> {
+    fn arm(desktop: &'a dyn Desktop) -> Self {
+        Self {
+            desktop,
+            held: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+        self.held.clear();
+    }
+
+    fn note_step(&mut self, step: PointerStep) {
+        let PointerStep::Button { button, down } = step else {
+            return;
+        };
+        if down {
+            self.held.push(Held::Button(button));
+            return;
+        }
+        if let Some(index) = self
+            .held
+            .iter()
+            .rposition(|item| matches!(item, Held::Button(pressed) if *pressed == button))
+        {
+            self.held.remove(index);
+        }
+    }
+
+    fn note_strokes(&mut self, strokes: &[Stroke]) {
+        for stroke in strokes {
+            if stroke.down {
+                self.held.push(Held::Key(stroke.keysym));
+                continue;
+            }
+            if let Some(index) = self
+                .held
+                .iter()
+                .rposition(|item| matches!(item, Held::Key(key) if *key == stroke.keysym))
+            {
+                self.held.remove(index);
+            }
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        while let Some(item) = self.held.pop() {
+            match item {
+                Held::Button(button) => {
+                    let _ = self.desktop.pointer_steps(&[PointerStep::Button {
+                        button,
+                        down: false,
+                    }]);
+                }
+                Held::Key(keysym) => {
+                    let _ = self.desktop.type_input(&[Stroke {
+                        keysym,
+                        down: false,
+                    }]);
+                }
+            }
+        }
+    }
+}
+
+impl Drop for ReleaseGuard<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// A short drag is one desktop call. A longer one is pointer steps, and the
-/// latch is checked between them. A pause after the button is down releases it.
+/// latch is checked between them. [`ReleaseGuard`] releases a button this
+/// request pressed when a later step fails or the latch trips.
 fn inject_mouse(
     desktop: &dyn Desktop,
     op: &MouseOp,
     cancelled: &dyn Fn() -> bool,
+    release: &mut ReleaseGuard<'_>,
 ) -> Result<(), ApiError> {
     let MouseOp::Drag {
         x,
@@ -1085,32 +1187,31 @@ fn inject_mouse(
         button,
     } = *op
     else {
+        if cancelled() {
+            return Err(paused_after(0, "pointer steps"));
+        }
         desktop.mouse(op).map_err(ApiError::from_desktop)?;
         return Ok(());
     };
-    if drag_waypoints(x, y, to_x, to_y).len() <= 1 {
-        desktop.mouse(op).map_err(ApiError::from_desktop)?;
-        return Ok(());
+    let points =
+        drag_point_count(x, y, to_x, to_y).map_err(|_| ApiError::bad("drag is too long"))?;
+    if points <= 1 {
+        if cancelled() {
+            return Err(paused_after(0, "pointer steps"));
+        }
+        return desktop.mouse(op).map_err(ApiError::from_desktop);
     }
-    let steps = drag_steps(x, y, to_x, to_y, button);
-    let mut down = false;
+    let steps =
+        drag_steps(x, y, to_x, to_y, button).map_err(|_| ApiError::bad("drag is too long"))?;
     let mut done = 0usize;
     for step in steps {
         if cancelled() {
-            if down {
-                let _ = desktop.pointer_steps(&[PointerStep::Button {
-                    button,
-                    down: false,
-                }]);
-            }
             return Err(paused_after(done, "pointer steps"));
         }
         desktop
             .pointer_steps(&[step])
             .map_err(ApiError::from_desktop)?;
-        if let PointerStep::Button { down: pressed, .. } = step {
-            down = pressed;
-        }
+        release.note_step(step);
         done += 1;
     }
     Ok(())
@@ -1139,12 +1240,29 @@ async fn mouse(
     Json(op): Json<MouseOp>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
-    if state.desktop.backend_name() == "wayland" {
+    let backend = state.desktop.backend_name();
+    if !mouse_in_bounds(backend, &op) {
+        return Err(ApiError::bad("pointer coordinate is out of range"));
+    }
+    if let MouseOp::Drag {
+        x, y, to_x, to_y, ..
+    } = op
+    {
+        drag_point_count(x, y, to_x, to_y).map_err(|_| ApiError::bad("drag is too long"))?;
+    }
+    // Captured before the phase check. A pause that bumps the epoch after
+    // this read cannot be adopted as the baseline inside the desktop task.
+    let epoch = state.pause_epoch.load(Ordering::SeqCst);
+    if backend == "wayland" {
         return Err(ApiError::not_implemented(
             crate::desktop::WAYLAND_AUTOMATION,
         ));
     }
-    if state.drive_blocked(id) {
+    if injection_cancelled(
+        epoch,
+        state.pause_epoch.load(Ordering::SeqCst),
+        state.drive_blocked(id),
+    ) {
         return Err(ApiError::conflict("automation paused"));
     }
     if !state.mark_verb(id, Verb::Mouse) {
@@ -1159,19 +1277,25 @@ async fn mouse(
         if !state2.has_session(id) {
             return Err(ApiError::missing());
         }
-        if state2.drive_blocked(id) {
+        let cancelled = || {
+            injection_cancelled(
+                epoch,
+                state2.pause_epoch.load(Ordering::SeqCst),
+                state2.drive_blocked(id),
+            )
+        };
+        if cancelled() {
             return Err(ApiError::conflict("automation paused"));
         }
         let _injecting = InjectGuard::arm(&state2.automation);
+        let mut release = ReleaseGuard::arm(&*desktop);
         let generation = lock(&state2.automation).generation();
         let from = desktop.pointer_position().ok().flatten();
-        let epoch = state2.pause_epoch.load(Ordering::SeqCst);
-        inject_mouse(&*desktop, &op, &|| {
-            state2.pause_epoch.load(Ordering::SeqCst) != epoch || state2.drive_blocked(id)
-        })?;
-        if state2.pause_epoch.load(Ordering::SeqCst) != epoch || state2.drive_blocked(id) {
+        inject_mouse(&*desktop, &op, &cancelled, &mut release)?;
+        if cancelled() {
             return Err(ApiError::conflict("automation paused"));
         }
+        release.disarm();
         state2.record_mouse(id, &op_for_drive, from, generation);
         Ok(())
     })
@@ -1187,12 +1311,17 @@ async fn type_keys(
     Json(mut body): Json<TypeBody>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
+    let epoch = state.pause_epoch.load(Ordering::SeqCst);
     if state.desktop.backend_name() == "wayland" {
         return Err(ApiError::not_implemented(
             crate::desktop::WAYLAND_AUTOMATION,
         ));
     }
-    if state.drive_blocked(id) {
+    if injection_cancelled(
+        epoch,
+        state.pause_epoch.load(Ordering::SeqCst),
+        state.drive_blocked(id),
+    ) {
         return Err(ApiError::conflict("automation paused"));
     }
     let (secret, typed, secret_handle, key_line) = {
@@ -1242,24 +1371,36 @@ async fn type_keys(
         if state2.drive_blocked(id) {
             return Err(ApiError::conflict("automation paused"));
         }
+        let cancelled = || {
+            injection_cancelled(
+                epoch,
+                state2.pause_epoch.load(Ordering::SeqCst),
+                state2.drive_blocked(id),
+            )
+        };
+        if cancelled() {
+            return Err(ApiError::conflict("automation paused"));
+        }
         let _injecting = InjectGuard::arm(&state2.automation);
+        let mut release = ReleaseGuard::arm(&*desktop);
         let generation = lock(&state2.automation).generation();
         let at = desktop.pointer_position().ok().flatten();
-        let epoch = state2.pause_epoch.load(Ordering::SeqCst);
         let mut rest = strokes.as_slice();
         let mut sent = 0usize;
         while !rest.is_empty() {
-            if state2.pause_epoch.load(Ordering::SeqCst) != epoch || state2.drive_blocked(id) {
+            if cancelled() {
                 return Err(paused_after(sent, "keystrokes"));
             }
             let chunk = take_keystrokes(rest, TYPE_CHUNK_KEYSTROKES);
             desktop.type_input(chunk).map_err(ApiError::from_desktop)?;
+            release.note_strokes(chunk);
             sent += keystroke_count(chunk);
             rest = &rest[chunk.len()..];
         }
-        if state2.pause_epoch.load(Ordering::SeqCst) != epoch || state2.drive_blocked(id) {
+        if cancelled() {
             return Err(paused_after(sent, "keystrokes"));
         }
+        release.disarm();
         state2.record_type(id, at, generation);
         Ok(())
     })
@@ -1694,6 +1835,11 @@ mod tests {
         block_type: AtomicBool,
         /// 1-based `pointer_steps` call to block inside. `0` blocks nothing.
         block_step_call: AtomicUsize,
+        /// 1-based `pointer_steps` call that fails before it is recorded.
+        fail_step_call: AtomicUsize,
+        /// `pointer_position` waits while this is set.
+        block_pointer: AtomicBool,
+        pointer_waits: AtomicUsize,
         step_calls: AtomicUsize,
         views: AtomicUsize,
         audio_opens: AtomicUsize,
@@ -1714,6 +1860,9 @@ mod tests {
                 pointer_log: Mutex::new(Vec::new()),
                 block_type: AtomicBool::new(false),
                 block_step_call: AtomicUsize::new(0),
+                fail_step_call: AtomicUsize::new(0),
+                block_pointer: AtomicBool::new(false),
+                pointer_waits: AtomicUsize::new(0),
                 step_calls: AtomicUsize::new(0),
                 views: AtomicUsize::new(0),
                 audio_opens: AtomicUsize::new(0),
@@ -1770,8 +1919,12 @@ mod tests {
         }
 
         fn pointer_steps(&self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
-            lock(&self.pointer_log).extend_from_slice(steps);
             let n = self.step_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let fail = self.fail_step_call.load(Ordering::SeqCst);
+            if fail != 0 && n == fail {
+                return Err(DesktopError::Input("pointer step failed".into()));
+            }
+            lock(&self.pointer_log).extend_from_slice(steps);
             let hold = self.block_step_call.load(Ordering::SeqCst);
             if hold != 0 && n == hold {
                 while self.block_step_call.load(Ordering::SeqCst) == hold {
@@ -1787,6 +1940,12 @@ mod tests {
         }
 
         fn pointer_position(&self) -> Result<Option<(i32, i32)>, DesktopError> {
+            if self.block_pointer.load(Ordering::SeqCst) {
+                self.pointer_waits.fetch_add(1, Ordering::SeqCst);
+                while self.block_pointer.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             Ok(*lock(&self.pointer))
         }
 
@@ -2650,6 +2809,257 @@ while True:
                 .any(|step| matches!(step, crate::input::PointerStep::Move { x: 200, .. })),
             "{steps:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_drag_outside_the_backend_range_is_refused_before_injection() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"drag","x":0,"y":0,"to_x":40000,"to_y":0}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("out of range"), "{text}");
+        assert!(lock(&desktop.mice).is_empty());
+        assert!(lock(&desktop.pointer_log).is_empty());
+
+        desktop.wayland.store(true, Ordering::SeqCst);
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"drag","x":0,"y":0,"to_x":40000,"to_y":0}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 501, "{text}");
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":2147483647,"y":0}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("out of range"), "{text}");
+        assert!(lock(&desktop.mice).is_empty());
+        assert!(lock(&desktop.pointer_log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_pointer_step_releases_the_button() {
+        let desktop = FakeDesktop::new();
+        desktop.fail_step_call.store(3, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"drag","x":0,"y":0,"to_x":200,"to_y":0}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 502, "{text}");
+        let steps = lock(&desktop.pointer_log).clone();
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, crate::input::PointerStep::Button { down: true, .. })),
+            "{steps:?}"
+        );
+        assert!(
+            matches!(
+                steps.last(),
+                Some(crate::input::PointerStep::Button { down: false, .. })
+            ),
+            "{steps:?}"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(step, crate::input::PointerStep::Move { x: 200, .. })),
+            "{steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pause_between_key_chunks_releases_a_held_modifier() {
+        let desktop = FakeDesktop::new();
+        desktop.block_type.store(true, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let mut keys = vec![serde_json::json!({"key": "control", "action": "down"})];
+        for _ in 0..40 {
+            keys.push(serde_json::json!({"key": "a", "action": "tap"}));
+        }
+        let payload = serde_json::json!({ "keys": keys }).to_string();
+        let type_addr = addr;
+        let type_id = id;
+        let job = tokio::spawn(async move {
+            send(
+                type_addr,
+                "POST",
+                &format!("/session/{type_id}/type"),
+                Some(payload),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if lock(&desktop.typed).len() >= 63 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "the first key batch did not start");
+        let paused = tokio::time::timeout(
+            Duration::from_secs(2),
+            send(
+                addr,
+                "POST",
+                "/companion/automation",
+                Some(r#"{"action":"pause"}"#.into()),
+            ),
+        )
+        .await;
+        desktop.block_type.store(false, Ordering::SeqCst);
+        let (status, _, _) = paused.expect("pause waited on the injection lock");
+        assert_eq!(status, 204);
+        let (status, _, body) = job.await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        assert!(text.contains("after 32 keystrokes"), "{text}");
+        let typed = lock(&desktop.typed).clone();
+        assert_eq!(
+            typed.last().copied(),
+            Some(Stroke {
+                keysym: 0xffe3,
+                down: false,
+            }),
+            "{typed:?}"
+        );
+        assert_eq!(
+            typed
+                .iter()
+                .filter(|stroke| stroke.keysym == 0xffe3 && !stroke.down)
+                .count(),
+            1,
+            "{typed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pause_after_entry_cancels_before_the_pointer_call() {
+        let desktop = FakeDesktop::new();
+        desktop.block_pointer.store(true, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let move_addr = addr;
+        let move_id = id;
+        let job = tokio::spawn(async move {
+            send(
+                move_addr,
+                "POST",
+                &format!("/session/{move_id}/mouse"),
+                Some(r#"{"action":"move","x":3,"y":4}"#.into()),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if desktop.pointer_waits.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "the move did not reach the pointer query");
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"pause"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        desktop.block_pointer.store(false, Ordering::SeqCst);
+        let (status, _, body) = job.await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        assert!(
+            lock(&desktop.mice).is_empty(),
+            "the move ran after the pause"
+        );
+    }
+
+    #[test]
+    fn release_guard_releases_held_input_on_drop_and_panic() {
+        let desktop = FakeDesktop::new();
+        {
+            let mut guard = ReleaseGuard::arm(&*desktop);
+            guard.note_strokes(&[
+                Stroke {
+                    keysym: 0xffe1,
+                    down: true,
+                },
+                Stroke {
+                    keysym: 0xffe3,
+                    down: true,
+                },
+            ]);
+        }
+        let typed = lock(&desktop.typed).clone();
+        assert_eq!(
+            typed,
+            vec![
+                Stroke {
+                    keysym: 0xffe3,
+                    down: false,
+                },
+                Stroke {
+                    keysym: 0xffe1,
+                    down: false,
+                },
+            ]
+        );
+
+        let desktop = FakeDesktop::new();
+        let hooked = Arc::clone(&desktop);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = ReleaseGuard::arm(&*hooked);
+            guard.note_step(crate::input::PointerStep::Button {
+                button: crate::input::Button::Left,
+                down: true,
+            });
+            panic!("inject failed");
+        }));
+        assert!(panicked.is_err());
+        let steps = lock(&desktop.pointer_log).clone();
+        assert!(
+            matches!(
+                steps.last(),
+                Some(crate::input::PointerStep::Button { down: false, .. })
+            ),
+            "{steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_changed_pause_epoch_cancels_injection() {
+        assert!(!injection_cancelled(4, 4, false));
+        assert!(injection_cancelled(4, 5, false));
+        assert!(injection_cancelled(4, 4, true));
     }
 
     #[tokio::test]

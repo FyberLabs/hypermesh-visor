@@ -423,6 +423,9 @@ pub struct FallbackTrack {
     /// Pointer sample while automation is off. Movement here refreshes idle
     /// time and does not pause.
     idle_baseline: Option<(i32, i32, u32)>,
+    /// Button bits held when Continue rebaselined. Their release is not a
+    /// new press. Cleared on the next classification.
+    ignore_release: u32,
 }
 
 /// Pointer-fallback cases.
@@ -444,6 +447,7 @@ pub struct FallbackTrack {
 /// | Reconnect | The same `resume_seq` does not undo a local pause. A newer running snapshot follows. |
 /// | Missed poll | The epoch does not bump, so a displacement does not confirm. |
 /// | Automation off | Pointer movement and button changes refresh idle time. They do not pause, and they do not become the running baseline. |
+/// | Continue while a button is held | [`FallbackTrack::rebaseline`] stores that pointer and mask. The button-up of that click is ignored. A later press still pauses. |
 ///
 /// A drive is usable when its pointer is known and [`drive_counts`]. While an
 /// injection is outstanding, the live sample is not copied into the baseline.
@@ -514,16 +518,34 @@ fn note_idle(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
     moved
 }
 
+impl FallbackTrack {
+    /// The pointer and buttons at Continue. The release of buttons in `mask`
+    /// is not treated as a new press on the next sample.
+    pub fn rebaseline(&mut self, x: i32, y: i32, mask: u32) {
+        self.baseline = Some((x, y, mask));
+        self.baseline_ready = true;
+        self.button_mask = mask;
+        self.displacement_hold = None;
+        self.ignore_release = mask & FALLBACK_BUTTONS;
+    }
+}
+
 fn baseline_moved(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
     let Some((x, y, mask)) = track.baseline.filter(|_| track.baseline_ready) else {
         track.baseline = Some((input.x, input.y, input.mask));
         track.button_mask = input.mask;
         track.baseline_ready = true;
+        track.ignore_release = 0;
         return false;
     };
-    let moved = fallback_paused_activity(x, y, mask, input.x, input.y, input.mask);
+    let observed = input.mask | track.ignore_release;
+    let ignoring = track.ignore_release != 0;
+    let moved = fallback_paused_activity(x, y, mask, input.x, input.y, observed);
+    track.ignore_release = 0;
     if moved {
         track.baseline = Some((input.x, input.y, input.mask));
+    } else if ignoring {
+        track.baseline = Some((x, y, input.mask));
     }
     track.button_mask = input.mask;
     moved
@@ -981,6 +1003,41 @@ mod tests {
         let (pause, cleared) = consider_displacement(false, 80, 9, hold);
         assert!(!pause);
         assert!(cleared.is_none());
+    }
+
+    #[test]
+    fn continue_rebaseline_ignores_the_initiating_button_up() {
+        let button = 1 << 8;
+        let mut track = FallbackTrack::default();
+        let mut sample = running_at(10, 10, 0, 0);
+        sample.phase = Phase::Paused;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.mask = button;
+        assert!(classify_fallback(&sample, &mut track));
+        track.rebaseline(sample.x, sample.y, sample.mask);
+        sample.phase = Phase::Running;
+        sample.mask = 0;
+        sample.epoch += 1;
+        assert!(
+            !classify_fallback(&sample, &mut track),
+            "releasing Continue is not a new press"
+        );
+        sample.mask = button;
+        sample.epoch += 1;
+        assert!(classify_fallback(&sample, &mut track));
+
+        track = FallbackTrack::default();
+        sample = running_at(10, 10, button, 0);
+        sample.phase = Phase::Paused;
+        assert!(!classify_fallback(&sample, &mut track));
+        track.rebaseline(10, 10, button);
+        sample.phase = Phase::Running;
+        sample.mask = 0;
+        sample.x = 23;
+        assert!(
+            classify_fallback(&sample, &mut track),
+            "a real move with the release still pauses"
+        );
     }
 
     #[test]

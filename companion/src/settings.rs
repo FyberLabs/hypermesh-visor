@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
 
 use toml::Value;
 
@@ -61,6 +62,60 @@ pub fn upgrading_notice(dir: &Path) -> bool {
     fs::read_to_string(dir.join(NOTICE_FILE))
         .ok()
         .is_some_and(|text| text.trim() == "upgrading")
+}
+
+/// How often the window may stat `companion-notice`.
+pub const NOTICE_REFRESH: Duration = Duration::from_secs(1);
+
+/// Cached upgrading notice. The file is stat'ed at most once per refresh, and
+/// read only when the mtime changes.
+#[derive(Debug, Default)]
+pub struct NoticeCache {
+    checked_at: Option<Instant>,
+    mtime: Option<SystemTime>,
+    upgrading: bool,
+}
+
+impl NoticeCache {
+    pub fn current(&mut self, dir: &Path, now: Instant) -> bool {
+        let due = self
+            .checked_at
+            .map(|at| now.saturating_duration_since(at) >= NOTICE_REFRESH)
+            .unwrap_or(true);
+        if !due {
+            return self.upgrading;
+        }
+        let path = dir.join(NOTICE_FILE);
+        let mtime = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+        refresh_cached_notice(self, now, NOTICE_REFRESH, mtime, || upgrading_notice(dir))
+    }
+}
+
+/// Apply one refresh decision. `load` runs on the first fill and when `mtime` changes
+/// after the interval. A missing file is `mtime == None` and is not read again until
+/// that changes.
+pub fn refresh_cached_notice(
+    cache: &mut NoticeCache,
+    now: Instant,
+    interval: Duration,
+    mtime: Option<SystemTime>,
+    load: impl FnOnce() -> bool,
+) -> bool {
+    if cache
+        .checked_at
+        .is_some_and(|at| now.saturating_duration_since(at) < interval)
+    {
+        return cache.upgrading;
+    }
+    if cache.checked_at.is_some() && cache.mtime == mtime {
+        cache.checked_at = Some(now);
+        return cache.upgrading;
+    }
+    let upgrading = load();
+    cache.upgrading = upgrading;
+    cache.mtime = mtime;
+    cache.checked_at = Some(now);
+    upgrading
 }
 
 fn read_bool(dir: &Path, key: &str, default: bool) -> bool {
@@ -229,5 +284,79 @@ mod tests {
         assert!(extra.get("eyes_follow_pointer").is_none());
         assert!(eyes_follow_pointer(&dir));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_upgrading_notice_is_reread_only_after_the_interval_when_mtime_changes() {
+        let mut cache = NoticeCache::default();
+        let start = Instant::now();
+        let mtime = SystemTime::UNIX_EPOCH;
+        let mut loads = 0;
+        let first = refresh_cached_notice(&mut cache, start, NOTICE_REFRESH, Some(mtime), || {
+            loads += 1;
+            true
+        });
+        assert!(first);
+        assert_eq!(loads, 1);
+        let again = refresh_cached_notice(
+            &mut cache,
+            start + Duration::from_millis(40),
+            NOTICE_REFRESH,
+            Some(mtime + Duration::from_secs(5)),
+            || {
+                loads += 1;
+                false
+            },
+        );
+        assert!(again);
+        assert_eq!(loads, 1);
+        let same = refresh_cached_notice(
+            &mut cache,
+            start + NOTICE_REFRESH,
+            NOTICE_REFRESH,
+            Some(mtime),
+            || {
+                loads += 1;
+                false
+            },
+        );
+        assert!(same);
+        assert_eq!(loads, 1);
+        let changed = refresh_cached_notice(
+            &mut cache,
+            start + NOTICE_REFRESH + NOTICE_REFRESH,
+            NOTICE_REFRESH,
+            Some(mtime + Duration::from_secs(5)),
+            || {
+                loads += 1;
+                false
+            },
+        );
+        assert!(!changed);
+        assert_eq!(loads, 2);
+        let missing = refresh_cached_notice(
+            &mut cache,
+            start + NOTICE_REFRESH * 3,
+            NOTICE_REFRESH,
+            None,
+            || {
+                loads += 1;
+                false
+            },
+        );
+        assert!(!missing);
+        assert_eq!(loads, 3);
+        let still_missing = refresh_cached_notice(
+            &mut cache,
+            start + NOTICE_REFRESH * 4,
+            NOTICE_REFRESH,
+            None,
+            || {
+                loads += 1;
+                true
+            },
+        );
+        assert!(!still_missing);
+        assert_eq!(loads, 3);
     }
 }
