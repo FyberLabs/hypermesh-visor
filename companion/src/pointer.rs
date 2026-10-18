@@ -223,6 +223,10 @@ pub struct BugCursor {
     overlay_disabled: bool,
     /// The last overlay failure was already logged.
     overlay_noted: bool,
+    /// A cursor-creation error is permanent for this process.
+    cursor_disabled: bool,
+    /// The last cursor-creation failure was already logged.
+    cursor_noted: bool,
     shown: Option<(CursorPose, usize)>,
     depth: u8,
     visual: u32,
@@ -254,6 +258,8 @@ impl BugCursor {
             root_cursor_set: false,
             overlay_disabled: false,
             overlay_noted: false,
+            cursor_disabled: false,
+            cursor_noted: false,
             shown: None,
             depth,
             visual,
@@ -275,12 +281,23 @@ impl BugCursor {
         pose: CursorPose,
         frame: usize,
     ) -> Result<(), String> {
+        if self.cursor_disabled {
+            return Ok(());
+        }
         if self.shown == Some((pose, frame)) && self.current != 0 {
             return Ok(());
         }
         let (hot_x, hot_y) = automation::hotspot_for(CURSOR_SIZE);
         self.hot = (hot_x as i16, hot_y as i16);
-        let cursor = make_cursor(conn, self.root, image, hot_x, hot_y)?;
+        let cursor = match make_cursor(conn, self.root, image, hot_x, hot_y) {
+            Ok(cursor) => cursor,
+            Err(err) => {
+                if cursor_give_up(&mut self.cursor_disabled, &mut self.cursor_noted) {
+                    eprintln!("hypermesh-companion: cursor creation failed: {err}");
+                }
+                return Ok(());
+            }
+        };
         define(conn, self.window, cursor)?;
         let covering = self.cover_pointer(conn, image);
         if replaces_root_cursor(covering) {
@@ -535,6 +552,39 @@ fn define(conn: &RustConnection, window: u32, cursor: u32) -> Result<(), String>
     .map_err(|err| err.to_string())
 }
 
+/// Pixmap, GC, and picture allocated for one cursor. Drop frees whichever
+/// of them were created, including when `render_create_cursor` fails.
+struct CursorScratch<'a> {
+    conn: &'a RustConnection,
+    pixmap: u32,
+    gc: u32,
+    picture: u32,
+}
+
+impl Drop for CursorScratch<'_> {
+    fn drop(&mut self) {
+        if self.picture != 0 {
+            let _ = self.conn.render_free_picture(self.picture);
+        }
+        if self.gc != 0 {
+            let _ = self.conn.free_gc(self.gc);
+        }
+        if self.pixmap != 0 {
+            let _ = self.conn.free_pixmap(self.pixmap);
+        }
+    }
+}
+
+/// First failure disables further attempts and asks the caller to log once.
+pub(crate) fn cursor_give_up(disabled: &mut bool, noted: &mut bool) -> bool {
+    *disabled = true;
+    if *noted {
+        return false;
+    }
+    *noted = true;
+    true
+}
+
 fn make_cursor(
     conn: &RustConnection,
     root: u32,
@@ -543,18 +593,30 @@ fn make_cursor(
     hot_y: u16,
 ) -> Result<u32, String> {
     let format = argb_format(conn)?;
-    let pixmap = conn.generate_id().map_err(|err| err.to_string())?;
-    conn.create_pixmap(32, pixmap, root, image.width as u16, image.height as u16)
-        .map_err(|err| err.to_string())?;
-    let gc = conn.generate_id().map_err(|err| err.to_string())?;
-    conn.create_gc(gc, pixmap, &xproto::CreateGCAux::new())
+    let mut scratch = CursorScratch {
+        conn,
+        pixmap: 0,
+        gc: 0,
+        picture: 0,
+    };
+    scratch.pixmap = conn.generate_id().map_err(|err| err.to_string())?;
+    conn.create_pixmap(
+        32,
+        scratch.pixmap,
+        root,
+        image.width as u16,
+        image.height as u16,
+    )
+    .map_err(|err| err.to_string())?;
+    scratch.gc = conn.generate_id().map_err(|err| err.to_string())?;
+    conn.create_gc(scratch.gc, scratch.pixmap, &xproto::CreateGCAux::new())
         .map_err(|err| err.to_string())?;
     let lsb = conn.setup().image_byte_order == ImageOrder::LSB_FIRST;
     let data = pack_argb(image, &format.direct, lsb);
     conn.put_image(
         ImageFormat::Z_PIXMAP,
-        pixmap,
-        gc,
+        scratch.pixmap,
+        scratch.gc,
         image.width as u16,
         image.height as u16,
         0,
@@ -564,17 +626,20 @@ fn make_cursor(
         &data,
     )
     .map_err(|err| err.to_string())?;
-    let picture = conn.generate_id().map_err(|err| err.to_string())?;
-    conn.render_create_picture(picture, pixmap, format.id, &render::CreatePictureAux::new())
-        .map_err(|err| err.to_string())?;
+    scratch.picture = conn.generate_id().map_err(|err| err.to_string())?;
+    conn.render_create_picture(
+        scratch.picture,
+        scratch.pixmap,
+        format.id,
+        &render::CreatePictureAux::new(),
+    )
+    .map_err(|err| err.to_string())?;
     let cursor = conn.generate_id().map_err(|err| err.to_string())?;
-    conn.render_create_cursor(cursor, picture, hot_x, hot_y)
+    conn.render_create_cursor(cursor, scratch.picture, hot_x, hot_y)
         .map_err(|err| err.to_string())?
         .check()
         .map_err(|err| err.to_string())?;
-    let _ = conn.render_free_picture(picture);
-    let _ = conn.free_gc(gc);
-    let _ = conn.free_pixmap(pixmap);
+    drop(scratch);
     Ok(cursor)
 }
 
@@ -649,7 +714,9 @@ fn pack_visual(image: &draw::Rgba, red: u32, green: u32, blue: u32, lsb: bool) -
 
 #[cfg(test)]
 mod tests {
-    use super::{fp3232, overlay_error_disables_retry, premultiply, replaces_root_cursor};
+    use super::{
+        cursor_give_up, fp3232, overlay_error_disables_retry, premultiply, replaces_root_cursor,
+    };
 
     #[test]
     fn negative_fp3232_keeps_the_positive_fraction() {
@@ -660,6 +727,16 @@ mod tests {
         assert!((fp3232(1, 0) - 1.0).abs() < 1e-9);
         assert!((fp3232(-2, 0) + 2.0).abs() < 1e-9);
         assert!((fp3232(0, 0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_cursor_creation_failure_logs_once_and_stops_retrying() {
+        let mut disabled = false;
+        let mut noted = false;
+        assert!(cursor_give_up(&mut disabled, &mut noted));
+        assert!(disabled);
+        assert!(!cursor_give_up(&mut disabled, &mut noted));
+        assert!(disabled);
     }
 
     #[test]

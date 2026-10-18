@@ -5,7 +5,7 @@ use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
 use crate::desktop::pixels::{encode_rgba_png, zpixmap_to_rgba};
-use crate::desktop::{DesktopError, Frame, PointerPipe};
+use crate::desktop::{DesktopError, Frame, KeyboardPipe, PointerPipe};
 use crate::input::{Button, MouseOp, Stroke};
 
 const KEY_PRESS: u8 = 2;
@@ -247,35 +247,63 @@ pub(crate) fn unreleased_buttons(steps: &[crate::input::PointerStep]) -> Vec<But
     held
 }
 
-pub fn type_strokes(display: Option<&str>, strokes: &[Stroke]) -> Result<(), DesktopError> {
-    let (conn, _) = connect(display)?;
-    ensure_xtest(&conn)?;
-    let map = load_map(&conn)?;
-    let shift = find_keycode(&map, XK_SHIFT_L).map(|(code, _)| code);
-    let mut planned = Vec::with_capacity(strokes.len());
-    for stroke in strokes {
-        let (keycode, needs_shift) = find_keycode(&map, stroke.keysym).ok_or_else(|| {
-            DesktopError::Input("the session keymap has no keycode for a character".into())
-        })?;
-        planned.push((keycode, needs_shift, stroke.down));
+pub fn root_size(display: Option<&str>) -> Result<(u16, u16), DesktopError> {
+    let (conn, screen_num) = connect(display)?;
+    let screen = &conn.setup().roots[screen_num];
+    Ok((screen.width_in_pixels, screen.height_in_pixels))
+}
+
+/// One X connection and one keymap for every chunk of a type request.
+pub struct XKeyboard {
+    conn: RustConnection,
+    map: KeyMap,
+    shift: Option<u8>,
+}
+
+impl XKeyboard {
+    pub fn open(display: Option<&str>) -> Result<Self, DesktopError> {
+        let (conn, _) = connect(display)?;
+        ensure_xtest(&conn)?;
+        let map = load_map(&conn)?;
+        let shift = find_keycode(&map, XK_SHIFT_L).map(|(code, _)| code);
+        Ok(Self { conn, map, shift })
     }
-    for (keycode, needs_shift, down) in planned {
-        if needs_shift {
-            let shift = shift
-                .ok_or_else(|| DesktopError::Input("the session keymap has no shift key".into()))?;
-            if down {
-                key_event(&conn, shift, true)?;
-                key_event(&conn, keycode, true)?;
-            } else {
-                key_event(&conn, keycode, false)?;
-                key_event(&conn, shift, false)?;
-            }
-        } else {
-            key_event(&conn, keycode, down)?;
+}
+
+impl KeyboardPipe for XKeyboard {
+    fn send(&mut self, strokes: &[Stroke]) -> Result<(), DesktopError> {
+        let mut planned = Vec::with_capacity(strokes.len());
+        for stroke in strokes {
+            let (keycode, needs_shift) =
+                find_keycode(&self.map, stroke.keysym).ok_or_else(|| {
+                    DesktopError::Input("the session keymap has no keycode for a character".into())
+                })?;
+            planned.push((keycode, needs_shift, stroke.down));
         }
+        for (keycode, needs_shift, down) in planned {
+            if needs_shift {
+                let shift = self.shift.ok_or_else(|| {
+                    DesktopError::Input("the session keymap has no shift key".into())
+                })?;
+                if down {
+                    key_event(&self.conn, shift, true)?;
+                    key_event(&self.conn, keycode, true)?;
+                } else {
+                    key_event(&self.conn, keycode, false)?;
+                    key_event(&self.conn, shift, false)?;
+                }
+            } else {
+                key_event(&self.conn, keycode, down)?;
+            }
+        }
+        self.conn.flush().map_err(input_err)?;
+        Ok(())
     }
-    conn.flush().map_err(input_err)?;
-    Ok(())
+}
+
+pub fn type_strokes(display: Option<&str>, strokes: &[Stroke]) -> Result<(), DesktopError> {
+    let mut keyboard = XKeyboard::open(display)?;
+    KeyboardPipe::send(&mut keyboard, strokes)
 }
 
 fn connect(display: Option<&str>) -> Result<(RustConnection, usize), DesktopError> {

@@ -21,7 +21,7 @@ use uuid::Uuid;
 use zeroize::Zeroize;
 
 use crate::automation::{self, Control, Notice, Phase};
-use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
+use crate::desktop::{AudioRead, Desktop, DesktopError, KeyboardPipe, AUDIO_FORMAT};
 use crate::harness::{
     Agent, Harness, HarnessError, Recipe, Skill, SESSION_LIST_MAX, SESSION_TEXT_MAX,
 };
@@ -52,13 +52,13 @@ pub struct AppState {
     frames: Mutex<HashMap<Uuid, CachedFrame>>,
     /// Driving phase for the desktop companion. Mouse and type enter it.
     automation: Mutex<automation::Gate>,
-    /// Held across injection and across stop and session close.
-    /// Stop waits for an in-flight drive to finish recording, then clears it.
-    /// Pause does not take this lock. It bumps [`Self::pause_epoch`] first.
+    /// Held across a desktop injection. Pause, stop, and the gate snapshot
+    /// do not take this lock, and the gate lock is never held across a
+    /// desktop call.
     injection: Mutex<()>,
-    /// Bumped when a companion pause is requested, before any lock. An
-    /// in-flight type or drag compares this between batches and stops.
-    pause_epoch: AtomicU64,
+    /// Lock-free copy of the gate's epoch and phase. Only [`automation::Gate`]
+    /// methods store it. Injection threads load it between chunks.
+    published: Arc<AtomicU64>,
     /// Last focused app. `GET /companion` must not probe the compositor on
     /// every poll; a Wayland probe spawns a helper process.
     focus_cache: Arc<Mutex<FocusCache>>,
@@ -71,10 +71,6 @@ pub struct AppState {
     bindings: Mutex<BindingCache>,
     /// How long `running` may continue without a companion-socket poll.
     companion_poll_timeout: Duration,
-    /// Last `GET /companion` on the companion socket.
-    last_companion_poll: Mutex<Option<Instant>>,
-    /// When the gate most recently entered `running`.
-    running_since: Mutex<Option<Instant>>,
 }
 
 /// A running automation pauses when the companion socket has not polled
@@ -155,6 +151,8 @@ impl AppState {
         prompts: prompt::PromptPass,
         mcp_dir: PathBuf,
     ) -> Self {
+        let gate = automation::Gate::default();
+        let published = gate.snapshot_handle();
         Self {
             sessions: Mutex::new(HashMap::new()),
             desktop,
@@ -163,9 +161,9 @@ impl AppState {
             mcp_dir,
             mcp_audit: Mutex::new(McpAuditor::default()),
             frames: Mutex::new(HashMap::new()),
-            automation: Mutex::new(automation::Gate::default()),
+            automation: Mutex::new(gate),
             injection: Mutex::new(()),
-            pause_epoch: AtomicU64::new(0),
+            published,
             focus_cache: Arc::new(Mutex::new(FocusCache {
                 fetched_at: None,
                 value: None,
@@ -176,40 +174,19 @@ impl AppState {
             companion_poll_timeout: companion_poll_timeout_from(
                 std::env::var("HYPERMESH_COMPANION_POLL_MS").ok().as_deref(),
             ),
-            last_companion_poll: Mutex::new(None),
-            running_since: Mutex::new(None),
-        }
-    }
-
-    fn note_companion_poll(&self) {
-        *lock(&self.last_companion_poll) = Some(Instant::now());
-    }
-
-    /// While the gate is running, a companion-socket poll older than
-    /// [`Self::companion_poll_timeout`] pauses. Only a companion resume
-    /// lifts that pause. A poll from before this run does not count as
-    /// fresh: the clock starts at the later of the last poll and the moment
-    /// running began.
-    fn pause_if_companion_quiet(&self) {
-        let now = Instant::now();
-        let running = lock(&self.automation).phase() == Phase::Running;
-        if !running {
-            *lock(&self.running_since) = None;
-            return;
-        }
-        let since = {
-            let mut slot = lock(&self.running_since);
-            *slot.get_or_insert(now)
-        };
-        let last = *lock(&self.last_companion_poll);
-        let anchor = last.map(|at| at.max(since)).unwrap_or(since);
-        if now.saturating_duration_since(anchor) >= self.companion_poll_timeout {
-            let _ = self.control_automation(Control::Pause, true);
         }
     }
 
     fn close_all(&self) {
-        let _injection = lock(&self.injection);
+        self.shutdown(automation::SHUTDOWN_INJECTION_WAIT);
+    }
+
+    /// Bump the epoch so a live injection cancels at its next chunk, wait up
+    /// to `bound` for the injection lock, then reset even if that call is
+    /// still inside a desktop request.
+    fn shutdown(&self, bound: Duration) {
+        lock(&self.automation).shutdown_cancel();
+        let _held = lock_for(&self.injection, bound);
         lock(&self.sessions).clear();
         lock(&self.frames).clear();
         lock(&self.automation).reset();
@@ -400,10 +377,6 @@ impl AppState {
         });
     }
 
-    fn drive_blocked(&self, id: Uuid) -> bool {
-        lock(&self.automation).blocks(id)
-    }
-
     fn record_mouse(&self, id: Uuid, op: &MouseOp, from: Option<(i32, i32)>, generation: u64) {
         lock(&self.automation).record_mouse(id, op, from, generation, automation::unix_ms());
     }
@@ -412,30 +385,39 @@ impl AppState {
         lock(&self.automation).record_type(id, at, generation, automation::unix_ms());
     }
 
+    fn keyboard_blocked(&self) -> bool {
+        !lock(&self.automation).keyboard_interrupt()
+    }
+
     fn control_automation(&self, action: Control, companion: bool) -> Result<(), ApiError> {
-        if action == Control::Pause {
-            // First action of a pause: visible to an in-flight injection
-            // before this thread waits on any mutex. The phase write is the
-            // next step, under the automation lock, with no session lookup
-            // in between. Pause does not take the injection lock.
-            self.pause_epoch.fetch_add(1, Ordering::SeqCst);
-            let mut gate = lock(&self.automation);
-            let paused = gate
-                .control(None, action)
-                .map_err(|_| ApiError::bad("start needs an open session"));
-            drop(gate);
-            // The next running stretch starts its own quiet-poll window.
-            // A resume that lands before the watchdog notices the pause
-            // must not inherit the stretch that just ended.
-            *lock(&self.running_since) = None;
-            return paused;
-        }
         if matches!(action, Control::Start | Control::Resume)
             && self.desktop.backend_name() == "wayland"
         {
             return Err(ApiError::not_implemented(
                 crate::desktop::WAYLAND_AUTOMATION,
             ));
+        }
+        if matches!(action, Control::Start | Control::Resume) && self.keyboard_blocked() {
+            return Err(ApiError::not_implemented(automation::KEYBOARD_INTERRUPT));
+        }
+        if action == Control::Pause {
+            // Epoch and Paused are one publish. Pause does not take the
+            // injection lock and does not wait for a desktop call.
+            lock(&self.automation).pause();
+            return Ok(());
+        }
+        if action == Control::Stop {
+            // Stop does not take the injection lock. An in-flight call sees
+            // the new epoch at its next chunk; the phase stays running until
+            // that call ends.
+            let mut gate = lock(&self.automation);
+            if automation::lifts_user_pause(action, gate.phase()) && !companion {
+                return Err(ApiError::forbidden(
+                    "a paused automation can only be resumed by the companion",
+                ));
+            }
+            gate.stop();
+            return Ok(());
         }
         let _injection = lock(&self.injection);
         let session = self.control_session();
@@ -486,6 +468,9 @@ struct CompanionBody {
     /// `upgrading` when an updater published that notice. Absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     notice: Option<&'static str>,
+    /// Set when the companion cannot see physical key presses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    interrupt: Option<&'static str>,
     automation: AutomationBody,
     #[serde(skip_serializing_if = "Option::is_none")]
     session: Option<CompanionSession>,
@@ -567,6 +552,7 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
     Router::new()
         .route("/companion", get(companion))
         .route("/companion/automation", post(companion_automation))
+        .route("/companion/interrupt", post(companion_interrupt))
         .route("/companion/notice", post(companion_notice))
         .route("/session", post(open_session))
         .route("/session/:id", delete(close_session))
@@ -592,6 +578,9 @@ pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()
     let runtime = crate::companion_sock::runtime_dir()?;
     crate::companion_sock::prepare_dir(&runtime)?;
     let socket_path = crate::companion_sock::socket_file(&runtime);
+    // Held until this function returns, including across the socket replace
+    // below. A second process fails here and does not unlink the live socket.
+    let _runtime_lock = crate::companion_sock::lock_runtime(&runtime)?;
     // A second process must not unlink a live companion socket and then fail
     // the TCP bind, leaving the running visor unreachable.
     if crate::companion_sock::unix_socket_listening(&socket_path) {
@@ -858,29 +847,22 @@ async fn companion(
     Extension(CompanionLink(from_companion)): Extension<CompanionLink>,
 ) -> Json<CompanionBody> {
     if from_companion {
-        state.note_companion_poll();
+        lock(&state.automation).note_poll(Instant::now(), state.companion_poll_timeout);
+    } else {
+        lock(&state.automation).watchdog(Instant::now(), state.companion_poll_timeout);
     }
-    state.pause_if_companion_quiet();
     let session = state.companion_session();
-    let gate_session = lock(&state.automation).session();
-    let stale = gate_session.filter(|id| !state.has_session(*id));
-    if let Some(id) = stale {
-        lock(&state.automation).clear_session(id);
-    }
-    if session.is_none() {
-        let mut gate = lock(&state.automation);
-        // A user pause stays in force after the last session is gone.
-        // Closing it must not hand the pointer back to the next client.
-        if gate.phase() == Phase::Running {
-            gate.reset();
-        }
-    }
-    let (phase, resume_seq, injecting, inject_seq, last_settled_seq, drive, notice) = {
+    let (phase, resume_seq, injecting, inject_seq, last_settled_seq, drive, notice, interrupt) = {
         let gate = lock(&state.automation);
         let resume_seq = gate.resume_seq();
         let injecting = gate.injecting();
         let inject_seq = gate.inject_seq();
         let last_settled_seq = gate.last_settled_seq();
+        let interrupt = if gate.keyboard_interrupt() {
+            None
+        } else {
+            Some(automation::KEYBOARD_INTERRUPT)
+        };
         let drive = gate.drive().map(|drive| DriveBody {
             kind: drive.kind.as_str(),
             x: drive.x,
@@ -903,6 +885,7 @@ async fn companion(
             last_settled_seq,
             drive,
             gate.notice().as_str(),
+            interrupt,
         )
     };
     Json(CompanionBody {
@@ -910,6 +893,7 @@ async fn companion(
         instance: state.instance,
         backend: state.desktop.backend_name(),
         notice,
+        interrupt,
         automation: AutomationBody {
             phase,
             resume_seq,
@@ -944,6 +928,30 @@ async fn companion_automation(
 }
 
 #[derive(Deserialize)]
+struct InterruptRequest {
+    available: bool,
+}
+
+/// The companion reports that X11 cannot see key presses. Only the companion
+/// socket may set this, and only to unavailable.
+async fn companion_interrupt(
+    State(state): State<Arc<AppState>>,
+    Extension(CompanionLink(companion)): Extension<CompanionLink>,
+    Json(body): Json<InterruptRequest>,
+) -> Result<StatusCode, ApiError> {
+    if !companion {
+        return Err(ApiError::forbidden(
+            "only the companion can report a missing keyboard interrupt",
+        ));
+    }
+    if body.available {
+        return Err(ApiError::bad("keyboard interrupt cannot be re-enabled"));
+    }
+    lock(&state.automation).set_keyboard_interrupt(false);
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
 struct NoticeRequest {
     notice: String,
 }
@@ -968,8 +976,14 @@ async fn close_session(
         return Err(ApiError::missing());
     }
     lock(&state.frames).remove(&id);
-    let _injection = lock(&state.injection);
-    lock(&state.automation).clear_session(id);
+    lock(&state.automation).note_session_closed(id);
+    let state2 = Arc::clone(&state);
+    tokio::task::spawn_blocking(move || {
+        let _injection = lock(&state2.injection);
+        lock(&state2.automation).finish_closed_session(id);
+    })
+    .await
+    .map_err(|_| ApiError::internal("desktop task failed"))?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1174,11 +1188,65 @@ fn paused_after(sent: usize, unit: &str) -> ApiError {
     }
 }
 
-/// True when a pause landed after the request captured `epoch`, or the gate
-/// is already paused. Checked before admission and again before every
-/// injection call.
-fn injection_cancelled(captured: u64, current: u64, blocked: bool) -> bool {
-    current != captured || blocked
+/// True when a pause or stop landed after the request captured `epoch`, or
+/// the published phase is already paused. The word is the lock-free snapshot.
+fn injection_cancelled(captured: u64, word: u64) -> bool {
+    let (epoch, phase) = automation::unpack_snap(word);
+    epoch != captured || phase == Phase::Paused
+}
+
+fn gate_word(state: &AppState) -> u64 {
+    state.published.load(Ordering::SeqCst)
+}
+
+/// `Some` when the injection lock was free within `bound`. Shutdown keeps
+/// going when the desktop call is still inside that lock.
+fn lock_for<'a, T>(mutex: &'a Mutex<T>, bound: Duration) -> Option<std::sync::MutexGuard<'a, T>> {
+    let start = Instant::now();
+    loop {
+        match mutex.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(std::sync::TryLockError::Poisoned(err)) => return Some(err.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if start.elapsed() >= bound {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+fn coords_on_root(width: u16, height: u16, op: &MouseOp) -> bool {
+    let inside = |x: i32, y: i32| x >= 0 && y >= 0 && x < i32::from(width) && y < i32::from(height);
+    match *op {
+        MouseOp::Move { x, y, .. } | MouseOp::Click { x, y, .. } => inside(x, y),
+        MouseOp::Drag {
+            x, y, to_x, to_y, ..
+        } => inside(x, y) && inside(to_x, to_y),
+    }
+}
+
+fn with_reached(op: &MouseOp, at: Option<(i32, i32)>) -> MouseOp {
+    let Some((x, y)) = at else {
+        return op.clone();
+    };
+    match *op {
+        MouseOp::Move { clickable, .. } => MouseOp::Move { x, y, clickable },
+        MouseOp::Click { button, .. } => MouseOp::Click { x, y, button },
+        MouseOp::Drag {
+            x: from_x,
+            y: from_y,
+            button,
+            ..
+        } => MouseOp::Drag {
+            x: from_x,
+            y: from_y,
+            to_x: x,
+            to_y: y,
+            button,
+        },
+    }
 }
 
 /// Buttons and keys this request pressed and has not released.
@@ -1326,7 +1394,7 @@ fn spawn_companion_watch(state: Arc<AppState>) {
             let slice = (state.companion_poll_timeout / 4)
                 .clamp(Duration::from_millis(10), Duration::from_millis(250));
             tokio::time::sleep(slice).await;
-            state.pause_if_companion_quiet();
+            lock(&state.automation).watchdog(Instant::now(), state.companion_poll_timeout);
         }
     });
 }
@@ -1336,9 +1404,11 @@ struct InjectGuard<'a> {
 }
 
 impl<'a> InjectGuard<'a> {
-    fn arm(gate: &'a Mutex<automation::Gate>) -> Self {
-        lock(gate).begin_inject();
-        Self { gate }
+    fn arm(gate: &'a Mutex<automation::Gate>, session: Uuid, epoch: u64) -> Result<Self, ApiError> {
+        lock(gate)
+            .begin_inject(session, epoch)
+            .map_err(|_| ApiError::conflict("automation paused"))?;
+        Ok(Self { gate })
     }
 }
 
@@ -1364,20 +1434,19 @@ async fn mouse(
     {
         drag_point_count(x, y, to_x, to_y).map_err(|_| ApiError::bad("drag is too long"))?;
     }
-    state.pause_if_companion_quiet();
-    // Captured before the phase check. A pause that bumps the epoch after
-    // this read cannot be adopted as the baseline inside the desktop task.
-    let epoch = state.pause_epoch.load(Ordering::SeqCst);
+    lock(&state.automation).watchdog(Instant::now(), state.companion_poll_timeout);
+    // Captured before the phase check. A pause that publishes a new epoch
+    // after this read cannot be adopted as the baseline inside the desktop task.
+    let epoch = automation::unpack_snap(gate_word(&state)).0;
     if backend == "wayland" {
         return Err(ApiError::not_implemented(
             crate::desktop::WAYLAND_AUTOMATION,
         ));
     }
-    if injection_cancelled(
-        epoch,
-        state.pause_epoch.load(Ordering::SeqCst),
-        state.drive_blocked(id),
-    ) {
+    if state.keyboard_blocked() {
+        return Err(ApiError::not_implemented(automation::KEYBOARD_INTERRUPT));
+    }
+    if injection_cancelled(epoch, gate_word(&state)) {
         return Err(ApiError::conflict("automation paused"));
     }
     if !state.mark_verb(id, Verb::Mouse) {
@@ -1392,17 +1461,16 @@ async fn mouse(
         if !state2.has_session(id) {
             return Err(ApiError::missing());
         }
-        let cancelled = || {
-            injection_cancelled(
-                epoch,
-                state2.pause_epoch.load(Ordering::SeqCst),
-                state2.drive_blocked(id),
-            )
-        };
+        if let Some((width, height)) = desktop.root_size().map_err(ApiError::from_desktop)? {
+            if !coords_on_root(width, height, &op) {
+                return Err(ApiError::bad("pointer coordinate is out of range"));
+            }
+        }
+        let cancelled = || injection_cancelled(epoch, gate_word(&state2));
         if cancelled() {
             return Err(ApiError::conflict("automation paused"));
         }
-        let _injecting = InjectGuard::arm(&state2.automation);
+        let _injecting = InjectGuard::arm(&state2.automation, id, epoch)?;
         let mut release = ReleaseGuard::arm(&*desktop);
         let generation = lock(&state2.automation).generation();
         let from = desktop.pointer_position().ok().flatten();
@@ -1410,7 +1478,9 @@ async fn mouse(
         if cancelled() {
             return Err(ApiError::conflict("automation paused"));
         }
-        state2.record_mouse(id, &op_for_drive, from, generation);
+        let reached = desktop.pointer_position().ok().flatten();
+        let recorded = with_reached(&op_for_drive, reached);
+        state2.record_mouse(id, &recorded, from, generation);
         Ok(())
     })
     .await
@@ -1425,18 +1495,17 @@ async fn type_keys(
     Json(mut body): Json<TypeBody>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
-    state.pause_if_companion_quiet();
-    let epoch = state.pause_epoch.load(Ordering::SeqCst);
+    lock(&state.automation).watchdog(Instant::now(), state.companion_poll_timeout);
+    let epoch = automation::unpack_snap(gate_word(&state)).0;
     if state.desktop.backend_name() == "wayland" {
         return Err(ApiError::not_implemented(
             crate::desktop::WAYLAND_AUTOMATION,
         ));
     }
-    if injection_cancelled(
-        epoch,
-        state.pause_epoch.load(Ordering::SeqCst),
-        state.drive_blocked(id),
-    ) {
+    if state.keyboard_blocked() {
+        return Err(ApiError::not_implemented(automation::KEYBOARD_INTERRUPT));
+    }
+    if injection_cancelled(epoch, gate_word(&state)) {
         return Err(ApiError::conflict("automation paused"));
     }
     let (secret, typed, secret_handle, key_line) = {
@@ -1483,31 +1552,22 @@ async fn type_keys(
         if !state2.has_session(id) {
             return Err(ApiError::missing());
         }
-        if state2.drive_blocked(id) {
-            return Err(ApiError::conflict("automation paused"));
-        }
-        let cancelled = || {
-            injection_cancelled(
-                epoch,
-                state2.pause_epoch.load(Ordering::SeqCst),
-                state2.drive_blocked(id),
-            )
-        };
+        let cancelled = || injection_cancelled(epoch, gate_word(&state2));
         if cancelled() {
             return Err(ApiError::conflict("automation paused"));
         }
-        let _injecting = InjectGuard::arm(&state2.automation);
+        let _injecting = InjectGuard::arm(&state2.automation, id, epoch)?;
         let mut release = ReleaseGuard::arm(&*desktop);
         let generation = lock(&state2.automation).generation();
-        let at = desktop.pointer_position().ok().flatten();
         let mut rest = strokes.as_slice();
         let mut sent = 0usize;
+        let mut keyboard = desktop.open_keyboard().map_err(ApiError::from_desktop)?;
         while !rest.is_empty() {
             if cancelled() {
                 return Err(paused_after(sent, "keystrokes"));
             }
             let chunk = take_keystrokes(rest, TYPE_CHUNK_KEYSTROKES);
-            desktop.type_input(chunk).map_err(ApiError::from_desktop)?;
+            KeyboardPipe::send(&mut *keyboard, chunk).map_err(ApiError::from_desktop)?;
             release.note_strokes(chunk);
             sent += keystroke_count(chunk);
             rest = &rest[chunk.len()..];
@@ -1515,6 +1575,7 @@ async fn type_keys(
         if cancelled() {
             return Err(paused_after(sent, "keystrokes"));
         }
+        let at = desktop.pointer_position().ok().flatten();
         state2.record_type(id, at, generation);
         Ok(())
     })
@@ -1932,7 +1993,7 @@ mod tests {
     use super::*;
     use crate::desktop::pixels::encode_rgba_png;
     use crate::desktop::Frame;
-    use crate::desktop::PointerPipe;
+    use crate::desktop::{KeyboardPipe, PointerPipe};
     use crate::input::Stroke;
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
@@ -1957,6 +2018,8 @@ mod tests {
         pointer_waits: AtomicUsize,
         step_calls: AtomicUsize,
         pointer_sessions: AtomicUsize,
+        keyboard_sessions: AtomicUsize,
+        root_size: Mutex<Option<(u16, u16)>>,
         views: AtomicUsize,
         audio_opens: AtomicUsize,
         root: AtomicBool,
@@ -1981,6 +2044,8 @@ mod tests {
                 pointer_waits: AtomicUsize::new(0),
                 step_calls: AtomicUsize::new(0),
                 pointer_sessions: AtomicUsize::new(0),
+                keyboard_sessions: AtomicUsize::new(0),
+                root_size: Mutex::new(None),
                 views: AtomicUsize::new(0),
                 audio_opens: AtomicUsize::new(0),
                 root: AtomicBool::new(false),
@@ -2040,6 +2105,15 @@ mod tests {
             Ok(Box::new(FakePipe { desktop: self }))
         }
 
+        fn open_keyboard(&self) -> Result<Box<dyn KeyboardPipe + '_>, DesktopError> {
+            self.keyboard_sessions.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakeKeys { desktop: self }))
+        }
+
+        fn root_size(&self) -> Result<Option<(u16, u16)>, DesktopError> {
+            Ok(*lock(&self.root_size))
+        }
+
         fn pointer_steps(&self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
             let n = self.step_calls.fetch_add(1, Ordering::SeqCst) + 1;
             let fail = self.fail_step_call.load(Ordering::SeqCst);
@@ -2087,6 +2161,16 @@ mod tests {
     impl PointerPipe for FakePipe<'_> {
         fn send(&mut self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
             self.desktop.pointer_steps(steps)
+        }
+    }
+
+    struct FakeKeys<'a> {
+        desktop: &'a FakeDesktop,
+    }
+
+    impl KeyboardPipe for FakeKeys<'_> {
+        fn send(&mut self, strokes: &[Stroke]) -> Result<(), DesktopError> {
+            self.desktop.type_input(strokes)
         }
     }
 
@@ -2183,6 +2267,30 @@ mod tests {
             403
         } else {
             panic!("companion socket reply: {text}");
+        }
+    }
+
+    fn companion_interrupt(dir: &std::path::Path) -> u16 {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(crate::companion_sock::socket_file(dir))
+                .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let body = r#"{"available":false}"#;
+        let request = format!(
+            "POST /companion/interrupt HTTP/1.1\r\nhost: hypermesh\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        if text.contains(" 204 ") {
+            204
+        } else {
+            panic!("companion interrupt reply: {text}");
         }
     }
 
@@ -3483,9 +3591,257 @@ while True:
 
     #[test]
     fn a_changed_pause_epoch_cancels_injection() {
-        assert!(!injection_cancelled(4, 4, false));
-        assert!(injection_cancelled(4, 5, false));
-        assert!(injection_cancelled(4, 4, true));
+        let running = automation::pack_snap(4, Phase::Running);
+        let paused = automation::pack_snap(4, Phase::Paused);
+        let bumped = automation::pack_snap(5, Phase::Running);
+        assert!(!injection_cancelled(4, running));
+        assert!(injection_cancelled(4, bumped));
+        assert!(injection_cancelled(4, paused));
+    }
+
+    #[test]
+    fn shutdown_returns_while_an_injection_lock_is_still_held() {
+        let state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        let held = lock(&state.injection);
+        let started = Instant::now();
+        state.shutdown(Duration::from_millis(40));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "shutdown waited on the injection lock"
+        );
+        assert_eq!(lock(&state.automation).phase(), Phase::Off);
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_stop_during_injection_stays_running_until_the_call_ends() {
+        let desktop = FakeDesktop::new();
+        desktop.block_type.store(true, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let move_addr = addr;
+        let move_id = id;
+        let job = tokio::spawn(async move {
+            send(
+                move_addr,
+                "POST",
+                &format!("/session/{move_id}/type"),
+                Some(r#"{"text":"ab"}"#.into()),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (_, _, body) = send(addr, "GET", "/companion", None).await;
+                let live: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if live["automation"]["phase"] == "running"
+                    && live["automation"]["injecting"] == true
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "type did not publish running");
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"stop"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let during: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(during["automation"]["phase"], "running");
+        assert!(desktop.block_type.load(Ordering::SeqCst));
+        desktop.block_type.store(false, Ordering::SeqCst);
+        let (status, _, body) = job.await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let after: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(after["automation"]["phase"], "off");
+    }
+
+    #[tokio::test]
+    async fn deleting_the_driving_session_during_injection_does_not_reset_early() {
+        let desktop = FakeDesktop::new();
+        desktop.block_type.store(true, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let type_addr = addr;
+        let type_id = id;
+        let job = tokio::spawn(async move {
+            send(
+                type_addr,
+                "POST",
+                &format!("/session/{type_id}/type"),
+                Some(r#"{"text":"ab"}"#.into()),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (_, _, body) = send(addr, "GET", "/companion", None).await;
+                let live: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if live["automation"]["injecting"] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "type did not start");
+        let close_addr = addr;
+        let close_id = id;
+        let close = tokio::spawn(async move {
+            send(close_addr, "DELETE", &format!("/session/{close_id}"), None).await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let during: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(during["automation"]["phase"], "running");
+        assert_eq!(during["automation"]["injecting"], true);
+        desktop.block_type.store(false, Ordering::SeqCst);
+        let _ = job.await.unwrap();
+        let (status, _, _) = close.await.unwrap();
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let after: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(after["automation"]["phase"], "off");
+    }
+
+    #[tokio::test]
+    async fn a_late_socket_poll_pauses_instead_of_refreshing_the_heartbeat() {
+        let desktop = FakeDesktop::new();
+        let (addr, dir) = spawn_pair_timeout(Arc::clone(&desktop), Duration::from_millis(80)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":1,"y":2}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let sock = dir.clone();
+        let body = tokio::task::spawn_blocking(move || companion_get(&sock))
+            .await
+            .unwrap();
+        assert_eq!(body["automation"]["phase"], "paused");
+    }
+
+    #[tokio::test]
+    async fn a_missing_keyboard_interrupt_refuses_automation() {
+        let desktop = FakeDesktop::new();
+        let (addr, dir) = spawn_pair(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let sock = dir.clone();
+        let status = tokio::task::spawn_blocking(move || companion_interrupt(&sock))
+            .await
+            .unwrap();
+        assert_eq!(status, 204);
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 501, "{text}");
+        assert!(text.contains("no keyboard interrupt available"), "{text}");
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":1,"y":2}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 501, "{text}");
+        assert!(lock(&desktop.mice).is_empty());
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"text":"a"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 501);
+        let sock = dir.clone();
+        let body = tokio::task::spawn_blocking(move || companion_get(&sock))
+            .await
+            .unwrap();
+        assert_eq!(body["interrupt"], "no keyboard interrupt available");
+    }
+
+    #[tokio::test]
+    async fn a_coordinate_outside_the_root_is_refused() {
+        let desktop = FakeDesktop::new();
+        *lock(&desktop.root_size) = Some((100, 80));
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":300,"y":10}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 400, "{text}");
+        assert!(lock(&desktop.mice).is_empty());
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":10,"y":12}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn the_drive_target_is_the_pointer_after_injection() {
+        let desktop = FakeDesktop::new();
+        *lock(&desktop.pointer) = Some((7, 9));
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":10,"y":12}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let live: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(live["automation"]["drive"]["x"], 7);
+        assert_eq!(live["automation"]["drive"]["y"], 9);
+    }
+
+    #[tokio::test]
+    async fn a_long_type_uses_one_keyboard_connection() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let text = "a".repeat(64);
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(format!(r#"{{"text":"{text}"}}"#)),
+        )
+        .await;
+        let response = String::from_utf8_lossy(&body);
+        assert_eq!(status, 204, "{response}");
+        assert_eq!(desktop.keyboard_sessions.load(Ordering::SeqCst), 1);
+        assert!(lock(&desktop.typed).len() > 32);
     }
 
     #[tokio::test]

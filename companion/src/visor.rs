@@ -30,6 +30,10 @@ pub struct Poller {
     snapshot: Arc<Mutex<Cache>>,
     queue: Arc<Mutex<VecDeque<&'static str>>>,
     stop: Arc<AtomicBool>,
+    /// Set when a queued resume must not be restored after a failed post.
+    resume_dropped: Arc<AtomicBool>,
+    /// Set until the keyboard-unavailable report is accepted.
+    keyboard_report: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -41,17 +45,31 @@ impl Poller {
         }));
         let queue = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let resume_dropped = Arc::new(AtomicBool::new(false));
+        let keyboard_report = Arc::new(AtomicBool::new(false));
         let snapshot_thread = Arc::clone(&snapshot);
         let queue_thread = Arc::clone(&queue);
         let stop_thread = Arc::clone(&stop);
+        let dropped_thread = Arc::clone(&resume_dropped);
+        let keyboard_thread = Arc::clone(&keyboard_report);
         let thread = thread::Builder::new()
             .name("hypermesh-companion-visor".into())
-            .spawn(move || visor_loop(snapshot_thread, queue_thread, stop_thread))
+            .spawn(move || {
+                visor_loop(
+                    snapshot_thread,
+                    queue_thread,
+                    stop_thread,
+                    dropped_thread,
+                    keyboard_thread,
+                )
+            })
             .ok();
         Self {
             snapshot,
             queue,
             stop,
+            resume_dropped,
+            keyboard_report,
             thread,
         }
     }
@@ -62,7 +80,24 @@ impl Poller {
     }
 
     pub fn enqueue(&self, action: &'static str) {
+        if action == "resume" {
+            self.resume_dropped.store(false, Ordering::SeqCst);
+        }
         self.queue.lock().unwrap().push_back(action);
+    }
+
+    /// Drop a resume that has not been confirmed. A failed post must not put it back.
+    pub fn cancel_resume(&self) {
+        self.resume_dropped.store(true, Ordering::SeqCst);
+        self.queue
+            .lock()
+            .unwrap()
+            .retain(|action| *action != "resume");
+    }
+
+    /// Ask the visor to refuse automation until it is restarted.
+    pub fn report_keyboard_unavailable(&self) {
+        self.keyboard_report.store(true, Ordering::SeqCst);
     }
 }
 
@@ -79,17 +114,26 @@ fn visor_loop(
     snapshot: Arc<Mutex<Cache>>,
     queue: Arc<Mutex<VecDeque<&'static str>>>,
     stop: Arc<AtomicBool>,
+    resume_dropped: Arc<AtomicBool>,
+    keyboard_report: Arc<AtomicBool>,
 ) {
     let mut link = Link::new(Snapshot::disconnected());
     let mut pause_asked = false;
     while !stop.load(Ordering::SeqCst) {
+        if keyboard_report.load(Ordering::SeqCst) && post_interrupt() {
+            keyboard_report.store(false, Ordering::SeqCst);
+        }
         let batch = {
             let mut queued = queue.lock().unwrap();
             queued.drain(..).collect::<Vec<_>>()
         };
         if let Some(failed) = post_batch(&batch) {
             let mut queued = queue.lock().unwrap();
-            restore_failed_posts(&mut queued, &batch[failed..]);
+            restore_after_cancel(
+                &mut queued,
+                &batch[failed..],
+                resume_dropped.load(Ordering::SeqCst),
+            );
         }
         if stop.load(Ordering::SeqCst) {
             break;
@@ -140,6 +184,23 @@ fn post_each<'a>(batch: &[&'a str], mut post: impl FnMut(&'a str) -> bool) -> Op
 }
 
 /// A failed post goes back to the front. Newer actions stay behind it.
+fn restore_after_cancel(
+    queue: &mut VecDeque<&'static str>,
+    failed: &[&'static str],
+    resume_dropped: bool,
+) {
+    if !resume_dropped {
+        restore_failed_posts(queue, failed);
+        return;
+    }
+    let kept: Vec<&'static str> = failed
+        .iter()
+        .copied()
+        .filter(|action| *action != "resume")
+        .collect();
+    restore_failed_posts(queue, &kept);
+}
+
 fn restore_failed_posts(queue: &mut VecDeque<&'static str>, failed: &[&'static str]) {
     let mut restored: VecDeque<&'static str> = failed.iter().copied().collect();
     restored.append(queue);
@@ -236,6 +297,18 @@ fn apply_poll(
 
 fn post(action: &str) -> bool {
     let request = automation_post(action);
+    match exchange(&request) {
+        Exchange::Body(text) => status_ok(&text),
+        _ => false,
+    }
+}
+
+fn post_interrupt() -> bool {
+    let body = r#"{"available":false}"#;
+    let request = format!(
+        "POST /companion/interrupt HTTP/1.1\r\nhost: hypermesh\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
     match exchange(&request) {
         Exchange::Body(text) => status_ok(&text),
         _ => false,
@@ -691,5 +764,18 @@ mod tests {
         assert!(queue.is_empty());
         assert!(link.disconnected());
         assert!(!link.current().connected);
+    }
+
+    #[test]
+    fn a_cancelled_resume_is_not_restored_after_a_failed_post() {
+        let mut queue = VecDeque::from(["pause"]);
+        restore_after_cancel(&mut queue, &["resume", "pause"], true);
+        assert_eq!(
+            queue.into_iter().collect::<Vec<_>>(),
+            vec!["pause", "pause"]
+        );
+        let mut queue = VecDeque::new();
+        restore_after_cancel(&mut queue, &["resume"], false);
+        assert_eq!(queue.into_iter().collect::<Vec<_>>(), vec!["resume"]);
     }
 }

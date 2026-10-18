@@ -34,6 +34,8 @@ pub const INJECT_HOLD_MS: u64 = 2_000;
 /// Menu note and log line while the visor backend is the Wayland portal.
 pub const WAYLAND_AUTOMATION_NOTE: &str =
     "Automation is disabled on Wayland until the portal backend lands (#17)";
+/// Menu note and visor report when X11 cannot see a physical key press.
+pub const KEYBOARD_INTERRUPT_NOTE: &str = "no keyboard interrupt available";
 
 /// A Wayland visor does not drive the desktop until issue #17. The companion
 /// keeps idle, sleeping, disconnected, and upgrading, and does not enter the
@@ -235,8 +237,16 @@ impl Machine {
     }
 
     /// The visor could not be polled. A local pause stays paused so the
-    /// unsent pause can be posted again when the visor returns.
+    /// unsent pause can be posted again when the visor returns. A resume
+    /// that has not been confirmed stays paused too, so later input still
+    /// restarts the timer instead of being ignored on `off`.
     pub fn note_disconnect(&mut self) {
+        if self.holding_resume {
+            self.phase = Phase::Paused;
+            self.asking = false;
+            self.holding_resume = false;
+            return;
+        }
         if self.phase == Phase::Paused {
             return;
         }
@@ -541,7 +551,7 @@ fn baseline_moved(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
     let observed = input.mask | track.ignore_release;
     let ignoring = track.ignore_release != 0;
     let moved = fallback_paused_activity(x, y, mask, input.x, input.y, observed);
-    track.ignore_release = 0;
+    track.ignore_release &= input.mask & FALLBACK_BUTTONS;
     if moved {
         track.baseline = Some((input.x, input.y, input.mask));
     } else if ignoring {
@@ -933,6 +943,20 @@ mod tests {
     }
 
     #[test]
+    fn a_disconnect_during_a_local_resume_stays_paused() {
+        let mut machine = Machine::new(1_000);
+        machine.see_visor(VisorPhase::Running, 0, 0);
+        machine.user_input(10);
+        machine.ask(15);
+        assert_eq!(machine.continue_now(20), Effect::Resume);
+        machine.note_disconnect();
+        assert_eq!(machine.phase(), Phase::Paused);
+        assert_eq!(machine.user_input(30), Effect::None);
+        assert_eq!(machine.poll(30 + 999), Effect::None);
+        assert_eq!(machine.poll(30 + 1_000), Effect::Resume);
+    }
+
+    #[test]
     fn disconnect_without_a_pause_clears_a_running_automation() {
         let mut machine = Machine::new(1_000);
         machine.see_visor(VisorPhase::Running, 0, 0);
@@ -1024,6 +1048,29 @@ mod tests {
         );
         sample.mask = button;
         sample.epoch += 1;
+        assert!(classify_fallback(&sample, &mut track));
+
+        track = FallbackTrack::default();
+        sample = running_at(10, 10, 0, 0);
+        sample.phase = Phase::Paused;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.mask = button;
+        assert!(classify_fallback(&sample, &mut track));
+        track.rebaseline(sample.x, sample.y, sample.mask);
+        sample.phase = Phase::Running;
+        sample.epoch += 1;
+        assert!(
+            !classify_fallback(&sample, &mut track),
+            "holding Continue across the next sample does not pause"
+        );
+        sample.epoch += 1;
+        sample.mask = 0;
+        assert!(
+            !classify_fallback(&sample, &mut track),
+            "releasing the last ignored button does not pause"
+        );
+        sample.epoch += 1;
+        sample.mask = button;
         assert!(classify_fallback(&sample, &mut track));
 
         track = FallbackTrack::default();

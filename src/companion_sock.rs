@@ -127,6 +127,39 @@ pub fn unix_socket_listening(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
+/// Held for the visor's lifetime. Dropping the file releases the lock.
+#[derive(Debug)]
+pub struct RuntimeLock {
+    _file: fs::File,
+}
+
+/// Exclusive non-blocking lock on `companion.lock` in the runtime directory.
+/// A second visor fails with `visor already running` before it can replace
+/// the socket.
+pub fn lock_runtime(dir: &Path) -> io::Result<RuntimeLock> {
+    let path = dir.join("companion.lock");
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&path)?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        let err = io::Error::last_os_error();
+        let code = err.raw_os_error();
+        let blocked = code == Some(libc::EAGAIN) || code == Some(libc::EWOULDBLOCK);
+        if blocked {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                "visor already running",
+            ));
+        }
+        return Err(err);
+    }
+    let _ = enforce_private(&path, 0o600);
+    Ok(RuntimeLock { _file: file })
+}
+
 pub async fn bind(dir: &Path) -> io::Result<UnixListener> {
     let path = socket_file(dir);
     if unix_socket_listening(&path) {
@@ -366,6 +399,25 @@ mod tests {
         assert!(!unix_socket_listening(&path));
         let replaced = bind(&dir).await.unwrap();
         drop(replaced);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_visor_cannot_take_the_runtime_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "hypermesh-visor-lock-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        prepare_dir(&dir).unwrap();
+        let first = lock_runtime(&dir).unwrap();
+        let err = lock_runtime(&dir).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("visor already running"));
+        drop(first);
+        let second = lock_runtime(&dir).unwrap();
+        drop(second);
         let _ = fs::remove_dir_all(&dir);
     }
 }

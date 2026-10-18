@@ -65,6 +65,8 @@ struct App {
     scroll: i32,
     /// The Wayland automation note has already been logged.
     wayland_note_logged: bool,
+    /// The missing-keyboard note has already been logged and reported.
+    keyboard_note_logged: bool,
     /// Config directory captured at startup. The frame loop does not look it up again.
     config: std::path::PathBuf,
     /// `companion-notice`, stat'ed at most once a second.
@@ -105,6 +107,7 @@ pub fn run() -> Result<(), String> {
         sample_age: automation::SampleAge::default(),
         scroll: 0,
         wayland_note_logged: false,
+        keyboard_note_logged: false,
         config,
         notice: settings::NoticeCache::default(),
         fallback_sample: None,
@@ -231,6 +234,14 @@ fn show(mut app: App) -> Result<(), String> {
             );
             app.wayland_note_logged = true;
         }
+        if !wayland && !watch.accepts_raw() && !app.keyboard_note_logged {
+            eprintln!(
+                "hypermesh-companion: {}",
+                automation::KEYBOARD_INTERRUPT_NOTE
+            );
+            app.poller.report_keyboard_unavailable();
+            app.keyboard_note_logged = true;
+        }
         let visor_phase = if snap.connected {
             automation::displayed_visor_phase(wayland, snap.phase)
         } else {
@@ -247,6 +258,10 @@ fn show(mut app: App) -> Result<(), String> {
             }
         } else {
             app.machine.note_disconnect();
+            if app.pending.as_deref() == Some("resume") {
+                app.pending = None;
+            }
+            app.poller.cancel_resume();
         }
         if snap.connected {
             let prior = app.seen_resume_seq;
@@ -268,7 +283,7 @@ fn show(mut app: App) -> Result<(), String> {
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
             if let Some(live) = watch.observe(&event) {
                 let effect = app.machine.user_input(now_ms);
-                note_effect(&mut app, effect);
+                note_user_input(&mut app, effect);
                 app.last_used = Instant::now();
                 match live {
                     LiveInput::Button => app.click_at = Some(now_ms),
@@ -326,7 +341,7 @@ fn show(mut app: App) -> Result<(), String> {
                         app.last_used = Instant::now();
                     } else {
                         let effect = app.machine.user_input(now_ms);
-                        note_effect(&mut app, effect);
+                        note_user_input(&mut app, effect);
                         app.last_used = Instant::now();
                     }
                 }
@@ -375,6 +390,8 @@ fn show(mut app: App) -> Result<(), String> {
             app.bug_cursor,
             if wayland && app.menu {
                 Some(automation::WAYLAND_AUTOMATION_NOTE)
+            } else if !wayland && !watch.accepts_raw() && app.menu {
+                Some(automation::KEYBOARD_INTERRUPT_NOTE)
             } else {
                 None
             },
@@ -441,6 +458,14 @@ fn arm_signals() {
         libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
         libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
     }
+}
+
+fn note_user_input(app: &mut App, effect: Effect) {
+    app.poller.cancel_resume();
+    if app.pending.as_deref() == Some("resume") {
+        app.pending = None;
+    }
+    note_effect(app, effect);
 }
 
 fn note_effect(app: &mut App, effect: Effect) {
@@ -594,7 +619,7 @@ fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_
                 app.machine.ask(now_ms);
             } else if app.machine.phase() == Phase::Running {
                 let effect = app.machine.user_input(now_ms);
-                note_effect(app, effect);
+                note_user_input(app, effect);
             } else if app.machine.phase() == Phase::Paused {
                 // This click is the one that paused the automation.
             } else {

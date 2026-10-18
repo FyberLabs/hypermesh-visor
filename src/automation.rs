@@ -5,9 +5,20 @@
 //! the session. `clickable` on a move is reported by the caller. This process
 //! does not discover clickable targets.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use uuid::Uuid;
 
 use crate::input::MouseOp;
+
+/// Shown when X11 cannot see a physical key press. Start, resume, mouse, and
+/// type refuse with this sentence, the same way Wayland refuses automation.
+pub const KEYBOARD_INTERRUPT: &str = "no keyboard interrupt available";
+
+/// How long shutdown waits for an in-flight injection before it continues.
+pub const SHUTDOWN_INJECTION_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -110,7 +121,7 @@ pub struct Drive {
     pub inject_seq: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Gate {
     session: Option<Uuid>,
     phase: Phase,
@@ -133,6 +144,25 @@ pub struct Gate {
     last_settled_seq: u64,
     /// True from the moment an injection starts until its desktop call returns.
     injecting: bool,
+    /// Stop arrived while an injection held the desktop. Applied in
+    /// [`Gate::end_inject`] unless a pause latched first.
+    pending_stop: bool,
+    /// The driving session closed while an injection was in flight. Applied
+    /// in [`Gate::end_inject`], not from a companion poll.
+    closed_during_inject: bool,
+    /// Cancellation generation. Published with the phase in one word.
+    epoch: u64,
+    /// When the current running stretch began. A later start or resume
+    /// replaces it. Pause and stop clear it.
+    running_since: Option<Instant>,
+    /// Last companion-socket poll that was still inside the quiet window.
+    last_poll: Option<Instant>,
+    /// False after the companion reports that X11 cannot see key presses.
+    keyboard_interrupt: bool,
+    /// Lock-free view for injection threads. Bits 0–1 are the phase
+    /// (`0` off, `1` running, `2` paused) and bits 2–63 are [`Self::epoch`].
+    /// Only [`Gate`] methods store it.
+    published: Arc<AtomicU64>,
 }
 
 impl Default for Gate {
@@ -149,8 +179,34 @@ impl Default for Gate {
             inject_seq: 0,
             last_settled_seq: 0,
             injecting: false,
+            pending_stop: false,
+            closed_during_inject: false,
+            epoch: 0,
+            running_since: None,
+            last_poll: None,
+            keyboard_interrupt: true,
+            published: Arc::new(AtomicU64::new(0)),
         }
     }
+}
+
+/// Phase packed into the low two bits of the published word.
+pub fn pack_snap(epoch: u64, phase: Phase) -> u64 {
+    let bits = match phase {
+        Phase::Off => 0,
+        Phase::Running => 1,
+        Phase::Paused => 2,
+    };
+    (epoch << 2) | bits
+}
+
+pub fn unpack_snap(word: u64) -> (u64, Phase) {
+    let phase = match word & 0b11 {
+        1 => Phase::Running,
+        2 => Phase::Paused,
+        _ => Phase::Off,
+    };
+    (word >> 2, phase)
 }
 
 impl Gate {
@@ -194,25 +250,100 @@ impl Gate {
         self.last_settled_seq
     }
 
-    /// Mark an injection before the desktop call. The sequence is the value
-    /// the drive will store if this injection records.
-    pub fn begin_inject(&mut self) -> u64 {
+    #[allow(dead_code)]
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn keyboard_interrupt(&self) -> bool {
+        self.keyboard_interrupt
+    }
+
+    /// The companion posts this once when X11 cannot see key presses.
+    /// `false` stays until the process exits.
+    pub fn set_keyboard_interrupt(&mut self, available: bool) {
+        if available {
+            return;
+        }
+        self.keyboard_interrupt = false;
+    }
+
+    /// Shared with request threads. Loading it does not take the gate lock.
+    pub fn snapshot_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.published)
+    }
+
+    /// Mark an injection before the desktop call. The phase becomes `running`
+    /// in the same step, unless a pause or a newer epoch already won.
+    /// The sequence is the value the drive will store if this injection records.
+    pub fn begin_inject(&mut self, session: Uuid, captured_epoch: u64) -> Result<u64, ()> {
+        if self.epoch != captured_epoch || self.phase == Phase::Paused {
+            return Err(());
+        }
         self.inject_seq = self.inject_seq.saturating_add(1);
         self.injecting = true;
-        self.inject_seq
+        if self.phase != Phase::Running {
+            self.running_since = Some(Instant::now());
+            self.phase = Phase::Running;
+        }
+        self.session = Some(session);
+        self.publish();
+        Ok(self.inject_seq)
     }
 
     /// The desktop call returned. A failure records no drive, so this sequence
     /// is settled on its own and the companion does not keep deferring.
+    /// A stop or a session close that arrived during the call is applied here,
+    /// after the call has stopped at its last chunk.
     pub fn end_inject(&mut self) {
         self.injecting = false;
         self.last_settled_seq = self.last_settled_seq.max(self.inject_seq);
+        let stop = self.pending_stop;
+        let closed = self.closed_during_inject;
+        self.pending_stop = false;
+        self.closed_during_inject = false;
+        if stop && self.phase != Phase::Paused {
+            self.reset();
+            return;
+        }
+        if closed {
+            if let Some(id) = self.session {
+                self.clear_session(id);
+                return;
+            }
+        }
+        self.publish();
     }
 
     /// A pause covers the whole desktop. Every session injects into the same
     /// pointer, so another session must not move it until resume.
+    #[allow(dead_code)]
     pub fn blocks(&self, _session: Uuid) -> bool {
         self.phase == Phase::Paused
+    }
+
+    /// The driving session went away. While an injection is in flight the
+    /// phase stays put; [`Gate::end_inject`] applies the close.
+    pub fn note_session_closed(&mut self, session: Uuid) {
+        if self.session != Some(session) {
+            return;
+        }
+        if self.injecting {
+            self.closed_during_inject = true;
+            return;
+        }
+        self.bump_epoch();
+        self.clear_session(session);
+    }
+
+    /// Called once the injection lock is free. A close that [`Gate::end_inject`]
+    /// already applied is a no-op.
+    pub fn finish_closed_session(&mut self, session: Uuid) {
+        if self.injecting {
+            self.closed_during_inject = self.session == Some(session);
+            return;
+        }
+        self.clear_session(session);
     }
 
     /// Losing the driving session ends a running automation. A user pause
@@ -225,6 +356,7 @@ impl Gate {
             self.session = None;
             self.drive = None;
             self.generation = self.generation.wrapping_add(1);
+            self.publish();
             return;
         }
         self.reset();
@@ -238,14 +370,73 @@ impl Gate {
         let resume_seq = self.resume_seq;
         let inject_seq = self.inject_seq;
         let last_settled_seq = self.last_settled_seq;
+        let epoch = self.epoch;
+        let published = Arc::clone(&self.published);
+        let keyboard_interrupt = self.keyboard_interrupt;
+        let last_poll = self.last_poll;
         *self = Self {
             notice,
             generation,
             resume_seq,
             inject_seq,
             last_settled_seq,
+            epoch,
+            published,
+            keyboard_interrupt,
+            last_poll,
             ..Self::default()
         };
+        self.publish();
+    }
+
+    /// Epoch and `paused` land in one published word. A request cannot
+    /// observe the new epoch with the old phase.
+    pub fn pause(&mut self) {
+        self.bump_epoch();
+        self.phase = Phase::Paused;
+        self.running_since = None;
+        // A stop that was waiting for this injection must not wipe the latch
+        // when the call returns.
+        self.pending_stop = false;
+        self.publish();
+    }
+
+    /// Cancel an in-flight injection, then let shutdown proceed. The phase
+    /// stays until [`Gate::reset`] after the bounded wait.
+    pub fn shutdown_cancel(&mut self) {
+        self.bump_epoch();
+        self.pending_stop = true;
+        self.publish();
+    }
+
+    /// Companion-socket poll. An already-expired gap pauses and this poll
+    /// is not stored as a fresh heartbeat.
+    pub fn note_poll(&mut self, now: Instant, timeout: Duration) -> bool {
+        if self.phase == Phase::Running && self.gap_expired(now, timeout) {
+            self.pause();
+            return true;
+        }
+        self.last_poll = Some(now);
+        if self.phase != Phase::Running {
+            self.running_since = None;
+        }
+        false
+    }
+
+    /// Watchdog tick. Does not record a poll. A running stretch with no
+    /// clock yet starts one instead of pausing on the first look.
+    pub fn watchdog(&mut self, now: Instant, timeout: Duration) {
+        if self.phase != Phase::Running {
+            self.running_since = None;
+            return;
+        }
+        if self.running_since.is_none() {
+            self.running_since = Some(now);
+            return;
+        }
+        if self.gap_expired(now, timeout) {
+            self.pause();
+        }
     }
 
     /// `start` needs the session the companion is showing. The other actions
@@ -256,19 +447,14 @@ impl Gate {
                 let Some(id) = session else {
                     return Err(());
                 };
-                self.session = Some(id);
-                self.phase = Phase::Running;
-                // A sample from the previous drive would look like a user move
-                // to the pointer fallback the moment this start is running.
-                self.drive = None;
-                self.bump_resume();
+                self.enter_running(id);
                 Ok(())
             }
             Control::Pause => {
                 // A companion pause is a latch. It applies from running, off,
                 // or any other phase, so a TCP stop that landed first cannot
                 // leave the gate open for the next injection.
-                self.phase = Phase::Paused;
+                self.pause();
                 Ok(())
             }
             Control::Resume => {
@@ -282,21 +468,27 @@ impl Gate {
                     self.reset();
                     return Ok(());
                 };
-                self.session = Some(id);
-                self.phase = Phase::Running;
-                // The pointer is already away from this sample; that is
-                // why the automation paused. Leave the last point so a
-                // later type still has somewhere to land, but do not let
-                // the fallback compare against the pre-pause target.
-                self.drive = None;
-                self.bump_resume();
+                self.enter_running(id);
                 Ok(())
             }
             Control::Stop => {
-                self.reset();
+                self.stop();
                 Ok(())
             }
         }
+    }
+
+    /// While an injection is in flight, stop only cancels it. The phase stays
+    /// `running` until [`Gate::end_inject`], so a companion can still pause
+    /// and a TCP stop cannot publish `off` underneath the call.
+    pub fn stop(&mut self) {
+        self.bump_epoch();
+        if self.injecting {
+            self.pending_stop = true;
+            self.publish();
+            return;
+        }
+        self.reset();
     }
 
     pub fn record_mouse(
@@ -362,6 +554,35 @@ impl Gate {
         self.resume_seq = self.resume_seq.saturating_add(1);
     }
 
+    fn bump_epoch(&mut self) {
+        self.epoch = self.epoch.saturating_add(1);
+    }
+
+    fn enter_running(&mut self, session: Uuid) {
+        self.session = Some(session);
+        // A sample from the previous drive would look like a user move
+        // to the pointer fallback the moment this stretch is running.
+        // The pointer is already away from a pre-pause sample. Leave the
+        // last point so a later type still has somewhere to land, but do
+        // not let the fallback compare against that target.
+        self.drive = None;
+        self.running_since = Some(Instant::now());
+        self.phase = Phase::Running;
+        self.bump_resume();
+        self.publish();
+    }
+
+    fn gap_expired(&self, now: Instant, timeout: Duration) -> bool {
+        let since = self.running_since.unwrap_or(now);
+        let anchor = self.last_poll.map(|at| at.max(since)).unwrap_or(since);
+        now.saturating_duration_since(anchor) >= timeout
+    }
+
+    fn publish(&self) {
+        self.published
+            .store(pack_snap(self.epoch, self.phase), Ordering::SeqCst);
+    }
+
     fn store(
         &mut self,
         session: Uuid,
@@ -379,6 +600,9 @@ impl Gate {
             .map(|then| now_ms.saturating_sub(then).min(u32::MAX as u64) as u32)
             .unwrap_or(0);
         self.session = Some(session);
+        if self.phase != Phase::Running {
+            self.running_since = Some(Instant::now());
+        }
         self.phase = Phase::Running;
         if pointer_known {
             self.pointer = Some((x, y));
@@ -402,6 +626,7 @@ impl Gate {
             resume_seq: self.resume_seq,
             inject_seq: self.inject_seq,
         });
+        self.publish();
     }
 }
 
@@ -799,8 +1024,9 @@ mod tests {
     fn an_injection_keeps_its_sequence_after_the_flag_drops() {
         let mut gate = Gate::default();
         let id = Uuid::new_v4();
-        assert_eq!(gate.begin_inject(), 1);
+        assert_eq!(gate.begin_inject(id, gate.epoch()).unwrap(), 1);
         assert!(gate.injecting());
+        assert_eq!(gate.phase(), Phase::Running);
         gate.record_mouse(
             id,
             &MouseOp::Click {
@@ -817,11 +1043,11 @@ mod tests {
         assert!(!gate.injecting());
         assert_eq!(gate.inject_seq(), 1);
         assert_eq!(gate.last_settled_seq(), 1);
-        gate.begin_inject();
+        gate.begin_inject(id, gate.epoch()).unwrap();
         gate.end_inject();
         assert_eq!(gate.last_settled_seq(), 2);
         assert!(gate.drive().unwrap().inject_seq < gate.last_settled_seq());
-        gate.begin_inject();
+        gate.begin_inject(id, gate.epoch()).unwrap();
         gate.reset();
         assert!(!gate.injecting());
         assert_eq!(gate.last_settled_seq(), 2);
@@ -830,5 +1056,118 @@ mod tests {
             3,
             "reset must not reuse an in-flight sequence"
         );
+    }
+
+    #[test]
+    fn begin_inject_publishes_running_before_any_drive() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let handle = gate.snapshot_handle();
+        let epoch = gate.epoch();
+        assert_eq!(gate.begin_inject(id, epoch).unwrap(), 1);
+        let (seen, phase) = unpack_snap(handle.load(Ordering::SeqCst));
+        assert_eq!(phase, Phase::Running);
+        assert_eq!(seen, epoch);
+        assert!(gate.injecting());
+        assert!(gate.drive().is_none());
+        let stale = gate.epoch();
+        gate.pause();
+        assert!(gate.begin_inject(id, stale).is_err());
+        assert_eq!(gate.phase(), Phase::Paused);
+    }
+
+    #[test]
+    fn pause_publishes_the_epoch_and_paused_together() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.control(Some(id), Control::Start).unwrap();
+        let handle = gate.snapshot_handle();
+        let before = unpack_snap(handle.load(Ordering::SeqCst)).0;
+        gate.pause();
+        let word = handle.load(Ordering::SeqCst);
+        let (epoch, phase) = unpack_snap(word);
+        assert_eq!(epoch, before + 1);
+        assert_eq!(phase, Phase::Paused);
+        assert_eq!(word, pack_snap(epoch, Phase::Paused));
+        assert_eq!(gate.phase(), Phase::Paused);
+    }
+
+    #[test]
+    fn a_stop_during_injection_waits_for_the_call_to_finish() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let epoch = gate.epoch();
+        gate.begin_inject(id, epoch).unwrap();
+        gate.control(None, Control::Stop).unwrap();
+        assert_eq!(gate.phase(), Phase::Running);
+        assert!(gate.injecting());
+        assert_ne!(gate.epoch(), epoch);
+        assert!(gate.begin_inject(id, epoch).is_err());
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Off);
+        assert!(!gate.injecting());
+        assert!(gate.drive().is_none());
+    }
+
+    #[test]
+    fn a_pause_during_injection_keeps_the_latch_over_a_pending_stop() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.begin_inject(id, gate.epoch()).unwrap();
+        gate.stop();
+        gate.pause();
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert!(gate.blocks(id));
+    }
+
+    #[test]
+    fn a_late_poll_pauses_before_it_is_recorded() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.control(Some(id), Control::Start).unwrap();
+        let timeout = Duration::from_secs(2);
+        let late = Instant::now() + Duration::from_secs(10);
+        assert!(gate.note_poll(late, timeout));
+        assert_eq!(gate.phase(), Phase::Paused);
+        gate.control(Some(id), Control::Resume).unwrap();
+        gate.watchdog(late, timeout);
+        assert_eq!(
+            gate.phase(),
+            Phase::Paused,
+            "the expired poll must not become the heartbeat of the new stretch"
+        );
+    }
+
+    #[test]
+    fn a_new_running_stretch_resets_the_watchdog_clock() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.control(Some(id), Control::Start).unwrap();
+        std::thread::sleep(Duration::from_millis(80));
+        gate.control(None, Control::Stop).unwrap();
+        gate.control(Some(id), Control::Start).unwrap();
+        gate.watchdog(
+            Instant::now() + Duration::from_millis(50),
+            Duration::from_millis(100),
+        );
+        assert_eq!(
+            gate.phase(),
+            Phase::Running,
+            "a stop then start must not inherit the previous stretch"
+        );
+    }
+
+    #[test]
+    fn closing_the_session_during_injection_does_not_reset_until_the_call_ends() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.begin_inject(id, gate.epoch()).unwrap();
+        gate.note_session_closed(id);
+        assert_eq!(gate.phase(), Phase::Running);
+        assert!(gate.injecting());
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Off);
+        assert!(!gate.injecting());
     }
 }

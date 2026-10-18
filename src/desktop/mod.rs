@@ -71,6 +71,14 @@ pub trait Desktop: Send + Sync {
     fn pointer_steps(&self, steps: &[PointerStep]) -> Result<(), DesktopError>;
     /// One connection for a stepped drag. Batches go through [`PointerPipe::send`].
     fn open_pointer(&self) -> Result<Box<dyn PointerPipe + '_>, DesktopError>;
+    /// One connection and keymap for every chunk of a type request.
+    fn open_keyboard(&self) -> Result<Box<dyn KeyboardPipe + '_>, DesktopError>;
+
+    /// Root window size in pixels, when the backend can read it. Coordinates
+    /// outside this rectangle are refused before injection. Default: unknown.
+    fn root_size(&self) -> Result<Option<(u16, u16)>, DesktopError> {
+        Ok(None)
+    }
 
     /// Current pointer, when the backend can read it. Used to tell a long
     /// automation move from a short one. Default: unknown.
@@ -93,6 +101,11 @@ pub trait Desktop: Send + Sync {
 /// Pointer events on one backend connection.
 pub trait PointerPipe: Send {
     fn send(&mut self, steps: &[PointerStep]) -> Result<(), DesktopError>;
+}
+
+/// Key strokes on one backend connection and one keymap.
+pub trait KeyboardPipe: Send {
+    fn send(&mut self, strokes: &[Stroke]) -> Result<(), DesktopError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +230,20 @@ impl Desktop for LinuxDesktop {
         match choose_backend(&self.env)? {
             BackendKind::X11 => Ok(Box::new(x11::XPointer::open(self.env.display.as_deref())?)),
             BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
+        }
+    }
+
+    fn open_keyboard(&self) -> Result<Box<dyn KeyboardPipe + '_>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => Ok(Box::new(x11::XKeyboard::open(self.env.display.as_deref())?)),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
+        }
+    }
+
+    fn root_size(&self) -> Result<Option<(u16, u16)>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => x11::root_size(self.env.display.as_deref()).map(Some),
+            BackendKind::Wayland => Ok(None),
         }
     }
 
