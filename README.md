@@ -10,7 +10,7 @@ Optional `mcp_profile` on `POST /session` attaches local MCP *tool* servers from
 
 ## Linux build and tests
 
-Stable Rust. Tests do not need a display server.
+Stable Rust. The workspace tests do not need a display server.
 
 ```bash
 cargo test
@@ -19,6 +19,26 @@ cargo build --release
 ```
 
 Run the daemon as the logged-in user, not as root. It prints `control socket` and `companion socket` when those sockets are up. TCP stays closed unless `--tcp` or `HYPERMESH_TCP=1` is set. `--listen` then sets that loopback port (default `127.0.0.1:9847`).
+
+### Display harness
+
+`ci/display/run.sh` drives the visor and the companion on a real display. GitHub Actions runs the same script as `display-x11` and `display-wayland`. Each scenario has its own timeout. A failure leaves logs and a capture (`xwd` on X11, `grim` on Wayland) in `display-logs/`.
+
+X11 uses Xorg with the dummy video driver. Injected mouse and type go through XTEST, and a small `xev` window checks that those events landed. Physical input is separate: the harness creates a pointer and a keyboard with `/dev/uinput` (`sudo modprobe uinput`). libinput attaches those nodes as slave devices. If libinput does not attach them, the same nodes are handed to the evdev driver. They are not the XTEST pointer or keyboard, and the harness does not pretend that XTEST input is physical. The companion's XTEST classification is what the pause and click scenarios exercise.
+
+```bash
+sudo modprobe uinput
+cargo build --locked --bins
+bash ci/display/run.sh x11
+bash ci/display/run.sh x11 inject-lands
+bash ci/display/run.sh wayland
+```
+
+X11 scenarios: `inject-lands`, `uinput-key-pauses-type`, `uinput-move-pauses`, `pausing-click-does-not-ask`, `xtest-click-does-nothing`, `watchdog-pauses`, `held-release`, `auto-resume`, `tcp-start-without-poll`.
+
+`auto-resume` sets `HYPERMESH_AUTOMATION_RESUME_SECS` on the companion process so the idle resume is a couple of seconds. Unset, or set to anything that is not a positive integer, the companion keeps `automation_resume_secs` from `companion.toml`, or 120 seconds. That variable does not change the default.
+
+Wayland runs sway with `WLR_BACKENDS=headless`, or weston `--backend=headless` if sway does not stay up. `start`, `mouse`, and `type` must fail with the issue #17 error, and the companion must still be running. Portal and libei checks are a skipped placeholder in that script until issue #17 lands.
 
 ## Release packages
 

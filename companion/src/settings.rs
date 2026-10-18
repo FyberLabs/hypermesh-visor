@@ -49,7 +49,30 @@ pub fn set_sleep_after_secs(dir: &Path, secs: u64) -> Result<(), String> {
 }
 
 pub fn automation_resume_secs(dir: &Path) -> u64 {
-    read_u64(dir, RESUME_AFTER, DEFAULT_RESUME_AFTER_SECS).max(1)
+    let file_secs = read_u64(dir, RESUME_AFTER, DEFAULT_RESUME_AFTER_SECS);
+    resume_secs_from(
+        std::env::var("HYPERMESH_AUTOMATION_RESUME_SECS")
+            .ok()
+            .as_deref(),
+        file_secs,
+    )
+}
+
+/// A positive `HYPERMESH_AUTOMATION_RESUME_SECS` shortens idle resume for the
+/// display harness. Empty, zero, and non-numeric values are ignored.
+fn resume_secs_override(value: Option<&str>) -> Option<u64> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match raw.parse::<u64>() {
+        Ok(secs) if secs >= 1 => Some(secs),
+        _ => None,
+    }
+}
+
+fn resume_secs_from(override_value: Option<&str>, file_secs: u64) -> u64 {
+    resume_secs_override(override_value).unwrap_or(file_secs.max(1))
 }
 
 pub fn set_automation_resume_secs(dir: &Path, secs: u64) -> Result<(), String> {
@@ -237,6 +260,16 @@ mod tests {
         assert_eq!(sleep_after_secs(&dir), 1_800);
         assert_eq!(automation_resume_secs(&dir), 600);
         assert!(bug_cursor(&dir));
+        assert_eq!(DEFAULT_RESUME_AFTER_SECS, 120);
+        assert_eq!(resume_secs_override(None), None);
+        assert_eq!(resume_secs_override(Some("")), None);
+        assert_eq!(resume_secs_override(Some("nope")), None);
+        assert_eq!(resume_secs_override(Some("0")), None);
+        assert_eq!(resume_secs_override(Some("2")), Some(2));
+        assert_eq!(resume_secs_override(Some(" 15 ")), Some(15));
+        assert_eq!(resume_secs_from(Some("2"), 600), 2);
+        assert_eq!(resume_secs_from(Some("0"), 600), 600);
+        assert_eq!(resume_secs_from(None, 0), 1);
         fs::write(dir.join("companion.toml"), "sleep_after_secs = \"nope\"\n").unwrap();
         assert_eq!(sleep_after_secs(&dir), DEFAULT_SLEEP_AFTER_SECS);
         fs::write(dir.join("companion.toml"), "sleep_after_secs = [\n").unwrap();
