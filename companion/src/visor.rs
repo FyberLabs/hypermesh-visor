@@ -81,6 +81,7 @@ fn visor_loop(
     stop: Arc<AtomicBool>,
 ) {
     let mut link = Link::new(Snapshot::disconnected());
+    let mut pause_asked = false;
     while !stop.load(Ordering::SeqCst) {
         let batch = {
             let mut queued = queue.lock().unwrap();
@@ -93,15 +94,10 @@ fn visor_loop(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let fresh = match fetch() {
-            Some(next) => {
-                link.ok(next);
-                true
-            }
-            None => {
-                link.miss(disconnect_from(link.current()));
-                false
-            }
+        let fetched = fetch();
+        let fresh = {
+            let mut queued = queue.lock().unwrap();
+            apply_poll(&mut link, &mut queued, &mut pause_asked, fetched)
         };
         let mut cache = snapshot.lock().unwrap();
         note_poll(&mut cache.epoch, fresh);
@@ -154,22 +150,96 @@ pub fn disconnect_misses() -> u32 {
     DISCONNECT_MISSES
 }
 
-fn fetch() -> Option<Snapshot> {
+/// The companion stops reading a poll here. A larger body is not a snapshot.
+const POLL_READ_MAX: usize = 256 * 1024;
+
+enum Exchange {
+    Body(String),
+    /// The read hit [`POLL_READ_MAX`] or was not valid UTF-8.
+    Truncated,
+    /// No connection, or the peer was not this user.
+    Failed,
+}
+
+enum PollFetch {
+    Ready(Snapshot),
+    /// The visor did not answer, or it answered with something other than 200.
+    Down,
+    /// A 200 that was cut off or did not parse. Automation may still be running.
+    Unreadable,
+}
+
+fn fetch() -> PollFetch {
     let request = auth::visor_request("hypermesh");
-    let text = exchange(&request)?;
-    let body = body_of(&text)?;
-    if !status_ok(&text) {
-        return None;
+    match exchange(&request) {
+        Exchange::Failed => PollFetch::Down,
+        Exchange::Truncated => PollFetch::Unreadable,
+        Exchange::Body(text) => classify_poll(false, &text),
     }
-    auth::snapshot_from_body(body)
+}
+
+/// `truncated` wins even when the bytes already on hand would parse.
+fn classify_poll(truncated: bool, text: &str) -> PollFetch {
+    if truncated {
+        return PollFetch::Unreadable;
+    }
+    if text.is_empty() || !status_ok(text) {
+        return PollFetch::Down;
+    }
+    let Some(body) = body_of(text) else {
+        return PollFetch::Unreadable;
+    };
+    match auth::snapshot_from_body(body) {
+        Some(snapshot) => PollFetch::Ready(snapshot),
+        None => PollFetch::Unreadable,
+    }
+}
+
+/// A poll that cannot be read while automation is running or paused queues
+/// one `pause` and keeps the last snapshot. It does not walk toward Off.
+/// `fresh` is true only for a parsed snapshot, so the poll epoch stays put.
+fn apply_poll(
+    link: &mut Link<Snapshot>,
+    queue: &mut VecDeque<&'static str>,
+    pause_asked: &mut bool,
+    fetched: PollFetch,
+) -> bool {
+    match fetched {
+        PollFetch::Ready(next) => {
+            *pause_asked = false;
+            link.ok(next);
+            true
+        }
+        PollFetch::Down => {
+            let down = disconnect_from(link.current());
+            link.miss(down);
+            false
+        }
+        PollFetch::Unreadable => {
+            let current = link.current().clone();
+            if current.connected
+                && matches!(current.phase, VisorPhase::Running | VisorPhase::Paused)
+            {
+                if !*pause_asked && !queue.iter().any(|action| *action == "pause") {
+                    queue.push_back("pause");
+                }
+                *pause_asked = true;
+                false
+            } else {
+                let down = disconnect_from(&current);
+                link.miss(down);
+                false
+            }
+        }
+    }
 }
 
 fn post(action: &str) -> bool {
     let request = automation_post(action);
-    let Some(text) = exchange(&request) else {
-        return false;
-    };
-    status_ok(&text)
+    match exchange(&request) {
+        Exchange::Body(text) => status_ok(&text),
+        _ => false,
+    }
 }
 
 fn automation_post(action: &str) -> String {
@@ -180,27 +250,52 @@ fn automation_post(action: &str) -> String {
     )
 }
 
-fn exchange(request: &str) -> Option<String> {
-    exchange_at(socket_path()?.as_path(), request)
+fn exchange(request: &str) -> Exchange {
+    let Some(path) = socket_path() else {
+        return Exchange::Failed;
+    };
+    exchange_read(path.as_path(), request)
 }
 
 fn exchange_at(path: &Path, request: &str) -> Option<String> {
-    let mut stream = UnixStream::connect(path).ok()?;
-    stream
+    match exchange_read(path, request) {
+        Exchange::Body(text) => Some(text),
+        _ => None,
+    }
+}
+
+fn exchange_read(path: &Path, request: &str) -> Exchange {
+    let mut stream = match UnixStream::connect(path) {
+        Ok(stream) => stream,
+        Err(_) => return Exchange::Failed,
+    };
+    if stream
         .set_read_timeout(Some(Duration::from_millis(300)))
-        .ok()?;
-    stream
-        .set_write_timeout(Some(Duration::from_millis(200)))
-        .ok()?;
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .is_err()
+    {
+        return Exchange::Failed;
+    }
     let peer = peer_uid(&stream);
     let mut outgoing = None;
     if !release_to_peer(peer, current_uid(), || {
         outgoing = Some(request.to_string());
     }) {
         note_foreign_peer();
-        return None;
+        return Exchange::Failed;
     }
-    stream.write_all(outgoing?.as_bytes()).ok()?;
+    let Some(outgoing) = outgoing else {
+        return Exchange::Failed;
+    };
+    if stream.write_all(outgoing.as_bytes()).is_err() {
+        return Exchange::Failed;
+    }
+    read_capped(&mut stream)
+}
+
+fn read_capped(stream: &mut UnixStream) -> Exchange {
     let mut buf = Vec::new();
     let mut tmp = [0u8; 2048];
     loop {
@@ -208,14 +303,17 @@ fn exchange_at(path: &Path, request: &str) -> Option<String> {
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&tmp[..n]);
-                if buf.len() > 256 * 1024 {
-                    break;
+                if buf.len() > POLL_READ_MAX {
+                    return Exchange::Truncated;
                 }
             }
             Err(_) => break,
         }
     }
-    String::from_utf8(buf).ok()
+    match String::from_utf8(buf) {
+        Ok(text) => Exchange::Body(text),
+        Err(_) => Exchange::Truncated,
+    }
 }
 
 /// Copy the request only when the peer uid is ours. A missing credential
@@ -490,5 +588,108 @@ mod tests {
         let mut queue = VecDeque::from(["resume"]);
         restore_failed_posts(&mut queue, &["pause"]);
         assert_eq!(queue.into_iter().collect::<Vec<_>>(), ["pause", "resume"]);
+    }
+
+    fn running_body() -> &'static str {
+        r#"HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\n{"open":true,"session":{"purpose":"drive"},"automation":{"phase":"running","resume_seq":3}}"#
+    }
+
+    #[test]
+    fn a_truncated_or_unparsed_poll_is_unreadable_and_a_miss_is_down() {
+        assert!(matches!(
+            classify_poll(true, running_body()),
+            PollFetch::Unreadable
+        ));
+        assert!(matches!(
+            classify_poll(false, "HTTP/1.1 200 OK\r\n\r\nnot-json"),
+            PollFetch::Unreadable
+        ));
+        assert!(matches!(
+            classify_poll(false, "HTTP/1.1 200 OK\r\n\r\n"),
+            PollFetch::Unreadable
+        ));
+        assert!(matches!(
+            classify_poll(false, "HTTP/1.1 500 ERR\r\n\r\nnope"),
+            PollFetch::Down
+        ));
+        assert!(matches!(classify_poll(false, ""), PollFetch::Down));
+        assert!(matches!(
+            classify_poll(
+                false,
+                "HTTP/1.1 200 OK\r\n\r\n{\"open\":false,\"automation\":{\"phase\":\"off\"}}"
+            ),
+            PollFetch::Ready(_)
+        ));
+    }
+
+    #[test]
+    fn an_unreadable_poll_while_running_posts_one_pause() {
+        let snap = crate::auth::snapshot_from_body(
+            r#"{"open":true,"session":{"purpose":"drive"},"automation":{"phase":"running","resume_seq":3}}"#,
+        )
+        .unwrap();
+        let mut link = Link::new(Snapshot::disconnected());
+        link.ok(snap);
+        let mut queue = VecDeque::new();
+        let mut asked = false;
+        assert!(!apply_poll(
+            &mut link,
+            &mut queue,
+            &mut asked,
+            PollFetch::Unreadable
+        ));
+        assert_eq!(queue.iter().copied().collect::<Vec<_>>(), ["pause"]);
+        assert!(link.current().connected);
+        assert_eq!(link.current().phase, VisorPhase::Running);
+        queue.clear();
+        assert!(!apply_poll(
+            &mut link,
+            &mut queue,
+            &mut asked,
+            PollFetch::Unreadable
+        ));
+        assert!(queue.is_empty());
+        assert!(link.current().connected);
+
+        let paused = crate::auth::snapshot_from_body(
+            r#"{"open":true,"automation":{"phase":"paused","resume_seq":3}}"#,
+        )
+        .unwrap();
+        assert!(apply_poll(
+            &mut link,
+            &mut queue,
+            &mut asked,
+            PollFetch::Ready(paused)
+        ));
+        assert!(!asked);
+        assert!(!apply_poll(
+            &mut link,
+            &mut queue,
+            &mut asked,
+            PollFetch::Unreadable
+        ));
+        assert_eq!(queue.iter().copied().collect::<Vec<_>>(), ["pause"]);
+        assert_eq!(link.current().phase, VisorPhase::Paused);
+    }
+
+    #[test]
+    fn an_unreadable_poll_while_off_counts_as_a_miss() {
+        let mut off = Snapshot::disconnected();
+        off.connected = true;
+        let mut link = Link::new(Snapshot::disconnected());
+        link.ok(off);
+        let mut queue = VecDeque::new();
+        let mut asked = false;
+        for _ in 0..disconnect_misses() {
+            assert!(!apply_poll(
+                &mut link,
+                &mut queue,
+                &mut asked,
+                PollFetch::Unreadable
+            ));
+        }
+        assert!(queue.is_empty());
+        assert!(link.disconnected());
+        assert!(!link.current().connected);
     }
 }

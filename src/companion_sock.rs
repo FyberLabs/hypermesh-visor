@@ -14,6 +14,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use hyper::body::Incoming;
@@ -144,18 +145,58 @@ pub async fn bind(dir: &Path) -> io::Result<UnixListener> {
     Ok(listener)
 }
 
+/// `EMFILE` and its cousins are temporary. A dead listener is not.
+pub fn accept_is_transient(err: &io::Error) -> bool {
+    const CODES: &[i32] = &[
+        libc::EMFILE,
+        libc::ENFILE,
+        libc::ENOBUFS,
+        libc::ENOMEM,
+        libc::EINTR,
+        libc::ECONNABORTED,
+        libc::EAGAIN,
+    ];
+    if let Some(code) = err.raw_os_error() {
+        if CODES.contains(&code) || code == libc::EWOULDBLOCK {
+            return true;
+        }
+    }
+    matches!(
+        err.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::TimedOut
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::OutOfMemory
+    )
+}
+
 pub async fn accept_loop(listener: UnixListener, state: Arc<AppState>) -> io::Result<()> {
     let app = companion_router(state);
+    let mut pause = Duration::from_millis(10);
     loop {
-        let (stream, _) = listener.accept().await?;
-        if !admit(peer_uid(&stream).ok(), current_uid()) {
-            eprintln!("hypermesh-visor: refused a companion socket peer that is not this user");
-            continue;
+        match listener.accept().await {
+            Ok((stream, _)) => {
+                pause = Duration::from_millis(10);
+                if !admit(peer_uid(&stream).ok(), current_uid()) {
+                    eprintln!(
+                        "hypermesh-visor: refused a companion socket peer that is not this user"
+                    );
+                    continue;
+                }
+                let app = app.clone();
+                tokio::spawn(async move {
+                    serve_one(stream, app).await;
+                });
+            }
+            Err(err) if accept_is_transient(&err) => {
+                eprintln!("hypermesh-visor: companion accept: {err}");
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(Duration::from_secs(1));
+            }
+            Err(err) => return Err(err),
         }
-        let app = app.clone();
-        tokio::spawn(async move {
-            serve_one(stream, app).await;
-        });
     }
 }
 
@@ -249,6 +290,39 @@ mod tests {
         assert!(!access_is_private(0, 10, 0o600));
         assert!(!access_is_private(10, 10, 0o644));
         assert!(!access_is_private(10, 10, 0o640));
+    }
+
+    #[test]
+    fn an_emfile_accept_is_retried_and_a_dead_listener_is_not() {
+        assert!(accept_is_transient(&io::Error::from_raw_os_error(
+            libc::EMFILE
+        )));
+        assert!(accept_is_transient(&io::Error::from_raw_os_error(
+            libc::ENFILE
+        )));
+        assert!(accept_is_transient(&io::Error::from_raw_os_error(
+            libc::EINTR
+        )));
+        assert!(accept_is_transient(&io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+        assert!(accept_is_transient(&io::Error::from_raw_os_error(
+            libc::ENOMEM
+        )));
+        assert!(accept_is_transient(&io::Error::from_raw_os_error(
+            libc::ECONNABORTED
+        )));
+        assert!(accept_is_transient(&io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "again"
+        )));
+        assert!(!accept_is_transient(&io::Error::from_raw_os_error(
+            libc::EBADF
+        )));
+        assert!(!accept_is_transient(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "gone"
+        )));
     }
 
     #[tokio::test]

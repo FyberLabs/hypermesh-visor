@@ -66,9 +66,11 @@ pub trait Desktop: Send + Sync {
     fn open_audio(&self) -> Result<Box<dyn AudioRead>, DesktopError>;
     fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError>;
     fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError>;
-    /// One or more pointer events. A long drag calls this per step so a pause
-    /// can land between them.
+    /// One batch of pointer events. A stepped drag sends these through
+    /// [`Desktop::open_pointer`] so the whole drag shares one connection.
     fn pointer_steps(&self, steps: &[PointerStep]) -> Result<(), DesktopError>;
+    /// One connection for a stepped drag. Batches go through [`PointerPipe::send`].
+    fn open_pointer(&self) -> Result<Box<dyn PointerPipe + '_>, DesktopError>;
 
     /// Current pointer, when the backend can read it. Used to tell a long
     /// automation move from a short one. Default: unknown.
@@ -86,6 +88,11 @@ pub trait Desktop: Send + Sync {
     fn backend_name(&self) -> &'static str {
         "fixture"
     }
+}
+
+/// Pointer events on one backend connection.
+pub trait PointerPipe: Send {
+    fn send(&mut self, steps: &[PointerStep]) -> Result<(), DesktopError>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,6 +209,13 @@ impl Desktop for LinuxDesktop {
     fn pointer_steps(&self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::pointer_steps(self.env.display.as_deref(), steps),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
+        }
+    }
+
+    fn open_pointer(&self) -> Result<Box<dyn PointerPipe + '_>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => Ok(Box::new(x11::XPointer::open(self.env.display.as_deref())?)),
             BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
         }
     }

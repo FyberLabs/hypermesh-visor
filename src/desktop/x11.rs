@@ -5,7 +5,7 @@ use x11rb::protocol::xtest::ConnectionExt as _;
 use x11rb::rust_connection::RustConnection;
 
 use crate::desktop::pixels::{encode_rgba_png, zpixmap_to_rgba};
-use crate::desktop::{DesktopError, Frame};
+use crate::desktop::{DesktopError, Frame, PointerPipe};
 use crate::input::{Button, MouseOp, Stroke};
 
 const KEY_PRESS: u8 = 2;
@@ -182,19 +182,69 @@ pub fn pointer_steps(
     display: Option<&str>,
     steps: &[crate::input::PointerStep],
 ) -> Result<(), DesktopError> {
-    let (conn, screen_num) = connect(display)?;
-    ensure_xtest(&conn)?;
-    let root = conn.setup().roots[screen_num].root;
-    for step in steps {
-        match *step {
-            crate::input::PointerStep::Move { x, y } => move_abs(&conn, root, x, y)?,
-            crate::input::PointerStep::Button { button, down } => {
-                button_event(&conn, root, button, down)?;
+    XPointer::open(display)?.send(steps)
+}
+
+/// One X connection and one XTEST setup for every batch of a drag.
+pub struct XPointer {
+    conn: RustConnection,
+    root: u32,
+}
+
+impl XPointer {
+    pub fn open(display: Option<&str>) -> Result<Self, DesktopError> {
+        let (conn, screen_num) = connect(display)?;
+        ensure_xtest(&conn)?;
+        let root = conn.setup().roots[screen_num].root;
+        Ok(Self { conn, root })
+    }
+}
+
+impl PointerPipe for XPointer {
+    fn send(&mut self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
+        for (index, step) in steps.iter().enumerate() {
+            if let Err(err) = apply_step(&self.conn, self.root, *step) {
+                for button in unreleased_buttons(&steps[..index]).into_iter().rev() {
+                    let _ = button_event(&self.conn, self.root, button, false);
+                }
+                let _ = self.conn.flush().map_err(input_err);
+                return Err(err);
             }
         }
+        self.conn.flush().map_err(input_err)?;
+        Ok(())
     }
-    conn.flush().map_err(input_err)?;
-    Ok(())
+}
+
+fn apply_step(
+    conn: &RustConnection,
+    root: u32,
+    step: crate::input::PointerStep,
+) -> Result<(), DesktopError> {
+    match step {
+        crate::input::PointerStep::Move { x, y } => move_abs(conn, root, x, y),
+        crate::input::PointerStep::Button { button, down } => {
+            button_event(conn, root, button, down)
+        }
+    }
+}
+
+/// Buttons pressed in `steps` that this slice did not release.
+pub(crate) fn unreleased_buttons(steps: &[crate::input::PointerStep]) -> Vec<Button> {
+    let mut held = Vec::new();
+    for step in steps {
+        let crate::input::PointerStep::Button { button, down } = *step else {
+            continue;
+        };
+        if down {
+            held.push(button);
+            continue;
+        }
+        if let Some(index) = held.iter().rposition(|pressed| *pressed == button) {
+            held.remove(index);
+        }
+    }
+    held
 }
 
 pub fn type_strokes(display: Option<&str>, strokes: &[Stroke]) -> Result<(), DesktopError> {
@@ -357,5 +407,25 @@ mod tests {
         assert_eq!(find_keycode(&map, 0x41), Some((38, true)));
         assert_eq!(find_keycode(&map, 0x20), Some((39, false)));
         assert_eq!(find_keycode(&map, 0x62), None);
+    }
+
+    #[test]
+    fn a_failed_batch_remembers_the_button_it_pressed() {
+        use crate::input::PointerStep;
+        let steps = [
+            PointerStep::Move { x: 1, y: 2 },
+            PointerStep::Button {
+                button: Button::Left,
+                down: true,
+            },
+            PointerStep::Move { x: 3, y: 2 },
+        ];
+        assert_eq!(unreleased_buttons(&steps), vec![Button::Left]);
+        let mut released = steps.to_vec();
+        released.push(PointerStep::Button {
+            button: Button::Left,
+            down: false,
+        });
+        assert!(unreleased_buttons(&released).is_empty());
     }
 }

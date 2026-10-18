@@ -175,6 +175,8 @@ pub const WAYLAND_COORD_LIMIT: i32 = 1_048_576;
 /// Interpolated drag points. A full i16 span is about 1024 steps of 64 px.
 /// Anything larger is refused. The steps themselves are not stored.
 pub const DRAG_STEP_CAP: usize = 4_096;
+/// Pointer events sent on one X connection before the pause latch is checked.
+pub const POINTER_BATCH: usize = 16;
 
 /// The span would walk more than [`DRAG_STEP_CAP`] points.
 #[derive(Debug, PartialEq, Eq)]

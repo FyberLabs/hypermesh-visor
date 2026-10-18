@@ -22,11 +22,13 @@ use zeroize::Zeroize;
 
 use crate::automation::{self, Control, Notice, Phase};
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
-use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
+use crate::harness::{
+    Agent, Harness, HarnessError, Recipe, Skill, SESSION_LIST_MAX, SESSION_TEXT_MAX,
+};
 use crate::input::{
     drag_point_count, drag_steps, keys_activity, keystroke_count, mouse_activity, mouse_in_bounds,
     plan_type, take_keystrokes, Button, MouseOp, PlanError, PointerStep, Stroke, TypeBody,
-    TYPE_CHUNK_KEYSTROKES, TYPE_MAX_KEYSTROKES,
+    POINTER_BATCH, TYPE_CHUNK_KEYSTROKES, TYPE_MAX_KEYSTROKES,
 };
 use crate::mcp::{
     self, companion_mode, resolve_preferred, BindingCache, FocusedApp, McpAuditRow, McpAuditor,
@@ -67,6 +69,26 @@ pub struct AppState {
     instance: u64,
     /// `mcp-bindings.json`, refreshed outside the sessions lock.
     bindings: Mutex<BindingCache>,
+    /// How long `running` may continue without a companion-socket poll.
+    companion_poll_timeout: Duration,
+    /// Last `GET /companion` on the companion socket.
+    last_companion_poll: Mutex<Option<Instant>>,
+    /// When the gate most recently entered `running`.
+    running_since: Mutex<Option<Instant>>,
+}
+
+/// A running automation pauses when the companion socket has not polled
+/// within this long. `HYPERMESH_COMPANION_POLL_MS` overrides it (200–60000).
+pub const COMPANION_POLL_TIMEOUT: Duration = Duration::from_secs(2);
+
+pub fn companion_poll_timeout_from(value: Option<&str>) -> Duration {
+    let Some(text) = value.map(str::trim).filter(|text| !text.is_empty()) else {
+        return COMPANION_POLL_TIMEOUT;
+    };
+    match text.parse::<u64>() {
+        Ok(ms) if (200..=60_000).contains(&ms) => Duration::from_millis(ms),
+        _ => COMPANION_POLL_TIMEOUT,
+    }
 }
 
 struct FocusCache {
@@ -151,6 +173,38 @@ impl AppState {
             focus_refreshing: Arc::new(AtomicBool::new(false)),
             instance: automation::fresh_instance(),
             bindings: Mutex::new(BindingCache::default()),
+            companion_poll_timeout: companion_poll_timeout_from(
+                std::env::var("HYPERMESH_COMPANION_POLL_MS").ok().as_deref(),
+            ),
+            last_companion_poll: Mutex::new(None),
+            running_since: Mutex::new(None),
+        }
+    }
+
+    fn note_companion_poll(&self) {
+        *lock(&self.last_companion_poll) = Some(Instant::now());
+    }
+
+    /// While the gate is running, a companion-socket poll older than
+    /// [`Self::companion_poll_timeout`] pauses. Only a companion resume
+    /// lifts that pause. A poll from before this run does not count as
+    /// fresh: the clock starts at the later of the last poll and the moment
+    /// running began.
+    fn pause_if_companion_quiet(&self) {
+        let now = Instant::now();
+        let running = lock(&self.automation).phase() == Phase::Running;
+        if !running {
+            *lock(&self.running_since) = None;
+            return;
+        }
+        let since = {
+            let mut slot = lock(&self.running_since);
+            *slot.get_or_insert(now)
+        };
+        let last = *lock(&self.last_companion_poll);
+        let anchor = last.map(|at| at.max(since)).unwrap_or(since);
+        if now.saturating_duration_since(anchor) >= self.companion_poll_timeout {
+            let _ = self.control_automation(Control::Pause, true);
         }
     }
 
@@ -255,7 +309,7 @@ impl AppState {
             .or_else(|| sessions.values().max_by_key(|session| session.touched()))?;
             ChosenSession {
                 id: session.id(),
-                purpose: session.purpose().to_string(),
+                purpose: clip_text(session.purpose(), SESSION_TEXT_MAX),
                 verb: session.verb().map(Verb::as_str),
                 mcp_servers: session.mcp().server_names(),
                 healthy: session.mcp().healthy_server_names(),
@@ -267,15 +321,31 @@ impl AppState {
         let preferred = focused
             .as_ref()
             .and_then(|app| resolve_preferred(app, &bindings, &chosen.healthy));
-        let mode = companion_mode(preferred.as_deref(), chosen.verb);
+        let mode = companion_mode(preferred.as_deref(), chosen.verb)
+            .map(|mode| clip_text(&mode, SESSION_TEXT_MAX));
         let prefer_mcp = preferred.is_some();
+        let mcp_servers = chosen
+            .mcp_servers
+            .into_iter()
+            .take(SESSION_LIST_MAX)
+            .map(|name| clip_text(&name, SESSION_TEXT_MAX))
+            .collect();
+        let focused = focused.map(|app| FocusedApp {
+            wm_class: app
+                .wm_class
+                .map(|value| clip_text(&value, SESSION_TEXT_MAX)),
+            app_id: app.app_id.map(|value| clip_text(&value, SESSION_TEXT_MAX)),
+            executable: app
+                .executable
+                .map(|value| clip_text(&value, SESSION_TEXT_MAX)),
+        });
         Some(CompanionSession {
             id: chosen.id,
             purpose: chosen.purpose,
             verb: chosen.verb,
             mode,
-            mcp: preferred,
-            mcp_servers: chosen.mcp_servers,
+            mcp: preferred.map(|name| clip_text(&name, SESSION_TEXT_MAX)),
+            mcp_servers,
             focused,
             prefer_mcp,
             idle_ms: chosen.idle_ms,
@@ -350,9 +420,15 @@ impl AppState {
             // in between. Pause does not take the injection lock.
             self.pause_epoch.fetch_add(1, Ordering::SeqCst);
             let mut gate = lock(&self.automation);
-            return gate
+            let paused = gate
                 .control(None, action)
                 .map_err(|_| ApiError::bad("start needs an open session"));
+            drop(gate);
+            // The next running stretch starts its own quiet-poll window.
+            // A resume that lands before the watchdog notices the pause
+            // must not inherit the stretch that just ended.
+            *lock(&self.running_since) = None;
+            return paused;
         }
         if matches!(action, Control::Start | Control::Resume)
             && self.desktop.backend_name() == "wayland"
@@ -536,6 +612,7 @@ pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()
             eprintln!("hypermesh-visor: companion socket closed: {err}");
         }
     });
+    spawn_companion_watch(Arc::clone(&state));
     // The bearer file from earlier builds is not a credential anymore.
     let _ = std::fs::remove_file(state.mcp_dir.join("companion.token"));
     let app = router(Arc::clone(&state));
@@ -628,6 +705,20 @@ async fn open_session(
         skills: req.skills,
     };
     harness.validate().map_err(ApiError::from_harness)?;
+    if req
+        .secrets
+        .iter()
+        .any(|secret| secret.name.chars().count() > SESSION_TEXT_MAX)
+    {
+        return Err(ApiError::bad("secret name is too long"));
+    }
+    if req
+        .mcp_profile
+        .as_deref()
+        .is_some_and(|profile| profile.chars().count() > SESSION_TEXT_MAX)
+    {
+        return Err(ApiError::bad("mcp profile is too long"));
+    }
     let mcp_dir = state.mcp_dir.clone();
     let vault_dir = mcp_dir.clone();
     let secrets = req.secrets;
@@ -754,10 +845,22 @@ async fn list_mcp_audit(State(state): State<Arc<AppState>>) -> Json<Vec<McpAudit
     Json(lock(&state.mcp_audit).rows().to_vec())
 }
 
+fn clip_text(value: &str, max: usize) -> String {
+    value.chars().take(max).collect()
+}
+
 /// Hot path for the companion poll. Session choice, the focus cache, and the
 /// bindings cache are in memory. Focus is probed only when a session is open,
 /// and `mcp-bindings.json` is stat'ed at most about once a second.
-async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
+/// A poll on the companion socket marks the companion present. A TCP poll does not.
+async fn companion(
+    State(state): State<Arc<AppState>>,
+    Extension(CompanionLink(from_companion)): Extension<CompanionLink>,
+) -> Json<CompanionBody> {
+    if from_companion {
+        state.note_companion_poll();
+    }
+    state.pause_if_companion_quiet();
     let session = state.companion_session();
     let gate_session = lock(&state.automation).session();
     let stale = gate_session.filter(|id| !state.has_session(*id));
@@ -1085,8 +1188,8 @@ enum Held {
 }
 
 /// Best-effort release of whatever this request pressed. Drop covers error,
-/// cancel, and panic. A finished request disarms so an intentional key-down
-/// stays down.
+/// cancel, panic, and a success that still has an unmatched down. A key or
+/// button is not left down for a later request.
 struct ReleaseGuard<'a> {
     desktop: &'a dyn Desktop,
     held: Vec<Held>,
@@ -1100,11 +1203,6 @@ impl<'a> ReleaseGuard<'a> {
             held: Vec::new(),
             armed: true,
         }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-        self.held.clear();
     }
 
     fn note_step(&mut self, step: PointerStep) {
@@ -1201,20 +1299,36 @@ fn inject_mouse(
         }
         return desktop.mouse(op).map_err(ApiError::from_desktop);
     }
-    let steps =
+    let mut steps =
         drag_steps(x, y, to_x, to_y, button).map_err(|_| ApiError::bad("drag is too long"))?;
+    let mut pipe = desktop.open_pointer().map_err(ApiError::from_desktop)?;
     let mut done = 0usize;
-    for step in steps {
+    loop {
         if cancelled() {
             return Err(paused_after(done, "pointer steps"));
         }
-        desktop
-            .pointer_steps(&[step])
-            .map_err(ApiError::from_desktop)?;
-        release.note_step(step);
-        done += 1;
+        let batch: Vec<PointerStep> = steps.by_ref().take(POINTER_BATCH).collect();
+        if batch.is_empty() {
+            break;
+        }
+        pipe.send(&batch).map_err(ApiError::from_desktop)?;
+        for step in batch {
+            release.note_step(step);
+            done += 1;
+        }
     }
     Ok(())
+}
+
+fn spawn_companion_watch(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        loop {
+            let slice = (state.companion_poll_timeout / 4)
+                .clamp(Duration::from_millis(10), Duration::from_millis(250));
+            tokio::time::sleep(slice).await;
+            state.pause_if_companion_quiet();
+        }
+    });
 }
 
 struct InjectGuard<'a> {
@@ -1250,6 +1364,7 @@ async fn mouse(
     {
         drag_point_count(x, y, to_x, to_y).map_err(|_| ApiError::bad("drag is too long"))?;
     }
+    state.pause_if_companion_quiet();
     // Captured before the phase check. A pause that bumps the epoch after
     // this read cannot be adopted as the baseline inside the desktop task.
     let epoch = state.pause_epoch.load(Ordering::SeqCst);
@@ -1295,7 +1410,6 @@ async fn mouse(
         if cancelled() {
             return Err(ApiError::conflict("automation paused"));
         }
-        release.disarm();
         state2.record_mouse(id, &op_for_drive, from, generation);
         Ok(())
     })
@@ -1311,6 +1425,7 @@ async fn type_keys(
     Json(mut body): Json<TypeBody>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
+    state.pause_if_companion_quiet();
     let epoch = state.pause_epoch.load(Ordering::SeqCst);
     if state.desktop.backend_name() == "wayland" {
         return Err(ApiError::not_implemented(
@@ -1400,7 +1515,6 @@ async fn type_keys(
         if cancelled() {
             return Err(paused_after(sent, "keystrokes"));
         }
-        release.disarm();
         state2.record_type(id, at, generation);
         Ok(())
     })
@@ -1818,6 +1932,7 @@ mod tests {
     use super::*;
     use crate::desktop::pixels::encode_rgba_png;
     use crate::desktop::Frame;
+    use crate::desktop::PointerPipe;
     use crate::input::Stroke;
     use bytes::Bytes;
     use http_body_util::{BodyExt, Full};
@@ -1841,6 +1956,7 @@ mod tests {
         block_pointer: AtomicBool,
         pointer_waits: AtomicUsize,
         step_calls: AtomicUsize,
+        pointer_sessions: AtomicUsize,
         views: AtomicUsize,
         audio_opens: AtomicUsize,
         root: AtomicBool,
@@ -1864,6 +1980,7 @@ mod tests {
                 block_pointer: AtomicBool::new(false),
                 pointer_waits: AtomicUsize::new(0),
                 step_calls: AtomicUsize::new(0),
+                pointer_sessions: AtomicUsize::new(0),
                 views: AtomicUsize::new(0),
                 audio_opens: AtomicUsize::new(0),
                 root: AtomicBool::new(false),
@@ -1918,6 +2035,11 @@ mod tests {
             Ok(())
         }
 
+        fn open_pointer(&self) -> Result<Box<dyn PointerPipe + '_>, DesktopError> {
+            self.pointer_sessions.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FakePipe { desktop: self }))
+        }
+
         fn pointer_steps(&self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
             let n = self.step_calls.fetch_add(1, Ordering::SeqCst) + 1;
             let fail = self.fail_step_call.load(Ordering::SeqCst);
@@ -1958,16 +2080,45 @@ mod tests {
         }
     }
 
+    struct FakePipe<'a> {
+        desktop: &'a FakeDesktop,
+    }
+
+    impl PointerPipe for FakePipe<'_> {
+        fn send(&mut self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
+            self.desktop.pointer_steps(steps)
+        }
+    }
+
     async fn spawn(desktop: Arc<FakeDesktop>) -> SocketAddr {
-        spawn_with_mcp_dir(desktop, std::env::temp_dir().join("hypermesh-mcp-empty")).await
+        spawn_timeout(desktop, COMPANION_POLL_TIMEOUT).await
+    }
+
+    async fn spawn_timeout(desktop: Arc<FakeDesktop>, poll_timeout: Duration) -> SocketAddr {
+        spawn_with_timeout(
+            desktop,
+            std::env::temp_dir().join("hypermesh-mcp-empty"),
+            poll_timeout,
+        )
+        .await
     }
 
     async fn spawn_with_mcp_dir(desktop: Arc<FakeDesktop>, mcp_dir: PathBuf) -> SocketAddr {
+        spawn_with_timeout(desktop, mcp_dir, COMPANION_POLL_TIMEOUT).await
+    }
+
+    async fn spawn_with_timeout(
+        desktop: Arc<FakeDesktop>,
+        mcp_dir: PathBuf,
+        poll_timeout: Duration,
+    ) -> SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let mut state = AppState::new(desktop, Duration::from_millis(20));
         state.mcp_dir = mcp_dir;
+        state.companion_poll_timeout = poll_timeout;
         let state = Arc::new(state);
+        spawn_companion_watch(Arc::clone(&state));
         tokio::spawn(async move {
             axum::serve(listener, router(state)).await.unwrap();
         });
@@ -1975,6 +2126,13 @@ mod tests {
     }
 
     async fn spawn_pair(desktop: Arc<FakeDesktop>) -> (SocketAddr, std::path::PathBuf) {
+        spawn_pair_timeout(desktop, COMPANION_POLL_TIMEOUT).await
+    }
+
+    async fn spawn_pair_timeout(
+        desktop: Arc<FakeDesktop>,
+        poll_timeout: Duration,
+    ) -> (SocketAddr, std::path::PathBuf) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let dir = std::env::temp_dir().join(format!(
@@ -1987,7 +2145,9 @@ mod tests {
         let unix = crate::companion_sock::bind(&dir).await.unwrap();
         let mut state = AppState::new(desktop, Duration::from_millis(20));
         state.mcp_dir = std::env::temp_dir().join("hypermesh-mcp-empty");
+        state.companion_poll_timeout = poll_timeout;
         let state = Arc::new(state);
+        spawn_companion_watch(Arc::clone(&state));
         let tcp_state = Arc::clone(&state);
         let sock_state = Arc::clone(&state);
         tokio::spawn(async move {
@@ -2024,6 +2184,42 @@ mod tests {
         } else {
             panic!("companion socket reply: {text}");
         }
+    }
+
+    fn companion_get(dir: &std::path::Path) -> serde_json::Value {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(crate::companion_sock::socket_file(dir))
+                .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(b"GET /companion HTTP/1.1\r\nhost: hypermesh\r\nconnection: close\r\n\r\n")
+            .unwrap();
+        let mut buf = Vec::new();
+        if let Err(err) = stream.read_to_end(&mut buf) {
+            if buf.is_empty() {
+                panic!("companion get read: {err}");
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains(" 200 "), "{text}");
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        serde_json::from_str(body).unwrap_or_else(|err| panic!("{err}: {text}"))
+    }
+
+    fn session_body(purpose: &str) -> String {
+        serde_json::json!({
+            "purpose": purpose,
+            "recipes": [],
+            "agent": {"name": "desk", "instructions": ""},
+            "skills": []
+        })
+        .to_string()
     }
 
     fn open_body(secrets: serde_json::Value) -> String {
@@ -2111,6 +2307,55 @@ mod tests {
         assert_eq!(value["skills"][0]["name"], "typing");
         assert!(value.get("secrets").is_none());
         assert!(!text.contains("hunter2"));
+    }
+
+    #[test]
+    fn companion_poll_timeout_accepts_only_the_documented_range() {
+        assert_eq!(companion_poll_timeout_from(None), Duration::from_secs(2));
+        assert_eq!(
+            companion_poll_timeout_from(Some("")),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            companion_poll_timeout_from(Some("nope")),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            companion_poll_timeout_from(Some("199")),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            companion_poll_timeout_from(Some("60001")),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            companion_poll_timeout_from(Some("200")),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            companion_poll_timeout_from(Some(" 60000 ")),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_purpose_is_refused_and_a_legal_one_stays_under_the_poll_cap() {
+        let addr = spawn(FakeDesktop::new()).await;
+        let too_long = "p".repeat(crate::harness::SESSION_TEXT_MAX + 1);
+        let (status, _, body) = send(addr, "POST", "/session", Some(session_body(&too_long))).await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("too long"), "{text}");
+
+        let purpose = "p".repeat(crate::harness::SESSION_TEXT_MAX);
+        let (status, _, body) = send(addr, "POST", "/session", Some(session_body(&purpose))).await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 201, "{text}");
+        let (status, _, body) = send(addr, "GET", "/companion", None).await;
+        assert_eq!(status, 200);
+        assert!(body.len() < 64 * 1024, "poll is {} bytes", body.len());
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["session"]["purpose"], purpose);
     }
 
     #[tokio::test]
@@ -2754,7 +2999,7 @@ while True:
     #[tokio::test]
     async fn a_pause_during_a_long_drag_stops_later_steps() {
         let desktop = FakeDesktop::new();
-        desktop.block_step_call.store(3, Ordering::SeqCst);
+        desktop.block_step_call.store(2, Ordering::SeqCst);
         let addr = spawn(Arc::clone(&desktop)).await;
         let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
         let drag_addr = addr;
@@ -2764,20 +3009,20 @@ while True:
                 drag_addr,
                 "POST",
                 &format!("/session/{drag_id}/mouse"),
-                Some(r#"{"action":"drag","x":0,"y":0,"to_x":200,"to_y":0}"#.into()),
+                Some(r#"{"action":"drag","x":0,"y":0,"to_x":2048,"to_y":0}"#.into()),
             )
             .await
         });
         let ready = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                if desktop.step_calls.load(Ordering::SeqCst) >= 3 {
+                if desktop.step_calls.load(Ordering::SeqCst) >= 2 {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
         .await;
-        assert!(ready.is_ok(), "the drag did not reach the third step");
+        assert!(ready.is_ok(), "the drag did not reach the second batch");
         let paused = tokio::time::timeout(
             Duration::from_secs(2),
             send(
@@ -2794,7 +3039,7 @@ while True:
         let (status, _, body) = job.await.unwrap();
         let text = String::from_utf8_lossy(&body);
         assert_eq!(status, 409, "{text}");
-        assert!(text.contains("after 3 pointer steps"), "{text}");
+        assert!(text.contains("after 32 pointer steps"), "{text}");
         let steps = lock(&desktop.pointer_log).clone();
         assert!(
             matches!(
@@ -2806,7 +3051,7 @@ while True:
         assert!(
             !steps
                 .iter()
-                .any(|step| matches!(step, crate::input::PointerStep::Move { x: 200, .. })),
+                .any(|step| matches!(step, crate::input::PointerStep::Move { x: 2048, .. })),
             "{steps:?}"
         );
     }
@@ -2856,14 +3101,14 @@ while True:
     #[tokio::test]
     async fn a_failed_pointer_step_releases_the_button() {
         let desktop = FakeDesktop::new();
-        desktop.fail_step_call.store(3, Ordering::SeqCst);
+        desktop.fail_step_call.store(2, Ordering::SeqCst);
         let addr = spawn(Arc::clone(&desktop)).await;
         let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
         let (status, _, body) = send(
             addr,
             "POST",
             &format!("/session/{id}/mouse"),
-            Some(r#"{"action":"drag","x":0,"y":0,"to_x":200,"to_y":0}"#.into()),
+            Some(r#"{"action":"drag","x":0,"y":0,"to_x":2048,"to_y":0}"#.into()),
         )
         .await;
         let text = String::from_utf8_lossy(&body);
@@ -2885,9 +3130,190 @@ while True:
         assert!(
             !steps
                 .iter()
-                .any(|step| matches!(step, crate::input::PointerStep::Move { x: 200, .. })),
+                .any(|step| matches!(step, crate::input::PointerStep::Move { x: 2048, .. })),
             "{steps:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_long_drag_uses_one_pointer_connection() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"drag","x":0,"y":0,"to_x":2048,"to_y":0}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 204, "{text}");
+        assert!(lock(&desktop.mice).is_empty());
+        assert_eq!(desktop.pointer_sessions.load(Ordering::SeqCst), 1);
+        assert_eq!(desktop.step_calls.load(Ordering::SeqCst), 3);
+        let steps = lock(&desktop.pointer_log).clone();
+        assert!(
+            matches!(
+                steps.last(),
+                Some(crate::input::PointerStep::Button { down: false, .. })
+            ),
+            "{steps:?}"
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|step| matches!(step, crate::input::PointerStep::Move { x: 2048, .. })),
+            "{steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_successful_key_down_is_released_when_the_request_finishes() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"keys":[{"key":"control","action":"down"}]}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 204, "{text}");
+        let typed = lock(&desktop.typed).clone();
+        assert_eq!(
+            typed,
+            vec![
+                Stroke {
+                    keysym: 0xffe3,
+                    down: true,
+                },
+                Stroke {
+                    keysym: 0xffe3,
+                    down: false,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quiet_companion_pauses_until_a_socket_resume() {
+        let desktop = FakeDesktop::new();
+        let (addr, dir) = spawn_pair_timeout(Arc::clone(&desktop), Duration::from_millis(80)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"click","x":1,"y":2,"button":"left"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let (status, _, body) = send(addr, "GET", "/companion", None).await;
+        assert_eq!(status, 200);
+        let paused: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paused["automation"]["phase"], "paused");
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":3,"y":4}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 403, "{text}");
+        let sock = dir.clone();
+        let status = tokio::task::spawn_blocking(move || companion_post(&sock, "resume"))
+            .await
+            .unwrap();
+        assert_eq!(status, 204);
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":5,"y":6}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 204, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_socket_poll_keeps_a_running_automation_alive() {
+        let desktop = FakeDesktop::new();
+        let (addr, dir) = spawn_pair_timeout(Arc::clone(&desktop), Duration::from_millis(80)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"click","x":1,"y":2,"button":"left"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let started = tokio::time::Instant::now();
+        while started.elapsed() < Duration::from_millis(400) {
+            let poll_dir = dir.clone();
+            let snap = tokio::task::spawn_blocking(move || companion_get(&poll_dir))
+                .await
+                .unwrap();
+            assert_eq!(snap["automation"]["phase"], "running");
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":8,"y":9}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 204, "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_tcp_poll_does_not_refresh_the_companion_clock() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn_timeout(Arc::clone(&desktop), Duration::from_millis(150)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"click","x":1,"y":2,"button":"left"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, body) = send(addr, "GET", "/companion", None).await;
+        assert_eq!(status, 200);
+        let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snap["automation"]["phase"], "running");
+        let mut saw_paused = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            let (status, _, body) = send(addr, "GET", "/companion", None).await;
+            assert_eq!(status, 200);
+            let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if snap["automation"]["phase"] == "paused" {
+                saw_paused = true;
+                break;
+            }
+        }
+        assert!(saw_paused, "tcp polls must not keep the gate running");
     }
 
     #[tokio::test]
@@ -3333,6 +3759,7 @@ while True:
                 button: crate::input::Button::Right,
             }]
         );
+        assert_eq!(desktop.pointer_sessions.load(Ordering::SeqCst), 0);
 
         let (status, headers, body) =
             send(addr, "GET", &format!("/session/{id}/listen"), None).await;
@@ -3740,6 +4167,7 @@ while True:
             Duration::from_millis(20),
             door,
         ));
+        spawn_companion_watch(Arc::clone(&state));
         tokio::spawn(async move {
             axum::serve(listener, router(state)).await.unwrap();
         });

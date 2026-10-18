@@ -5,7 +5,7 @@ use std::sync::Mutex;
 
 use base64::Engine;
 
-use crate::desktop::{AudioRead, Desktop, DesktopError, Frame};
+use crate::desktop::{AudioRead, Desktop, DesktopError, Frame, PointerPipe};
 use crate::input::{Button, MouseOp, PointerStep, Stroke};
 
 fn view_png() -> Vec<u8> {
@@ -83,6 +83,10 @@ impl Desktop for FixtureDesktop {
         }))
     }
 
+    fn open_pointer(&self) -> Result<Box<dyn PointerPipe + '_>, DesktopError> {
+        Ok(Box::new(FixturePipe { desktop: self }))
+    }
+
     fn pointer_steps(&self, steps: &[PointerStep]) -> Result<(), DesktopError> {
         for step in steps {
             let value = match *step {
@@ -101,6 +105,16 @@ impl Desktop for FixtureDesktop {
             self.record(value)?;
         }
         Ok(())
+    }
+}
+
+struct FixturePipe<'a> {
+    desktop: &'a FixtureDesktop,
+}
+
+impl PointerPipe for FixturePipe<'_> {
+    fn send(&mut self, steps: &[PointerStep]) -> Result<(), DesktopError> {
+        self.desktop.pointer_steps(steps)
     }
 }
 
