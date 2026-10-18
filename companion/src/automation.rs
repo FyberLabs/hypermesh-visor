@@ -54,15 +54,19 @@ pub fn classify_shown_input(machine: &mut Machine, live: bool, now_ms: u64) -> E
 }
 
 /// Classify the same queued input against the phase the snapshot just
-/// applied, when the pass against the phase on screen did not already pause.
-/// An off-to-running transition in this frame still pauses.
+/// applied. An off-to-running transition in this frame still pauses. A
+/// snapshot that lifts a pause back to running is classified again, so the
+/// event pauses that stretch instead of leaving the companion on running.
 pub fn classify_incoming_input(
     machine: &mut Machine,
     live: bool,
     shown: Effect,
     now_ms: u64,
 ) -> Effect {
-    if live && shown != Effect::Pause {
+    if !live {
+        return Effect::None;
+    }
+    if shown != Effect::Pause || machine.phase() == Phase::Running {
         machine.user_input(now_ms)
     } else {
         Effect::None
@@ -93,7 +97,9 @@ pub fn settle_live_input(
 
 /// What a press on the bug does. `was_paused` is the phase from before this
 /// frame drained input. The press that moved `running` to `paused` must not
-/// open Continue.
+/// open Continue. Ask only when the phase is still paused: a snapshot that
+/// has since left paused would make [`Machine::ask`] a no-op and swallow the
+/// click.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BugClick {
     Ask,
@@ -103,7 +109,7 @@ pub enum BugClick {
 }
 
 pub fn bug_click(was_paused: bool, phase: Phase) -> BugClick {
-    if was_paused {
+    if was_paused && phase == Phase::Paused {
         BugClick::Ask
     } else if phase == Phase::Running {
         BugClick::Pause
@@ -970,6 +976,40 @@ mod tests {
         assert_eq!(bug_click(was_paused, machine.phase()), BugClick::Ask);
         machine.ask(20);
         assert!(machine.asking());
+    }
+
+    #[test]
+    fn a_bug_click_asks_only_while_the_phase_is_still_paused() {
+        assert_eq!(bug_click(true, Phase::Paused), BugClick::Ask);
+        assert_eq!(bug_click(true, Phase::Off), BugClick::ToggleMenu);
+        assert_eq!(bug_click(true, Phase::Running), BugClick::Pause);
+        assert_eq!(bug_click(false, Phase::Paused), BugClick::Ignore);
+        assert_eq!(bug_click(false, Phase::Running), BugClick::Pause);
+        assert_eq!(bug_click(false, Phase::Off), BugClick::ToggleMenu);
+
+        let mut machine = Machine::new(DEFAULT_RESUME_MS);
+        machine.see_visor(VisorPhase::Running, 0, 1);
+        machine.user_input(10);
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Off, 20, 1);
+        assert_eq!(machine.phase(), Phase::Off);
+        assert_eq!(bug_click(true, machine.phase()), BugClick::ToggleMenu);
+        machine.ask(30);
+        assert!(!machine.asking());
+    }
+
+    #[test]
+    fn a_queued_input_pauses_again_when_the_snapshot_lifts_the_pause() {
+        let mut machine = Machine::new(DEFAULT_RESUME_MS);
+        machine.see_visor(VisorPhase::Running, 0, 1);
+        let effect = settle_live_input(&mut machine, true, VisorPhase::Running, 10, 2);
+        assert_eq!(effect, Effect::Pause);
+        assert_eq!(
+            machine.phase(),
+            Phase::Paused,
+            "a newer running snapshot must not leave the queued input on running"
+        );
+        assert!(!machine.asking());
     }
 
     #[test]

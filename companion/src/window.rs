@@ -262,7 +262,8 @@ fn show(mut app: App) -> Result<(), String> {
         // Queued physical input is judged against the phase already on screen,
         // and again against the snapshot applied below. An `off` poll cannot
         // swallow a key or click that arrived while the gate was running, and
-        // an off-to-running transition in this frame still pauses.
+        // an off-to-running transition in this frame still pauses. A snapshot
+        // that lifts the pause back to running is classified again.
         let mut events = Vec::new();
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
             events.push(event);
