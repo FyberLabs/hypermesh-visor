@@ -45,6 +45,8 @@ COMPOSITOR_PID=
 COMPANION_WAS_UP=
 CORE_POINTER_ID=
 CORE_KEYBOARD_ID=
+XTEST_POINTER='Virtual core XTEST pointer'
+XTEST_KEYBOARD='Virtual core XTEST keyboard'
 ROOT_W=
 ROOT_H=
 
@@ -435,25 +437,14 @@ query_state() {
 }
 
 button_is_down() {
-  query_state "$CORE_POINTER_ID" | grep -q 'button\[1\]=down'
+  # query-state only opens extension devices. XTEST is where injected
+  # buttons land; the virtual core pointer is not one of those devices.
+  query_state "$XTEST_POINTER" | grep -q 'button\[1\]=down'
 }
 
 key_is_down() {
-  local code=$1 state
-  state=$(query_state "$CORE_KEYBOARD_ID")
-  python3 - "$code" "$state" <<'PY'
-import sys
-code, state = sys.argv[1], sys.argv[2]
-nums = []
-for line in state.splitlines():
-    if "keys:" not in line:
-        continue
-    rest = line.split("keys:", 1)[1].strip()
-    if rest and rest != "none":
-        nums = rest.split()
-    break
-sys.exit(0 if code in nums else 1)
-PY
+  local code=$1
+  query_state "$XTEST_KEYBOARD" | grep -q "key\\[$code\\]=down"
 }
 
 keycode_for() {
@@ -724,10 +715,10 @@ capture_core_devices() {
   CORE_POINTER_ID=$(xinput list --id-only 'Virtual core pointer' | head -n 1)
   CORE_KEYBOARD_ID=$(xinput list --id-only 'Virtual core keyboard' | head -n 1)
   [[ -n $CORE_POINTER_ID && -n $CORE_KEYBOARD_ID ]] || die "core pointer or keyboard id missing"
-  query_state "$CORE_POINTER_ID" >/dev/null
-  query_state "$CORE_KEYBOARD_ID" >/dev/null
+  query_state "$XTEST_POINTER" >/dev/null
+  query_state "$XTEST_KEYBOARD" >/dev/null
   read -r ROOT_W ROOT_H < <(xwininfo -root | awk '/Width:/ { w = $2 } /Height:/ { h = $2 } END { print w, h }')
-  echo "core pointer=$CORE_POINTER_ID keyboard=$CORE_KEYBOARD_ID root=${ROOT_W}x${ROOT_H}"
+  echo "core pointer=$CORE_POINTER_ID keyboard=$CORE_KEYBOARD_ID xtest='$XTEST_POINTER' root=${ROOT_W}x${ROOT_H}"
   (( ROOT_W >= 8000 && ROOT_H >= 800 )) || die "root ${ROOT_W}x${ROOT_H} is too small for a cancellable drag"
 }
 
@@ -957,7 +948,7 @@ scenario_held_release() {
   a=$(keycode_for a)
   [[ -n $control && -n $a ]] || die "keymap has no Control_L or a"
   if key_is_down "$control" || key_is_down "$a"; then
-    query_state "$CORE_KEYBOARD_ID" >&2 || true
+    query_state "$XTEST_KEYBOARD" >&2 || true
     die "finished type left a key down"
   fi
 
@@ -986,7 +977,7 @@ PY
     echo "key cancel attempt $attempt status $code sent ${n:-none}"
     if [[ $code == 409 && -n $n && $n -gt 0 ]]; then
       if key_is_down "$control"; then
-        query_state "$CORE_KEYBOARD_ID" >&2 || true
+        query_state "$XTEST_KEYBOARD" >&2 || true
         die "cancel left control down"
       fi
       break
@@ -1029,7 +1020,7 @@ PY
     n=$(sent_after "pointer steps")
     echo "drag cancel attempt $attempt status $code sent ${n:-none} total $total $(error_text "$HTTP_BODY")"
     if button_is_down; then
-      query_state "$CORE_POINTER_ID" >&2 || true
+      query_state "$XTEST_POINTER" >&2 || true
       die "left button stayed down"
     fi
     if [[ $code == 409 && -n $n && $n -ge 2 && $n -lt $total ]]; then
