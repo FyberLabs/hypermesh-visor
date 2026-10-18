@@ -28,7 +28,7 @@ X11 uses Xorg with the dummy video driver. Injected mouse and type go through XT
 
 ```bash
 sudo modprobe uinput
-cargo build --locked --bins
+cargo build --locked --workspace --bins
 bash ci/display/run.sh x11
 bash ci/display/run.sh x11 inject-lands
 bash ci/display/run.sh wayland
@@ -38,7 +38,7 @@ X11 scenarios: `inject-lands`, `uinput-key-pauses-type`, `uinput-move-pauses`, `
 
 `auto-resume` sets `HYPERMESH_AUTOMATION_RESUME_SECS` on the companion process so the idle resume is a couple of seconds. Unset, or set to anything that is not a positive integer, the companion keeps `automation_resume_secs` from `companion.toml`, or 120 seconds. That variable does not change the default.
 
-Wayland runs sway with `WLR_BACKENDS=headless`, or weston `--backend=headless` if sway does not stay up. `start`, `mouse`, and `type` must fail with the issue #17 error, and the companion must still be running. Portal and libei checks are a skipped placeholder in that script until issue #17 lands.
+Wayland runs sway with `WLR_BACKENDS=headless` and `WLR_RENDERER=pixman` (no DRM node on the runner), or weston `--backend=headless` if sway does not stay up. `start`, `mouse`, and `type` must fail with the issue #17 error, and the companion must still be running. Portal and libei checks are a skipped placeholder in that script until issue #17 lands.
 
 ## Release packages
 

@@ -35,11 +35,18 @@ BASE=
 SID=
 UINPUT_FD=
 UINPUT_PID=
+SOCK_FD=
+SOCK_PID=
 XORG_PID=
 XEV_PID=
 VISOR_PID=
+VISOR_PID_FILE=$DISPLAY_LOG_DIR/visor.pid
 COMPOSITOR_PID=
 COMPANION_WAS_UP=
+CORE_POINTER_ID=
+CORE_KEYBOARD_ID=
+ROOT_W=
+ROOT_H=
 
 export HYPERMESH_RUNTIME_DIR=$RUNTIME
 export HYPERMESH_CONFIG_DIR=$CONFIG
@@ -70,8 +77,17 @@ cleanup() {
   if [[ -n ${VISOR_PID:-} ]]; then
     kill "$VISOR_PID" 2>/dev/null || true
   fi
+  if [[ -f $VISOR_PID_FILE ]]; then
+    kill "$(cat "$VISOR_PID_FILE")" 2>/dev/null || true
+  fi
+  if [[ -n ${SOCK_FD:-} ]]; then
+    printf 'quit\n' >&"$SOCK_FD" 2>/dev/null || true
+  fi
   if [[ -n ${UINPUT_PID:-} ]]; then
     kill "$UINPUT_PID" 2>/dev/null || true
+  fi
+  if [[ -n ${SOCK_PID:-} ]]; then
+    kill "$SOCK_PID" 2>/dev/null || true
   fi
   if [[ -n ${COMPOSITOR_PID:-} ]]; then
     kill "$COMPOSITOR_PID" 2>/dev/null || true
@@ -121,6 +137,16 @@ wait_phase() {
 }
 
 socket_action() {
+  if [[ -n ${SOCK_FD:-} ]]; then
+    printf '%s\n' "$1" >&"$SOCK_FD"
+    local ack
+    IFS= read -r -t 2 ack <&"$SOCK_FD" || die "socket helper did not answer: $1"
+    if [[ $ack != ok* ]]; then
+      echo "socket $1 -> $ack" >&2
+      return 1
+    fi
+    return 0
+  fi
   python3 - "$RUNTIME/companion.sock" "$1" <<'PY'
 import socket, sys
 path, action = sys.argv[1], sys.argv[2]
@@ -151,6 +177,47 @@ if not line.startswith("HTTP/1.1 204"):
 PY
 }
 
+# HTTP body "error" field. Empty and non-JSON bodies yield an empty string.
+error_text() {
+  python3 - "$1" <<'PY'
+import json, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+if not raw:
+    print("")
+    raise SystemExit(0)
+try:
+    body = json.loads(raw)
+except json.JSONDecodeError:
+    print("")
+    raise SystemExit(0)
+if isinstance(body, dict):
+    print(body.get("error", ""))
+else:
+    print("")
+PY
+}
+
+sent_after() {
+  local unit=$1
+  python3 - "$HTTP_BODY" "$unit" <<'PY'
+import json, re, sys
+raw = open(sys.argv[1], encoding="utf-8", errors="replace").read().strip()
+unit = sys.argv[2]
+if not raw:
+    print("")
+    raise SystemExit(0)
+try:
+    body = json.loads(raw)
+except json.JSONDecodeError:
+    print("")
+    raise SystemExit(0)
+err = body.get("error", "") if isinstance(body, dict) else ""
+print(err, file=sys.stderr)
+match = re.search(r"after (\d+) " + re.escape(unit), err)
+print(match.group(1) if match else "")
+PY
+}
+
 open_session() {
   local body='{"purpose":"display harness","recipes":[],"agent":{"name":"display","instructions":""},"skills":[]}'
   SID=$(curl --max-time 10 -fsS -X POST "$BASE/session" \
@@ -169,6 +236,8 @@ start_visor() {
   "$VISOR_BIN" --listen 127.0.0.1:0 \
     >"$DISPLAY_LOG_DIR/visor.out" 2>"$DISPLAY_LOG_DIR/visor.err" &
   VISOR_PID=$!
+  echo "$VISOR_PID" >"$VISOR_PID_FILE"
+  disown "$VISOR_PID" 2>/dev/null || true
   local i
   for i in $(seq 1 50); do
     if [[ -s $DISPLAY_LOG_DIR/visor.out ]]; then
@@ -205,14 +274,20 @@ start_companion() {
   local resume=${1:-}
   local mode=${2:-x11}
   stop_companion
+  # The script already cleared HYPERMESH_AUTOMATION_RESUME_SECS. A direct
+  # exec keeps that. `env -u` reported the binary missing on the runner
+  # even when this same path executed.
   if [[ -n $resume ]]; then
     HYPERMESH_AUTOMATION_RESUME_SECS=$resume "$COMPANION_BIN" \
       >"$DISPLAY_LOG_DIR/companion.log" 2>&1 &
   else
-    env -u HYPERMESH_AUTOMATION_RESUME_SECS "$COMPANION_BIN" \
-      >"$DISPLAY_LOG_DIR/companion.log" 2>&1 &
+    "$COMPANION_BIN" >"$DISPLAY_LOG_DIR/companion.log" 2>&1 &
   fi
-  echo $! >"$COMPANION_PID_FILE"
+  local pid=$!
+  # The companion treats SIGHUP as a stop. Disown it so a scenario
+  # subshell can exit without taking the process down.
+  disown "$pid" 2>/dev/null || true
+  echo "$pid" >"$COMPANION_PID_FILE"
   COMPANION_WAS_UP=1
   local i
   for i in $(seq 1 50); do
@@ -310,7 +385,7 @@ uinput_cmd() {
 
 warp() {
   local target_x=$1 target_y=$2 i loc cx cy dx dy
-  for i in $(seq 1 30); do
+  for i in $(seq 1 40); do
     loc=$(xdotool getmouselocation --shell)
     cx=$(awk -F= '/^X=/{print $2}' <<<"$loc")
     cy=$(awk -F= '/^Y=/{print $2}' <<<"$loc")
@@ -319,12 +394,14 @@ warp() {
     if (( dx > -4 && dx < 4 && dy > -4 && dy < 4 )); then
       return 0
     fi
-    (( dx > 50 )) && dx=50
-    (( dx < -50 )) && dx=-50
-    (( dy > 50 )) && dy=50
-    (( dy < -50 )) && dy=-50
+    # Flat acceleration is 1:1, so a long move across the wide root
+    # does not need a one-pixel step.
+    (( dx > 800 )) && dx=800
+    (( dx < -800 )) && dx=-800
+    (( dy > 800 )) && dy=800
+    (( dy < -800 )) && dy=-800
     uinput_cmd "rel $dx $dy"
-    sleep 0.04
+    sleep 0.03
   done
   echo "pointer stayed at $cx,$cy, wanted $target_x,$target_y" >&2
   return 1
@@ -342,28 +419,45 @@ focus_xev() {
   local id
   id=$(xdotool search --name "Event Tester" | head -n 1)
   [[ -n $id ]] || die "xev window missing"
-  xdotool windowactivate --sync "$id" >/dev/null
-  xdotool windowfocus --sync "$id" >/dev/null
+  # No window manager, so _NET_ACTIVE_WINDOW is absent. Focus is enough.
+  xdotool windowfocus --sync "$id" >/dev/null || true
+}
+
+query_state() {
+  local id=$1 out
+  if ! out=$(xinput query-state "$id" 2>"$DISPLAY_LOG_DIR/xinput.err"); then
+    echo "xinput query-state $id failed" >&2
+    cat "$DISPLAY_LOG_DIR/xinput.err" >&2 || true
+    xinput list >&2 || true
+    exit 1
+  fi
+  printf '%s\n' "$out"
 }
 
 button_is_down() {
-  xinput query-state "Virtual core pointer" | grep -q 'button\[1\]=down'
-}
-
-keycode_for() {
-  xmodmap -pke | awk -v name="$1" '$4 == name { print $2; exit }'
+  query_state "$CORE_POINTER_ID" | grep -q 'button\[1\]=down'
 }
 
 key_is_down() {
   local code=$1 state
-  state=$(xinput query-state "Virtual core keyboard")
+  state=$(query_state "$CORE_KEYBOARD_ID")
   python3 - "$code" "$state" <<'PY'
-import re, sys
+import sys
 code, state = sys.argv[1], sys.argv[2]
-match = re.search(r"\[([^\]]*)\]", state)
-nums = match.group(1).split() if match else []
+nums = []
+for line in state.splitlines():
+    if "keys:" not in line:
+        continue
+    rest = line.split("keys:", 1)[1].strip()
+    if rest and rest != "none":
+        nums = rest.split()
+    break
 sys.exit(0 if code in nums else 1)
 PY
+}
+
+keycode_for() {
+  xmodmap -pke | awk -v name="$1" '$4 == name { print $2; exit }'
 }
 
 capture_shot() {
@@ -396,6 +490,10 @@ run_named() {
   local timer=$!
   set +e
   (
+    # The parent cleared -e so `wait` can collect the status. Turn it back
+    # on here, or a failed companion start still looks like a pass.
+    set -euo pipefail
+    trap - EXIT
     "$@"
   ) >"$DISPLAY_LOG_DIR/$name.log" 2>&1 &
   local test_pid=$!
@@ -478,7 +576,7 @@ EndSection
 Section "Device"
     Identifier "dummy"
     Driver "dummy"
-    VideoRam 32768
+    VideoRam 131072
     Option "IgnoreEDID" "true"
     Option "NoDDC" "true"
 EndSection
@@ -487,7 +585,7 @@ Section "Monitor"
     Identifier "monitor"
     HorizSync 5.0-1000.0
     VertRefresh 5.0-200.0
-    Modeline "1280x720" 74.50 1280 1344 1472 1664 720 723 728 748 -hsync +vsync
+    Modeline "16384x1024" 218.76 16384 16416 16448 16480 1024 1025 1028 1031 -hsync +vsync
 EndSection
 
 Section "Screen"
@@ -497,8 +595,8 @@ Section "Screen"
     DefaultDepth 24
     SubSection "Display"
         Depth 24
-        Modes "1280x720"
-        Virtual 1280 720
+        Modes "16384x1024"
+        Virtual 16384 1024
     EndSubSection
 EndSection
 
@@ -587,12 +685,58 @@ probe_physical_move() {
   uinput_cmd "rel -40 0" || true
 }
 
+build_bins() {
+  cargo build --locked --workspace --bins
+  [[ -x $VISOR_BIN ]] || die "visor binary missing after cargo build"
+  [[ -x $COMPANION_BIN ]] || die "companion binary missing after cargo build"
+}
+
+start_socket_helper() {
+  python3 -u "$root/ci/display/sock.py" "$RUNTIME/companion.sock" \
+    >"$DISPLAY_LOG_DIR/sock.ready" 2>"$DISPLAY_LOG_DIR/sock.err" &
+  SOCK_PID=$!
+  local i line port
+  for i in $(seq 1 50); do
+    if [[ -s $DISPLAY_LOG_DIR/sock.ready ]]; then
+      line=$(head -n 1 "$DISPLAY_LOG_DIR/sock.ready")
+      if [[ $line == ready* ]]; then
+        port=$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<<"$line")
+        break
+      fi
+    fi
+    if ! kill -0 "$SOCK_PID" 2>/dev/null; then
+      echo "socket helper exited" >&2
+      cat "$DISPLAY_LOG_DIR/sock.err" >&2 || true
+      return 1
+    fi
+    sleep 0.05
+  done
+  if [[ -z ${port:-} ]]; then
+    echo "socket helper did not become ready" >&2
+    cat "$DISPLAY_LOG_DIR/sock.err" >&2 || true
+    return 1
+  fi
+  exec {SOCK_FD}<>/dev/tcp/127.0.0.1/"$port"
+  echo "socket helper port=$port"
+}
+
+capture_core_devices() {
+  CORE_POINTER_ID=$(xinput list --id-only 'Virtual core pointer' | head -n 1)
+  CORE_KEYBOARD_ID=$(xinput list --id-only 'Virtual core keyboard' | head -n 1)
+  [[ -n $CORE_POINTER_ID && -n $CORE_KEYBOARD_ID ]] || die "core pointer or keyboard id missing"
+  query_state "$CORE_POINTER_ID" >/dev/null
+  query_state "$CORE_KEYBOARD_ID" >/dev/null
+  read -r ROOT_W ROOT_H < <(xwininfo -root | awk '/Width:/ { w = $2 } /Height:/ { h = $2 } END { print w, h }')
+  echo "core pointer=$CORE_POINTER_ID keyboard=$CORE_KEYBOARD_ID root=${ROOT_W}x${ROOT_H}"
+  (( ROOT_W >= 8000 && ROOT_H >= 800 )) || die "root ${ROOT_W}x${ROOT_H} is too small for a cancellable drag"
+}
+
 setup_x11() {
   unset WAYLAND_DISPLAY || true
   export XDG_SESSION_TYPE=x11
   mkdir -p "$CONFIG"
   rm -f "$CONFIG/companion.toml"
-  cargo build --locked --bins
+  build_bins
   start_uinput
   if ! start_xorg "$root/ci/display/xorg-libinput.conf" "$DISPLAY_LOG_DIR/xorg-libinput.log"; then
     echo "Xorg did not start with the libinput config" >&2
@@ -629,7 +773,9 @@ setup_x11() {
     sleep 0.1
   done
   xdotool search --name "Event Tester" >/dev/null 2>&1 || die "xev window did not appear"
+  capture_core_devices
   start_visor
+  start_socket_helper
   open_session
   echo "xinput:"
   xinput list
@@ -698,15 +844,7 @@ PY
     done
     wait "$curl_pid" || true
     code=$(cat "$DISPLAY_LOG_DIR/type.code")
-    n=$(python3 - "$HTTP_BODY" <<'PY'
-import json, re, sys
-body = json.load(open(sys.argv[1]))
-err = body.get("error", "")
-print(err, file=sys.stderr)
-match = re.search(r"after (\d+) keystrokes", err)
-print(match.group(1) if match else "")
-PY
-)
+    n=$(sent_after keystrokes)
     echo "attempt $attempt status $code sent ${n:-none}"
     if [[ $code == 409 && -n $n && $n -gt 0 && $n -lt 4000 ]]; then
       local qcount
@@ -819,7 +957,7 @@ scenario_held_release() {
   a=$(keycode_for a)
   [[ -n $control && -n $a ]] || die "keymap has no Control_L or a"
   if key_is_down "$control" || key_is_down "$a"; then
-    xinput query-state "Virtual core keyboard" >&2 || true
+    query_state "$CORE_KEYBOARD_ID" >&2 || true
     die "finished type left a key down"
   fi
 
@@ -835,31 +973,20 @@ PY
     http_code "$DISPLAY_LOG_DIR/type.code" POST "$BASE/session/$SID/type" @"$DISPLAY_LOG_DIR/held-type.json" &
     local curl_pid=$!
     local i
-    for i in $(seq 1 50); do
-      if [[ $(injecting || echo false) == true ]]; then
-        socket_action pause || true
-        break
-      fi
+    sleep 0.02
+    for i in $(seq 1 400); do
       if ! kill -0 "$curl_pid" 2>/dev/null; then
         break
       fi
-      sleep 0.02
+      socket_action pause || true
     done
     wait "$curl_pid" || true
     code=$(cat "$DISPLAY_LOG_DIR/type.code")
-    n=$(python3 - "$HTTP_BODY" <<'PY'
-import json, re, sys
-body = json.load(open(sys.argv[1]))
-err = body.get("error", "")
-print(err, file=sys.stderr)
-match = re.search(r"after (\d+) keystrokes", err)
-print(match.group(1) if match else "")
-PY
-)
+    n=$(sent_after keystrokes)
     echo "key cancel attempt $attempt status $code sent ${n:-none}"
     if [[ $code == 409 && -n $n && $n -gt 0 ]]; then
       if key_is_down "$control"; then
-        xinput query-state "Virtual core keyboard" >&2 || true
+        query_state "$CORE_KEYBOARD_ID" >&2 || true
         die "cancel left control down"
       fi
       break
@@ -869,30 +996,43 @@ PY
     fi
   done
 
+  # A short drag finishes before a pause can land. The root is wide so
+  # this is hundreds of pointer steps, and the socket helper pauses between
+  # batches. sent must include the button-down and exclude the button-up.
+  local to_x=$((ROOT_W - 1)) to_y=$((ROOT_H / 2))
+  (( to_x <= 32767 )) || to_x=32767
+  local points=$(( (to_x + 63) / 64 ))
+  local total=$((points + 3))
   local drag_ok=0
+  local delay
   for attempt in 1 2 3 4 5; do
+    case $attempt in
+      1) delay=0.02 ;;
+      2) delay=0.05 ;;
+      3) delay=0.01 ;;
+      4) delay=0.08 ;;
+      *) delay=0 ;;
+    esac
     ensure_running
     http_code "$DISPLAY_LOG_DIR/drag.code" POST "$BASE/session/$SID/mouse" \
-      '{"action":"drag","x":0,"y":0,"to_x":1279,"to_y":719,"button":"left"}' &
+      "{\"action\":\"drag\",\"x\":0,\"y\":0,\"to_x\":$to_x,\"to_y\":$to_y,\"button\":\"left\"}" &
     curl_pid=$!
-    for i in $(seq 1 50); do
-      if [[ $(injecting || echo false) == true ]]; then
-        socket_action pause || true
-        break
-      fi
+    sleep "$delay"
+    for i in $(seq 1 400); do
       if ! kill -0 "$curl_pid" 2>/dev/null; then
         break
       fi
-      sleep 0.01
+      socket_action pause || true
     done
     wait "$curl_pid" || true
     code=$(cat "$DISPLAY_LOG_DIR/drag.code")
-    echo "drag cancel attempt $attempt status $code $(cat "$HTTP_BODY")"
+    n=$(sent_after "pointer steps")
+    echo "drag cancel attempt $attempt status $code sent ${n:-none} total $total $(error_text "$HTTP_BODY")"
     if button_is_down; then
-      xinput query-state "Virtual core pointer" >&2 || true
+      query_state "$CORE_POINTER_ID" >&2 || true
       die "left button stayed down"
     fi
-    if [[ $code == 409 ]] && grep -q 'pointer steps' "$HTTP_BODY"; then
+    if [[ $code == 409 && -n $n && $n -ge 2 && $n -lt $total ]]; then
       drag_ok=1
       break
     fi
@@ -983,6 +1123,7 @@ start_wayland() {
   export XDG_SESSION_TYPE=wayland
   export WAYLAND_DISPLAY=hm-display
   export WLR_BACKENDS=headless
+  export WLR_RENDERER=pixman
   export WLR_LIBINPUT_NO_DEVICES=1
   local before
   before=$(x11_sockets)
@@ -1054,7 +1195,7 @@ scenario_portal_libei_placeholder() {
 
 run_wayland() {
   local only=${1:-}
-  cargo build --locked --bins
+  build_bins
   start_wayland || die "no headless compositor"
   if [[ -z $only || $only == wayland-refuses-automation ]]; then
     run_named wayland-refuses-automation 45 scenario_wayland_refuses_automation
