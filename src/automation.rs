@@ -423,15 +423,12 @@ impl Gate {
         false
     }
 
-    /// Watchdog tick. Does not record a poll. A running stretch with no
-    /// clock yet starts one instead of pausing on the first look.
+    /// Watchdog tick. Does not record a poll and does not grant time.
+    /// The anchor is the last companion-socket poll, or the single grace
+    /// instant from the transition that entered `running`.
     pub fn watchdog(&mut self, now: Instant, timeout: Duration) {
         if self.phase != Phase::Running {
             self.running_since = None;
-            return;
-        }
-        if self.running_since.is_none() {
-            self.running_since = Some(now);
             return;
         }
         if self.gap_expired(now, timeout) {
@@ -559,6 +556,7 @@ impl Gate {
     }
 
     fn enter_running(&mut self, session: Uuid) {
+        let fresh = self.phase != Phase::Running;
         self.session = Some(session);
         // A sample from the previous drive would look like a user move
         // to the pointer fallback the moment this stretch is running.
@@ -566,15 +564,26 @@ impl Gate {
         // last point so a later type still has somewhere to land, but do
         // not let the fallback compare against that target.
         self.drive = None;
-        self.running_since = Some(Instant::now());
+        // One grace window per off/paused → running transition. A start
+        // that is already running leaves the poll and that grace alone.
+        if fresh {
+            self.running_since = Some(Instant::now());
+        }
         self.phase = Phase::Running;
         self.bump_resume();
         self.publish();
     }
 
+    /// Last companion-socket poll when one is recorded, otherwise the grace
+    /// instant from the transition into `running`. A newer grace does not
+    /// outrank a poll, and a poll does not erase a fresher grace.
     fn gap_expired(&self, now: Instant, timeout: Duration) -> bool {
-        let since = self.running_since.unwrap_or(now);
-        let anchor = self.last_poll.map(|at| at.max(since)).unwrap_or(since);
+        let anchor = match (self.last_poll, self.running_since) {
+            (Some(poll), Some(grace)) => poll.max(grace),
+            (Some(poll), None) => poll,
+            (None, Some(grace)) => grace,
+            (None, None) => return true,
+        };
         now.saturating_duration_since(anchor) >= timeout
     }
 
@@ -1156,6 +1165,66 @@ mod tests {
             Phase::Running,
             "a stop then start must not inherit the previous stretch"
         );
+    }
+
+    #[test]
+    fn repeated_starts_while_running_do_not_extend_the_watchdog() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let timeout = Duration::from_millis(100);
+        gate.control(Some(id), Control::Start).unwrap();
+        let opened = Instant::now();
+        std::thread::sleep(Duration::from_millis(60));
+        gate.control(Some(id), Control::Start).unwrap();
+        gate.control(Some(id), Control::Start).unwrap();
+        assert_eq!(gate.resume_seq(), 3);
+        assert!(gate.drive().is_none());
+        gate.watchdog(opened + timeout, timeout);
+        assert_eq!(
+            gate.phase(),
+            Phase::Paused,
+            "a TCP start while running must not move the quiet-poll clock"
+        );
+    }
+
+    #[test]
+    fn a_companion_poll_extends_the_deadline_and_a_later_start_does_not() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let timeout = Duration::from_millis(100);
+        gate.control(Some(id), Control::Start).unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+        let polled = Instant::now();
+        assert!(!gate.note_poll(polled, timeout));
+        std::thread::sleep(Duration::from_millis(40));
+        gate.control(Some(id), Control::Start).unwrap();
+        gate.watchdog(polled + Duration::from_millis(90), timeout);
+        assert_eq!(gate.phase(), Phase::Running);
+        gate.watchdog(polled + timeout, timeout);
+        assert_eq!(
+            gate.phase(),
+            Phase::Paused,
+            "only the companion poll extends the deadline"
+        );
+    }
+
+    #[test]
+    fn a_fresh_transition_gets_one_grace_window() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let timeout = Duration::from_millis(100);
+        assert!(!gate.note_poll(Instant::now(), timeout));
+        std::thread::sleep(Duration::from_millis(80));
+        gate.control(Some(id), Control::Start).unwrap();
+        let opened = Instant::now();
+        gate.watchdog(opened + Duration::from_millis(50), timeout);
+        assert_eq!(
+            gate.phase(),
+            Phase::Running,
+            "an old poll must not erase the grace window"
+        );
+        gate.watchdog(opened + timeout, timeout);
+        assert_eq!(gate.phase(), Phase::Paused);
     }
 
     #[test]

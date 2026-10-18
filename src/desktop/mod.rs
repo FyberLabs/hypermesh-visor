@@ -106,6 +106,17 @@ pub trait PointerPipe: Send {
 /// Key strokes on one backend connection and one keymap.
 pub trait KeyboardPipe: Send {
     fn send(&mut self, strokes: &[Stroke]) -> Result<(), DesktopError>;
+
+    /// Keysyms this chunk will press, including implicit modifiers such as
+    /// Shift. The caller records them before [`KeyboardPipe::send`]. Releasing
+    /// a key that is not down is harmless.
+    fn presses(&self, strokes: &[Stroke]) -> Vec<u32> {
+        strokes
+            .iter()
+            .filter(|stroke| stroke.down)
+            .map(|stroke| stroke.keysym)
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

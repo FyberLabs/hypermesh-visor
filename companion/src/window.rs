@@ -234,7 +234,7 @@ fn show(mut app: App) -> Result<(), String> {
             );
             app.wayland_note_logged = true;
         }
-        if !wayland && !watch.accepts_raw() && !app.keyboard_note_logged {
+        if !wayland && !watch.accepts_raw_keyboard() && !app.keyboard_note_logged {
             eprintln!(
                 "hypermesh-companion: {}",
                 automation::KEYBOARD_INTERRUPT_NOTE
@@ -310,7 +310,7 @@ fn show(mut app: App) -> Result<(), String> {
                 }
             }
         }
-        if !watch.accepts_raw() {
+        if !watch.accepts_raw_pointer() {
             if let Some((x, y, mask)) = pointer::root_pointer_state(&conn, root) {
                 app.fallback_sample = Some((x, y, mask));
                 let drive = snap.drive.as_ref().map(|drive| automation::FallbackDrive {
@@ -390,7 +390,7 @@ fn show(mut app: App) -> Result<(), String> {
             app.bug_cursor,
             if wayland && app.menu {
                 Some(automation::WAYLAND_AUTOMATION_NOTE)
-            } else if !wayland && !watch.accepts_raw() && app.menu {
+            } else if !wayland && !watch.accepts_raw_keyboard() && app.menu {
                 Some(automation::KEYBOARD_INTERRUPT_NOTE)
             } else {
                 None

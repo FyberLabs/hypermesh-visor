@@ -150,12 +150,19 @@ pub fn mouse(display: Option<&str>, op: &MouseOp) -> Result<(), DesktopError> {
     let (conn, screen_num) = connect(display)?;
     ensure_xtest(&conn)?;
     let root = conn.setup().roots[screen_num].root;
-    match *op {
-        MouseOp::Move { x, y, .. } => move_abs(&conn, root, x, y)?,
+    let pressed = match *op {
+        MouseOp::Move { x, y, .. } => {
+            move_abs(&conn, root, x, y)?;
+            None
+        }
         MouseOp::Click { x, y, button } => {
             move_abs(&conn, root, x, y)?;
             button_event(&conn, root, button, true)?;
-            button_event(&conn, root, button, false)?;
+            if let Err(err) = button_event(&conn, root, button, false) {
+                release_pressed(&conn, root, button);
+                return Err(err);
+            }
+            Some(button)
         }
         MouseOp::Drag {
             x,
@@ -166,16 +173,29 @@ pub fn mouse(display: Option<&str>, op: &MouseOp) -> Result<(), DesktopError> {
         } => {
             move_abs(&conn, root, x, y)?;
             button_event(&conn, root, button, true)?;
-            if let Err(err) = move_abs(&conn, root, to_x, to_y) {
-                let _ = button_event(&conn, root, button, false);
-                let _ = conn.flush().map_err(input_err);
+            let moved = move_abs(&conn, root, to_x, to_y)
+                .and_then(|_| button_event(&conn, root, button, false));
+            if let Err(err) = moved {
+                release_pressed(&conn, root, button);
                 return Err(err);
             }
-            button_event(&conn, root, button, false)?;
+            Some(button)
         }
+    };
+    if let Err(err) = conn.flush().map_err(input_err) {
+        if let Some(button) = pressed {
+            release_pressed(&conn, root, button);
+        }
+        return Err(err);
     }
-    conn.flush().map_err(input_err)?;
     Ok(())
+}
+
+/// The press was accepted. Queue a release even when the matching up already
+/// failed, then flush. A second release of a button that is up is harmless.
+fn release_pressed(conn: &RustConnection, root: u32, button: Button) {
+    let _ = button_event(conn, root, button, false);
+    let _ = conn.flush().map_err(input_err);
 }
 
 pub fn pointer_steps(
@@ -271,6 +291,10 @@ impl XKeyboard {
 }
 
 impl KeyboardPipe for XKeyboard {
+    fn presses(&self, strokes: &[Stroke]) -> Vec<u32> {
+        planned_presses(&self.map, strokes)
+    }
+
     fn send(&mut self, strokes: &[Stroke]) -> Result<(), DesktopError> {
         let mut planned = Vec::with_capacity(strokes.len());
         for stroke in strokes {
@@ -280,25 +304,105 @@ impl KeyboardPipe for XKeyboard {
                 })?;
             planned.push((keycode, needs_shift, stroke.down));
         }
-        for (keycode, needs_shift, down) in planned {
-            if needs_shift {
-                let shift = self.shift.ok_or_else(|| {
-                    DesktopError::Input("the session keymap has no shift key".into())
-                })?;
-                if down {
-                    key_event(&self.conn, shift, true)?;
-                    key_event(&self.conn, keycode, true)?;
-                } else {
-                    key_event(&self.conn, keycode, false)?;
-                    key_event(&self.conn, shift, false)?;
-                }
-            } else {
-                key_event(&self.conn, keycode, down)?;
+        let events = expand_key_events(&planned, self.shift)
+            .map_err(|_| DesktopError::Input("the session keymap has no shift key".into()))?;
+        let mut sent = Vec::with_capacity(events.len());
+        for event in events {
+            if let Err(err) = key_event(&self.conn, event.keycode, event.down) {
+                self.release_keycodes(&unreleased_keycodes(&sent));
+                return Err(err);
             }
+            sent.push(event);
         }
-        self.conn.flush().map_err(input_err)?;
+        if let Err(err) = self.conn.flush().map_err(input_err) {
+            self.release_keycodes(&unreleased_keycodes(&sent));
+            return Err(err);
+        }
         Ok(())
     }
+}
+
+impl XKeyboard {
+    fn release_keycodes(&mut self, codes: &[u8]) {
+        for code in codes.iter().rev() {
+            let _ = key_event(&self.conn, *code, false);
+        }
+        let _ = self.conn.flush().map_err(input_err);
+    }
+}
+
+/// Downs this chunk will press, with Shift before a keysym that needs it.
+pub(crate) fn planned_presses(map: &KeyMap, strokes: &[Stroke]) -> Vec<u32> {
+    let mut downs = Vec::new();
+    for stroke in strokes {
+        if !stroke.down {
+            continue;
+        }
+        let needs_shift = find_keycode(map, stroke.keysym)
+            .map(|(_, shift)| shift)
+            .unwrap_or(false);
+        if needs_shift {
+            downs.push(XK_SHIFT_L);
+        }
+        downs.push(stroke.keysym);
+    }
+    downs
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyEvent {
+    pub keycode: u8,
+    pub down: bool,
+}
+
+/// `planned` entries are `(keycode, needs_shift, down)`.
+pub(crate) fn expand_key_events(
+    planned: &[(u8, bool, bool)],
+    shift: Option<u8>,
+) -> Result<Vec<KeyEvent>, ()> {
+    let mut events = Vec::new();
+    for &(keycode, needs_shift, down) in planned {
+        if needs_shift {
+            let shift = shift.ok_or(())?;
+            if down {
+                events.push(KeyEvent {
+                    keycode: shift,
+                    down: true,
+                });
+                events.push(KeyEvent {
+                    keycode,
+                    down: true,
+                });
+            } else {
+                events.push(KeyEvent {
+                    keycode,
+                    down: false,
+                });
+                events.push(KeyEvent {
+                    keycode: shift,
+                    down: false,
+                });
+            }
+        } else {
+            events.push(KeyEvent { keycode, down });
+        }
+    }
+    Ok(events)
+}
+
+/// Keycodes pressed in `events` that this slice did not release.
+pub(crate) fn unreleased_keycodes(events: &[KeyEvent]) -> Vec<u8> {
+    let mut held = Vec::new();
+    for event in events {
+        if event.down {
+            held.push(event.keycode);
+            continue;
+        }
+        if let Some(index) = held.iter().rposition(|code| *code == event.keycode) {
+            held.remove(index);
+        }
+    }
+    held
 }
 
 pub fn type_strokes(display: Option<&str>, strokes: &[Stroke]) -> Result<(), DesktopError> {
@@ -455,5 +559,34 @@ mod tests {
             down: false,
         });
         assert!(unreleased_buttons(&released).is_empty());
+    }
+
+    #[test]
+    fn a_shifted_press_keeps_shift_until_the_matching_up() {
+        let map = KeyMap {
+            min: 38,
+            per: 2,
+            keysyms: vec![0x61, 0x41],
+        };
+        let strokes = [
+            Stroke {
+                keysym: 0x41,
+                down: true,
+            },
+            Stroke {
+                keysym: 0x41,
+                down: false,
+            },
+        ];
+        assert_eq!(planned_presses(&map, &strokes), vec![XK_SHIFT_L, 0x41]);
+        let events = expand_key_events(&[(38, true, true), (38, true, false)], Some(50)).unwrap();
+        assert_eq!(
+            unreleased_keycodes(&events[..1]),
+            vec![50],
+            "shift stays down when the key press has not been sent"
+        );
+        assert_eq!(unreleased_keycodes(&events[..2]), vec![50, 38]);
+        assert!(unreleased_keycodes(&events).is_empty());
+        assert!(expand_key_events(&[(38, true, true)], None).is_err());
     }
 }

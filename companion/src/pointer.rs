@@ -6,10 +6,12 @@
 //! and are ignored. Other raw motion, button presses, and key presses are the
 //! user.
 //!
-//! If XInput2 or the XTEST devices cannot be identified, the companion falls
+//! If XInput2 or the XTEST pointer cannot be identified, the companion falls
 //! back to comparing the pointer with the last drive coordinate after the move
-//! has settled. That fallback cannot see key presses. A type sample with no
-//! known pointer is left out of that comparison. Wayland automation is off
+//! has settled. That fallback cannot see key presses. A missing XTEST keyboard
+//! uses the no-keyboard-interrupt path, so raw keys are not treated as the
+//! user. A type sample with no known pointer is left out of that comparison.
+//! Wayland automation is off
 //! until issue #17, so this detector is not asked to tell portal input from a
 //! physical device.
 //!
@@ -24,7 +26,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType};
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::ConnectionExt as _;
-use x11rb::protocol::xinput::{self, ConnectionExt as _, XIEventMask};
+use x11rb::protocol::xinput::{self, ConnectionExt as _, DeviceType, XIEventMask};
 use x11rb::protocol::xproto::{
     self, ClipOrdering, ConfigureWindowAux, ConnectionExt as _, CreateWindowAux, ImageFormat,
     ImageOrder, StackMode, WindowClass,
@@ -85,18 +87,58 @@ fn cursor_png(name: &str) -> Option<&'static [u8]> {
 }
 
 pub struct Watch {
-    pub xtest: Vec<u16>,
-    pub ready: bool,
+    xtest_pointer: Vec<u16>,
+    xtest_keyboard: Vec<u16>,
+    pointer_ready: bool,
+    keyboard_ready: bool,
     pending_px: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum XTestClass {
+    Pointer,
+    Keyboard,
+}
+
+/// An XTEST device belongs to one class. A name is only a fallback when the
+/// device type is neither pointer nor keyboard.
+pub(crate) fn classify_xtest_device(name: &str, device_type: u16) -> Option<XTestClass> {
+    let name = name.to_ascii_lowercase();
+    if !name.contains("xtest") {
+        return None;
+    }
+    let pointer = u16::from(DeviceType::SLAVE_POINTER);
+    let master_pointer = u16::from(DeviceType::MASTER_POINTER);
+    let keyboard = u16::from(DeviceType::SLAVE_KEYBOARD);
+    let master_keyboard = u16::from(DeviceType::MASTER_KEYBOARD);
+    if device_type == pointer || device_type == master_pointer {
+        return Some(XTestClass::Pointer);
+    }
+    if device_type == keyboard || device_type == master_keyboard {
+        return Some(XTestClass::Keyboard);
+    }
+    if name.contains("keyboard") {
+        return Some(XTestClass::Keyboard);
+    }
+    if name.contains("pointer") {
+        return Some(XTestClass::Pointer);
+    }
+    None
+}
+
 impl Watch {
-    pub fn attach(conn: &RustConnection, root: u32) -> Self {
-        let mut watch = Self {
-            xtest: Vec::new(),
-            ready: false,
+    fn blank() -> Self {
+        Self {
+            xtest_pointer: Vec::new(),
+            xtest_keyboard: Vec::new(),
+            pointer_ready: false,
+            keyboard_ready: false,
             pending_px: 0.0,
-        };
+        }
+    }
+
+    pub fn attach(conn: &RustConnection, root: u32) -> Self {
+        let mut watch = Self::blank();
         if conn
             .xinput_xi_query_version(2, 2)
             .ok()
@@ -112,13 +154,22 @@ impl Watch {
             return watch;
         };
         for info in &reply.infos {
-            let name = String::from_utf8_lossy(&info.name).to_ascii_lowercase();
-            if name.contains("xtest") {
-                watch.xtest.push(info.deviceid);
-            }
+            let name = String::from_utf8_lossy(&info.name);
+            watch.consider(&name, u16::from(info.type_), info.deviceid);
         }
-        let mask =
-            XIEventMask::RAW_MOTION | XIEventMask::RAW_BUTTON_PRESS | XIEventMask::RAW_KEY_PRESS;
+        let pointer = watch.accepts_raw_pointer_ids();
+        let keyboard = watch.accepts_raw_keyboard_ids();
+        if !pointer && !keyboard {
+            return watch;
+        }
+        let mask = match (pointer, keyboard) {
+            (true, true) => {
+                XIEventMask::RAW_MOTION | XIEventMask::RAW_BUTTON_PRESS | XIEventMask::RAW_KEY_PRESS
+            }
+            (true, false) => XIEventMask::RAW_MOTION | XIEventMask::RAW_BUTTON_PRESS,
+            (false, true) => XIEventMask::RAW_KEY_PRESS,
+            (false, false) => return watch,
+        };
         let select = xinput::EventMask {
             deviceid: 0,
             mask: vec![mask],
@@ -130,23 +181,58 @@ impl Watch {
         if cookie.check().is_err() {
             return watch;
         }
-        watch.ready = !watch.xtest.is_empty();
+        watch.finish_select(true);
         watch
     }
 
-    /// A missing XTEST device leaves XI2 unused. The window then uses the
+    fn consider(&mut self, name: &str, device_type: u16, device_id: u16) {
+        match classify_xtest_device(name, device_type) {
+            Some(XTestClass::Pointer) => self.xtest_pointer.push(device_id),
+            Some(XTestClass::Keyboard) => self.xtest_keyboard.push(device_id),
+            None => {}
+        }
+    }
+
+    fn accepts_raw_pointer_ids(&self) -> bool {
+        !self.xtest_pointer.is_empty()
+    }
+
+    fn accepts_raw_keyboard_ids(&self) -> bool {
+        !self.xtest_keyboard.is_empty()
+    }
+
+    fn finish_select(&mut self, selected: bool) {
+        if !selected {
+            return;
+        }
+        self.pointer_ready = self.accepts_raw_pointer_ids();
+        self.keyboard_ready = self.accepts_raw_keyboard_ids();
+    }
+
+    /// Motion and buttons can use XI2. A missing XTEST pointer keeps the
     /// drive-sample detector.
-    pub fn accepts_raw(&self) -> bool {
-        self.ready
+    pub fn accepts_raw_pointer(&self) -> bool {
+        self.pointer_ready
+    }
+
+    /// Keys can be filtered. A missing XTEST keyboard is the fail-closed
+    /// interrupt: raw keys are not user input.
+    pub fn accepts_raw_keyboard(&self) -> bool {
+        self.keyboard_ready
+    }
+
+    fn pointer_is_user(&self, device: u16, source: u16) -> bool {
+        self.pointer_ready && !automation::is_synthetic(device, source, &self.xtest_pointer)
+    }
+
+    fn key_is_user(&self, device: u16, source: u16) -> bool {
+        self.keyboard_ready && !automation::is_synthetic(device, source, &self.xtest_keyboard)
     }
 
     pub fn observe(&mut self, event: &Event) -> Option<LiveInput> {
-        if !self.accepts_raw() {
-            return None;
-        }
         match event {
             Event::XinputRawMotion(raw) => {
-                if automation::is_synthetic(raw.deviceid, raw.sourceid, &self.xtest) {
+                if !self.pointer_is_user(raw.deviceid, raw.sourceid) {
                     return None;
                 }
                 if raw.axisvalues_raw.is_empty() {
@@ -166,17 +252,17 @@ impl Watch {
                 }
             }
             Event::XinputRawButtonPress(raw) => {
-                if automation::is_synthetic(raw.deviceid, raw.sourceid, &self.xtest) {
-                    None
-                } else {
+                if self.pointer_is_user(raw.deviceid, raw.sourceid) {
                     Some(LiveInput::Button)
+                } else {
+                    None
                 }
             }
             Event::XinputRawKeyPress(raw) => {
-                if automation::is_synthetic(raw.deviceid, raw.sourceid, &self.xtest) {
-                    None
-                } else {
+                if self.key_is_user(raw.deviceid, raw.sourceid) {
                     Some(LiveInput::Key)
+                } else {
+                    None
                 }
             }
             _ => None,
@@ -753,6 +839,38 @@ mod tests {
         ));
         assert!(!overlay_error_disables_retry("connection reset"));
         assert!(!overlay_error_disables_retry(""));
+    }
+
+    #[test]
+    fn xtest_pointer_and_keyboard_are_tracked_apart() {
+        let pointer = u16::from(x11rb::protocol::xinput::DeviceType::SLAVE_POINTER);
+        let keyboard = u16::from(x11rb::protocol::xinput::DeviceType::SLAVE_KEYBOARD);
+        let mut watch = super::Watch::blank();
+        watch.consider("Virtual core XTEST pointer", pointer, 6);
+        watch.consider("Virtual core pointer", pointer, 2);
+        watch.finish_select(true);
+        assert!(watch.accepts_raw_pointer());
+        assert!(!watch.accepts_raw_keyboard());
+        assert!(!watch.key_is_user(9, 3));
+        assert!(!watch.pointer_is_user(6, 2));
+        assert!(watch.pointer_is_user(9, 3));
+
+        let mut keys = super::Watch::blank();
+        keys.consider("Virtual core XTEST keyboard", keyboard, 7);
+        keys.finish_select(true);
+        assert!(!keys.accepts_raw_pointer());
+        assert!(keys.accepts_raw_keyboard());
+        assert!(!keys.key_is_user(7, 3));
+        assert!(keys.key_is_user(9, 3));
+        assert!(!keys.pointer_is_user(9, 3));
+
+        let mut both = super::Watch::blank();
+        both.consider("Virtual core XTEST pointer", pointer, 6);
+        both.consider("Virtual core XTEST keyboard", keyboard, 7);
+        both.finish_select(false);
+        assert!(!both.accepts_raw_pointer());
+        assert!(!both.accepts_raw_keyboard());
+        assert!(!both.key_is_user(9, 3));
     }
 
     #[test]

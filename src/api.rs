@@ -419,7 +419,8 @@ impl AppState {
             gate.stop();
             return Ok(());
         }
-        let _injection = lock(&self.injection);
+        // Start and resume only publish. They do not wait on the injection
+        // lock. An in-flight call sees the snapshot at its next check.
         let session = self.control_session();
         let mut gate = lock(&self.automation);
         // Decide under the same lock that applies the action. Only the
@@ -1356,8 +1357,7 @@ fn inject_mouse(
         if cancelled() {
             return Err(paused_after(0, "pointer steps"));
         }
-        desktop.mouse(op).map_err(ApiError::from_desktop)?;
-        return Ok(());
+        return inject_short_mouse(desktop, op, release);
     };
     let points =
         drag_point_count(x, y, to_x, to_y).map_err(|_| ApiError::bad("drag is too long"))?;
@@ -1365,7 +1365,7 @@ fn inject_mouse(
         if cancelled() {
             return Err(paused_after(0, "pointer steps"));
         }
-        return desktop.mouse(op).map_err(ApiError::from_desktop);
+        return inject_short_mouse(desktop, op, release);
     }
     let mut steps =
         drag_steps(x, y, to_x, to_y, button).map_err(|_| ApiError::bad("drag is too long"))?;
@@ -1379,11 +1379,42 @@ fn inject_mouse(
         if batch.is_empty() {
             break;
         }
+        for step in &batch {
+            if matches!(step, PointerStep::Button { down: true, .. }) {
+                release.note_step(*step);
+            }
+        }
         pipe.send(&batch).map_err(ApiError::from_desktop)?;
         for step in batch {
-            release.note_step(step);
+            if matches!(step, PointerStep::Button { down: false, .. }) {
+                release.note_step(step);
+            }
             done += 1;
         }
+    }
+    Ok(())
+}
+
+/// Click and a one-step drag press a button inside `mouse`. Note the down
+/// before that call so a failure still releases it.
+fn inject_short_mouse(
+    desktop: &dyn Desktop,
+    op: &MouseOp,
+    release: &mut ReleaseGuard<'_>,
+) -> Result<(), ApiError> {
+    let button = match *op {
+        MouseOp::Click { button, .. } | MouseOp::Drag { button, .. } => Some(button),
+        MouseOp::Move { .. } => None,
+    };
+    if let Some(button) = button {
+        release.note_step(PointerStep::Button { button, down: true });
+    }
+    desktop.mouse(op).map_err(ApiError::from_desktop)?;
+    if let Some(button) = button {
+        release.note_step(PointerStep::Button {
+            button,
+            down: false,
+        });
     }
     Ok(())
 }
@@ -1567,8 +1598,15 @@ async fn type_keys(
                 return Err(paused_after(sent, "keystrokes"));
             }
             let chunk = take_keystrokes(rest, TYPE_CHUNK_KEYSTROKES);
+            for keysym in keyboard.presses(chunk) {
+                release.note_strokes(&[Stroke { keysym, down: true }]);
+            }
             KeyboardPipe::send(&mut *keyboard, chunk).map_err(ApiError::from_desktop)?;
-            release.note_strokes(chunk);
+            for stroke in chunk {
+                if !stroke.down {
+                    release.note_strokes(std::slice::from_ref(stroke));
+                }
+            }
             sent += keystroke_count(chunk);
             rest = &rest[chunk.len()..];
         }
@@ -2009,6 +2047,11 @@ mod tests {
         typed: Mutex<Vec<Stroke>>,
         pointer_log: Mutex<Vec<crate::input::PointerStep>>,
         block_type: AtomicBool,
+        /// Record this many strokes of the next `type_input`, then fail and clear.
+        /// `0` does not fail. The guard's later release is a new call.
+        type_fail_after: AtomicUsize,
+        /// The next `mouse` call fails before it is recorded.
+        fail_mouse: AtomicBool,
         /// 1-based `pointer_steps` call to block inside. `0` blocks nothing.
         block_step_call: AtomicUsize,
         /// 1-based `pointer_steps` call that fails before it is recorded.
@@ -2038,6 +2081,8 @@ mod tests {
                 typed: Mutex::new(Vec::new()),
                 pointer_log: Mutex::new(Vec::new()),
                 block_type: AtomicBool::new(false),
+                type_fail_after: AtomicUsize::new(0),
+                fail_mouse: AtomicBool::new(false),
                 block_step_call: AtomicUsize::new(0),
                 fail_step_call: AtomicUsize::new(0),
                 block_pointer: AtomicBool::new(false),
@@ -2088,14 +2133,26 @@ mod tests {
         }
 
         fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError> {
+            if self.fail_mouse.swap(false, Ordering::SeqCst) {
+                return Err(DesktopError::Input("mouse failed after press".into()));
+            }
             lock(&self.mice).push(op.clone());
             Ok(())
         }
 
         fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError> {
-            lock(&self.typed).extend_from_slice(strokes);
-            while self.block_type.load(Ordering::SeqCst) {
-                std::thread::sleep(Duration::from_millis(5));
+            let fail_after = self.type_fail_after.swap(0, Ordering::SeqCst);
+            if fail_after == 0 {
+                lock(&self.typed).extend_from_slice(strokes);
+                while self.block_type.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                return Ok(());
+            }
+            let keep = strokes.len().min(fail_after);
+            lock(&self.typed).extend_from_slice(&strokes[..keep]);
+            if strokes.len() > keep {
+                return Err(DesktopError::Input("type failed mid-chunk".into()));
             }
             Ok(())
         }
@@ -3304,6 +3361,186 @@ while True:
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_click_releases_the_button() {
+        let desktop = FakeDesktop::new();
+        desktop.fail_mouse.store(true, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"click","x":1,"y":2,"button":"left"}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 502, "{text}");
+        assert!(lock(&desktop.mice).is_empty());
+        let steps = lock(&desktop.pointer_log).clone();
+        assert!(
+            matches!(
+                steps.last(),
+                Some(crate::input::PointerStep::Button { down: false, .. })
+            ),
+            "{steps:?}"
+        );
+        desktop.fail_mouse.store(true, Ordering::SeqCst);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"drag","x":4,"y":5,"to_x":4,"to_y":6,"button":"left"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 502);
+        let steps = lock(&desktop.pointer_log).clone();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|step| matches!(
+                    step,
+                    crate::input::PointerStep::Button { down: false, .. }
+                ))
+                .count(),
+            2,
+            "{steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_type_chunk_that_fails_mid_send_still_releases_the_key() {
+        let desktop = FakeDesktop::new();
+        desktop.type_fail_after.store(1, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(
+                r#"{"keys":[{"key":"control","action":"down"},{"key":"a","action":"tap"}]}"#.into(),
+            ),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 502, "{text}");
+        let typed = lock(&desktop.typed).clone();
+        assert!(
+            typed
+                .iter()
+                .any(|stroke| stroke.keysym == 0xffe3 && stroke.down),
+            "{typed:?}"
+        );
+        assert!(
+            typed
+                .iter()
+                .any(|stroke| stroke.keysym == 0xffe3 && !stroke.down),
+            "{typed:?}"
+        );
+        assert!(
+            typed
+                .iter()
+                .any(|stroke| stroke.keysym == b'a' as u32 && !stroke.down),
+            "the down was recorded before the chunk failed: {typed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_does_not_wait_on_the_injection_lock() {
+        let desktop = FakeDesktop::new();
+        desktop.block_type.store(true, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let type_addr = addr;
+        let type_id = id;
+        let job = tokio::spawn(async move {
+            send(
+                type_addr,
+                "POST",
+                &format!("/session/{type_id}/type"),
+                Some(r#"{"text":"ab"}"#.into()),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (_, _, body) = send(addr, "GET", "/companion", None).await;
+                let live: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if live["automation"]["injecting"] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "type did not take the injection lock");
+        let started = tokio::time::Instant::now();
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 204, "{text}");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "start waited on the injection lock"
+        );
+        desktop.block_type.store(false, Ordering::SeqCst);
+        let (status, _, _) = job.await.unwrap();
+        assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn repeated_tcp_starts_do_not_extend_the_watchdog() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn_timeout(Arc::clone(&desktop), Duration::from_millis(80)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"click","x":1,"y":2,"button":"left"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let mut accepted = 0u32;
+        let began = tokio::time::Instant::now();
+        while began.elapsed() < Duration::from_millis(400) {
+            let (status, _, _) = send(
+                addr,
+                "POST",
+                "/companion/automation",
+                Some(r#"{"action":"start"}"#.into()),
+            )
+            .await;
+            if status == 204 {
+                accepted += 1;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            accepted >= 1,
+            "a running TCP start should still be accepted"
+        );
+        let (status, _, body) = send(addr, "GET", "/companion", None).await;
+        assert_eq!(status, 200);
+        let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snap["automation"]["phase"], "paused");
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":3,"y":4}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
     }
 
     #[tokio::test]
