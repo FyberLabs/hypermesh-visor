@@ -52,6 +52,13 @@ pub struct Scene {
     pub height: u32,
     pub rgba: Vec<u8>,
     pub hits: Vec<Hit>,
+    /// Largest scroll the rows can take. The stored value is clamped to this.
+    pub scroll_max: i32,
+}
+
+/// Keep a stored scroll inside the range `render` just used.
+pub fn clamp_scroll(scroll: i32, max_scroll: i32) -> i32 {
+    scroll.clamp(0, max_scroll.max(0))
 }
 
 struct Image {
@@ -269,7 +276,8 @@ pub fn render(
     } else {
         limit.max(1)
     };
-    let scroll = scroll.clamp(0, (natural - height).max(0));
+    let scroll_max = (natural - height).max(0);
+    let scroll = clamp_scroll(scroll, scroll_max);
     // The bug stays pinned. Rows scroll in the space under it, and a value
     // past the end clamps so the last row lands fully inside the window.
     let clip_top = if bug_h >= height { 0 } else { bug_h };
@@ -301,6 +309,7 @@ pub fn render(
         height: height as u32,
         rgba,
         hits,
+        scroll_max,
     }
 }
 
@@ -1141,6 +1150,25 @@ mod tests {
                 .expect("bug cursor");
             assert_eq!(bug.h, row_h(), "{bug:?}");
             assert!(bug.y >= 0 && bug.y + bug.h <= bottom.height as i32);
+            assert_eq!(top.scroll_max, bottom.scroll_max);
+            assert!(top.scroll_max > 0);
+            assert_eq!(clamp_scroll(1_000, top.scroll_max), top.scroll_max);
+            assert_eq!(clamp_scroll(-3, top.scroll_max), 0);
+            let stored = render(
+                &sprites,
+                &Pose::Idle,
+                Mascot::Idle,
+                0,
+                true,
+                false,
+                None,
+                false,
+                false,
+                None,
+                max_height,
+                clamp_scroll(i32::MAX, top.scroll_max),
+            );
+            assert_eq!(stored.rgba, bottom.rgba);
         }
     }
 

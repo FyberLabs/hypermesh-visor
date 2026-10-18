@@ -120,8 +120,20 @@ pub fn prepare_dir(dir: &Path) -> io::Result<()> {
     enforce_private(dir, 0o700)
 }
 
+/// True when a process is accepting connections on this socket. A leftover
+/// file from a crashed visor does not count.
+pub fn unix_socket_listening(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
 pub async fn bind(dir: &Path) -> io::Result<UnixListener> {
     let path = socket_file(dir);
+    if unix_socket_listening(&path) {
+        return Err(io::Error::new(
+            io::ErrorKind::AddrInUse,
+            "visor already running",
+        ));
+    }
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(err) if err.kind() == io::ErrorKind::NotFound => {}
@@ -258,6 +270,28 @@ mod tests {
             & 0o777;
         assert_eq!(file_mode, 0o600);
         drop(listener);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_a_live_socket_without_replacing_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "hypermesh-companion-live-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        prepare_dir(&dir).unwrap();
+        let path = socket_file(&dir);
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let err = bind(&dir).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains("visor already running"));
+        assert!(unix_socket_listening(&path));
+        drop(listener);
+        assert!(!unix_socket_listening(&path));
+        let replaced = bind(&dir).await.unwrap();
+        drop(replaced);
         let _ = fs::remove_dir_all(&dir);
     }
 }

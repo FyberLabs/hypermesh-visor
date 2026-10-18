@@ -382,6 +382,8 @@ struct AutomationBody {
     injecting: bool,
     /// Bumps at the start of each mouse or type call.
     inject_seq: u64,
+    /// Highest sequence whose desktop call has returned, including failures.
+    last_settled_seq: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     drive: Option<DriveBody>,
 }
@@ -461,9 +463,17 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
 pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()> {
     let runtime = crate::companion_sock::runtime_dir()?;
     crate::companion_sock::prepare_dir(&runtime)?;
-    let listener_sock = crate::companion_sock::bind(&runtime).await?;
     let socket_path = crate::companion_sock::socket_file(&runtime);
+    // A second process must not unlink a live companion socket and then fail
+    // the TCP bind, leaving the running visor unreachable.
+    if crate::companion_sock::unix_socket_listening(&socket_path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "visor already running",
+        ));
+    }
     let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener_sock = crate::companion_sock::bind(&runtime).await?;
     let local = listener.local_addr()?;
     println!("listening {local}");
     println!("companion socket {}", socket_path.display());
@@ -707,11 +717,12 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
             gate.reset();
         }
     }
-    let (phase, resume_seq, injecting, inject_seq, drive, notice) = {
+    let (phase, resume_seq, injecting, inject_seq, last_settled_seq, drive, notice) = {
         let gate = lock(&state.automation);
         let resume_seq = gate.resume_seq();
         let injecting = gate.injecting();
         let inject_seq = gate.inject_seq();
+        let last_settled_seq = gate.last_settled_seq();
         let drive = gate.drive().map(|drive| DriveBody {
             kind: drive.kind.as_str(),
             x: drive.x,
@@ -731,6 +742,7 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
             resume_seq,
             injecting,
             inject_seq,
+            last_settled_seq,
             drive,
             gate.notice().as_str(),
         )
@@ -744,6 +756,7 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
             resume_seq,
             injecting,
             inject_seq,
+            last_settled_seq,
             drive,
         },
         session,
@@ -2043,6 +2056,7 @@ while True:
         assert_eq!(running["automation"]["drive"]["resume_seq"], 0);
         assert_eq!(running["automation"]["injecting"], false);
         assert_eq!(running["automation"]["inject_seq"], 2);
+        assert_eq!(running["automation"]["last_settled_seq"], 2);
         assert_eq!(running["automation"]["drive"]["inject_seq"], 2);
         assert!(running["session"]["idle_ms"].as_u64().is_some());
 

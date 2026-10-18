@@ -81,6 +81,8 @@ pub struct Snapshot {
     pub injecting: bool,
     /// Latest injection sequence. A drive records the value from when it ran.
     pub inject_seq: u64,
+    /// Highest sequence whose desktop call has returned, including a failure.
+    pub last_settled_seq: u64,
     /// How the visor injects. Wayland portal input is not an XTEST device.
     pub backend: InjectionBackend,
 }
@@ -121,6 +123,7 @@ impl Snapshot {
             resume_seq: 0,
             injecting: false,
             inject_seq: 0,
+            last_settled_seq: 0,
             backend: InjectionBackend::X11,
         }
     }
@@ -141,18 +144,14 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
     } else {
         None
     };
-    let phase = if open {
-        match value
-            .pointer("/automation/phase")
-            .and_then(|phase| phase.as_str())
-            .unwrap_or("off")
-        {
-            "running" => VisorPhase::Running,
-            "paused" => VisorPhase::Paused,
-            _ => VisorPhase::Off,
-        }
-    } else {
-        VisorPhase::Off
+    let phase = match value
+        .pointer("/automation/phase")
+        .and_then(|phase| phase.as_str())
+        .unwrap_or("off")
+    {
+        "running" => VisorPhase::Running,
+        "paused" => VisorPhase::Paused,
+        _ => VisorPhase::Off,
     };
     let drive = if phase == VisorPhase::Off {
         None
@@ -171,6 +170,10 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         .pointer("/automation/inject_seq")
         .and_then(|item| item.as_u64())
         .unwrap_or(0);
+    let last_settled_seq = value
+        .pointer("/automation/last_settled_seq")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0);
     let backend = match value.get("backend").and_then(|item| item.as_str()) {
         Some("wayland") => InjectionBackend::Wayland,
         _ => InjectionBackend::X11,
@@ -185,6 +188,7 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         resume_seq,
         injecting,
         inject_seq,
+        last_settled_seq,
         backend,
     })
 }
@@ -305,6 +309,14 @@ mod tests {
         assert!(marked.injecting);
         assert_eq!(marked.inject_seq, 6);
         assert_eq!(marked.drive.unwrap().inject_seq, 6);
+        let paused = snapshot_from_body(
+            r#"{"open":false,"automation":{"phase":"paused","resume_seq":3,"last_settled_seq":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(paused.phase, VisorPhase::Paused);
+        assert_eq!(paused.resume_seq, 3);
+        assert_eq!(paused.last_settled_seq, 2);
+        assert!(paused.drive.is_none());
         assert_eq!(stamped.backend, InjectionBackend::X11);
         let wayland = snapshot_from_body(r#"{"open":false,"backend":"wayland"}"#).unwrap();
         assert_eq!(wayland.backend, InjectionBackend::Wayland);

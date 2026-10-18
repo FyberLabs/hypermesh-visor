@@ -241,6 +241,10 @@ pub struct BugCursor {
     /// True only after this process wrote the root window's cursor. The
     /// overlay path never does, so restore leaves a custom root cursor alone.
     root_cursor_set: bool,
+    /// An unsupported extension is permanent. Further frames skip the overlay.
+    overlay_disabled: bool,
+    /// The last overlay failure was already logged.
+    overlay_noted: bool,
     shown: Option<(CursorPose, usize)>,
     depth: u8,
     visual: u32,
@@ -270,6 +274,8 @@ impl BugCursor {
             sprite_hidden: false,
             hot: (0, 0),
             root_cursor_set: false,
+            overlay_disabled: false,
+            overlay_noted: false,
             shown: None,
             depth,
             visual,
@@ -344,14 +350,27 @@ impl BugCursor {
     /// Hide the system sprite and paint the bug on a click-through window.
     /// False means the caller has to put the cursor on the root window.
     fn cover_pointer(&mut self, conn: &RustConnection, image: &draw::Rgba) -> bool {
-        if self.depth != 32 {
+        if self.depth != 32 || self.overlay_disabled {
             return false;
         }
         if let Err(err) = self.present_overlay(conn, image) {
-            eprintln!("hypermesh-companion: cursor window: {err}");
+            if !self.overlay_noted {
+                if overlay_error_disables_retry(&err) {
+                    eprintln!(
+                        "hypermesh-companion: cursor overlay unavailable ({err}); the root cursor is used"
+                    );
+                } else {
+                    eprintln!("hypermesh-companion: cursor window: {err}");
+                }
+                self.overlay_noted = true;
+            }
+            if overlay_error_disables_retry(&err) {
+                self.overlay_disabled = true;
+            }
             self.reveal_sprite(conn);
             return false;
         }
+        self.overlay_noted = false;
         if self.conceal_sprite(conn) {
             return true;
         }
@@ -393,40 +412,14 @@ impl BugCursor {
 
     fn present_overlay(&mut self, conn: &RustConnection, image: &draw::Rgba) -> Result<(), String> {
         if self.overlay == 0 {
-            let overlay = conn.generate_id().map_err(|err| err.to_string())?;
-            conn.create_window(
+            let (overlay, gc) = open_overlay(
+                conn,
                 self.depth,
-                overlay,
                 self.root,
-                0,
-                0,
-                image.width as u16,
-                image.height as u16,
-                0,
-                WindowClass::INPUT_OUTPUT,
                 self.visual,
-                &CreateWindowAux::new()
-                    .colormap(self.colormap)
-                    .border_pixel(0)
-                    .background_pixel(0)
-                    .override_redirect(1u32),
-            )
-            .map_err(|err| err.to_string())?;
-            let gc = conn.generate_id().map_err(|err| err.to_string())?;
-            conn.create_gc(gc, overlay, &xproto::CreateGCAux::new())
-                .map_err(|err| err.to_string())?;
-            conn.shape_rectangles(
-                shape::SO::SET,
-                shape::SK::INPUT,
-                ClipOrdering::UNSORTED,
-                overlay,
-                0,
-                0,
-                &[],
-            )
-            .map_err(|err| err.to_string())?
-            .check()
-            .map_err(|err| err.to_string())?;
+                self.colormap,
+                image,
+            )?;
             self.overlay = overlay;
             self.overlay_gc = gc;
         }
@@ -476,6 +469,82 @@ pub fn root_pointer_state(conn: &RustConnection, root: u32) -> Option<(i32, i32,
 /// path writes it and can only restore the default cursor on the way out.
 pub(crate) fn replaces_root_cursor(overlay_covering: bool) -> bool {
     !overlay_covering
+}
+
+/// A missing Shape extension will fail the same way on every frame.
+pub(crate) fn overlay_error_disables_retry(err: &str) -> bool {
+    let err = err.to_ascii_lowercase();
+    err.contains("extension") || err.contains("shape")
+}
+
+/// Create the click-through window. A failure after the window or GC request
+/// was queued destroys that resource before the error is returned.
+fn open_overlay(
+    conn: &RustConnection,
+    depth: u8,
+    root: u32,
+    visual: u32,
+    colormap: u32,
+    image: &draw::Rgba,
+) -> Result<(u32, u32), String> {
+    let overlay = conn.generate_id().map_err(|err| err.to_string())?;
+    conn.create_window(
+        depth,
+        overlay,
+        root,
+        0,
+        0,
+        image.width as u16,
+        image.height as u16,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        visual,
+        &CreateWindowAux::new()
+            .colormap(colormap)
+            .border_pixel(0)
+            .background_pixel(0)
+            .override_redirect(1u32),
+    )
+    .map_err(|err| err.to_string())?;
+    let gc = match conn.generate_id() {
+        Ok(gc) => gc,
+        Err(err) => {
+            release_overlay(conn, overlay, None);
+            return Err(err.to_string());
+        }
+    };
+    if let Err(err) = conn.create_gc(gc, overlay, &xproto::CreateGCAux::new()) {
+        release_overlay(conn, overlay, None);
+        return Err(err.to_string());
+    }
+    let shaped = conn
+        .shape_rectangles(
+            shape::SO::SET,
+            shape::SK::INPUT,
+            ClipOrdering::UNSORTED,
+            overlay,
+            0,
+            0,
+            &[],
+        )
+        .map_err(|err| err.to_string())
+        .and_then(|cookie| cookie.check().map_err(|err| err.to_string()));
+    if let Err(err) = shaped {
+        release_overlay(conn, overlay, Some(gc));
+        return Err(err);
+    }
+    Ok((overlay, gc))
+}
+
+fn release_overlay(conn: &RustConnection, window: u32, gc: Option<u32>) {
+    if let Some(gc) = gc {
+        if let Ok(cookie) = conn.free_gc(gc) {
+            let _ = cookie.check();
+        }
+    }
+    if let Ok(cookie) = conn.destroy_window(window) {
+        let _ = cookie.check();
+    }
 }
 
 fn define(conn: &RustConnection, window: u32, cursor: u32) -> Result<(), String> {
@@ -602,7 +671,7 @@ fn pack_visual(image: &draw::Rgba, red: u32, green: u32, blue: u32, lsb: bool) -
 
 #[cfg(test)]
 mod tests {
-    use super::{fp3232, premultiply, replaces_root_cursor, Watch};
+    use super::{fp3232, overlay_error_disables_retry, premultiply, replaces_root_cursor, Watch};
 
     #[test]
     fn negative_fp3232_keeps_the_positive_fraction() {
@@ -654,6 +723,16 @@ mod tests {
     fn overlay_leaves_the_root_cursor_alone() {
         assert!(!replaces_root_cursor(true));
         assert!(replaces_root_cursor(false));
+    }
+
+    #[test]
+    fn an_unsupported_extension_disables_overlay_retries() {
+        assert!(overlay_error_disables_retry("Unsupported extension"));
+        assert!(overlay_error_disables_retry(
+            "X11 error RequestError { error_code: 1, shape: true }"
+        ));
+        assert!(!overlay_error_disables_retry("connection reset"));
+        assert!(!overlay_error_disables_retry(""));
     }
 
     #[test]

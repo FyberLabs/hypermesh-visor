@@ -128,8 +128,10 @@ pub struct Gate {
     /// Bumped when mouse or type is about to inject. Stays put when that
     /// injection finishes so a drive can be matched to it.
     inject_seq: u64,
-    /// True from the moment an injection starts until its drive is recorded,
-    /// or the injection returns an error.
+    /// Highest sequence whose desktop call has returned, including a failure
+    /// that recorded no drive. The companion stops deferring at this sequence.
+    last_settled_seq: u64,
+    /// True from the moment an injection starts until its desktop call returns.
     injecting: bool,
 }
 
@@ -145,6 +147,7 @@ impl Default for Gate {
             generation: 0,
             resume_seq: 0,
             inject_seq: 0,
+            last_settled_seq: 0,
             injecting: false,
         }
     }
@@ -187,6 +190,10 @@ impl Gate {
         self.injecting
     }
 
+    pub fn last_settled_seq(&self) -> u64 {
+        self.last_settled_seq
+    }
+
     /// Mark an injection before the desktop call. The sequence is the value
     /// the drive will store if this injection records.
     pub fn begin_inject(&mut self) -> u64 {
@@ -195,10 +202,11 @@ impl Gate {
         self.inject_seq
     }
 
-    /// The desktop call returned. The drive, when one was recorded, keeps the
-    /// sequence. The flag is what the companion watches while the call runs.
+    /// The desktop call returned. A failure records no drive, so this sequence
+    /// is settled on its own and the companion does not keep deferring.
     pub fn end_inject(&mut self) {
         self.injecting = false;
+        self.last_settled_seq = self.last_settled_seq.max(self.inject_seq);
     }
 
     /// A pause covers the whole desktop. Every session injects into the same
@@ -229,11 +237,13 @@ impl Gate {
         // start look older than a cutoff the companion still holds.
         let resume_seq = self.resume_seq;
         let inject_seq = self.inject_seq;
+        let last_settled_seq = self.last_settled_seq;
         *self = Self {
             notice,
             generation,
             resume_seq,
             inject_seq,
+            last_settled_seq,
             ..Self::default()
         };
     }
@@ -698,12 +708,18 @@ mod tests {
         gate.end_inject();
         assert!(!gate.injecting());
         assert_eq!(gate.inject_seq(), 1);
+        assert_eq!(gate.last_settled_seq(), 1);
+        gate.begin_inject();
+        gate.end_inject();
+        assert_eq!(gate.last_settled_seq(), 2);
+        assert!(gate.drive().unwrap().inject_seq < gate.last_settled_seq());
         gate.begin_inject();
         gate.reset();
         assert!(!gate.injecting());
+        assert_eq!(gate.last_settled_seq(), 2);
         assert_eq!(
             gate.inject_seq(),
-            2,
+            3,
             "reset must not reuse an in-flight sequence"
         );
     }

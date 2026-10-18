@@ -3,7 +3,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -59,6 +59,8 @@ struct App {
     fallback_after_resume: Option<u64>,
     /// Pointer fallback: baseline, button mask, and the in-flight injection.
     fallback: automation::FallbackTrack,
+    /// When the companion first showed the current drive sample.
+    sample_age: automation::SampleAge,
     /// Menu and continue-prompt scroll, in pixels.
     scroll: i32,
 }
@@ -92,6 +94,7 @@ pub fn run() -> Result<(), String> {
         resume_seq_prior: 0,
         fallback_after_resume: None,
         fallback: automation::FallbackTrack::default(),
+        sample_age: automation::SampleAge::default(),
         scroll: 0,
     };
     show(app)
@@ -185,10 +188,13 @@ fn show(mut app: App) -> Result<(), String> {
             break;
         }
         let now_ms = app.started.elapsed().as_millis() as u64;
-        let wall_ms = wall_ms();
         let dt = last_frame.elapsed().as_millis() as u64;
         last_frame = Instant::now();
         let (snap, epoch) = app.poller.snapshot();
+        let sample_age_ms = snap.drive.as_ref().map_or(0, |drive| {
+            app.sample_age
+                .observe(drive.inject_seq, drive.at_ms, now_ms)
+        });
         let visor_phase = if snap.connected {
             snap.phase
         } else {
@@ -244,6 +250,7 @@ fn show(mut app: App) -> Result<(), String> {
                         } else {
                             app.scroll = app.scroll.saturating_add(step);
                         }
+                        app.scroll = draw::clamp_scroll(app.scroll, scene.scroll_max);
                     }
                     1 => click = Some((i32::from(press.event_x), i32::from(press.event_y))),
                     _ => {}
@@ -266,10 +273,11 @@ fn show(mut app: App) -> Result<(), String> {
                     y,
                     mask,
                     now_ms,
-                    wall_ms,
+                    sample_age_ms,
                     epoch,
                     injecting: snap.injecting,
                     inject_seq: snap.inject_seq,
+                    last_settled_seq: snap.last_settled_seq,
                     drive,
                     after_resume: app.fallback_after_resume,
                 };
@@ -320,6 +328,7 @@ fn show(mut app: App) -> Result<(), String> {
                 .max(1),
             app.scroll,
         );
+        app.scroll = draw::clamp_scroll(app.scroll, scene.scroll_max);
         if (scene.width, scene.height) != size {
             let (x, y) = place(
                 screen.width_in_pixels,
@@ -340,7 +349,14 @@ fn show(mut app: App) -> Result<(), String> {
         }
         put_scene(&conn, window, gc, &scene, depth, lsb, red, green, blue)?;
         sync_cursor(
-            &mut app, &mut guard, &art, &snap, &conn, root, now_ms, wall_ms,
+            &mut app,
+            &mut guard,
+            &art,
+            &snap,
+            &conn,
+            root,
+            now_ms,
+            sample_age_ms,
         )?;
         conn.flush().map_err(|err| err.to_string())?;
         std::thread::sleep(Duration::from_millis(80));
@@ -416,7 +432,7 @@ fn sync_cursor(
     conn: &RustConnection,
     root: u32,
     now_ms: u64,
-    wall_ms: u64,
+    sample_age_ms: u64,
 ) -> Result<(), String> {
     app.pose = if snap.connected {
         snap.pose.clone()
@@ -427,7 +443,7 @@ fn sync_cursor(
     let motion = if app.machine.phase() == Phase::Running {
         snap.drive.as_ref().map(|drive| Motion {
             kind: drive.kind,
-            age_ms: wall_ms.saturating_sub(drive.at_ms),
+            age_ms: sample_age_ms,
             distance_px: drive.distance_px,
             elapsed_ms: drive.elapsed_ms,
             clickable: drive.clickable,
@@ -510,13 +526,6 @@ fn local_motion(app: &mut App, conn: &RustConnection, root: u32, now_ms: u64) ->
         None
     };
     moved
-}
-
-fn wall_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
 }
 
 fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_ms: u64) {

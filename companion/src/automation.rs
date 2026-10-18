@@ -340,11 +340,14 @@ pub struct FallbackInput {
     pub mask: u32,
     /// Milliseconds since the companion started. Not the drive's unix time.
     pub now_ms: u64,
-    /// Wall clock used only to age a drive sample.
-    pub wall_ms: u64,
+    /// How long this drive has been visible to the companion, measured from
+    /// the first poll that showed it. Not a difference of wall clocks.
+    pub sample_age_ms: u64,
     pub epoch: u64,
     pub injecting: bool,
     pub inject_seq: u64,
+    /// Visor sequence that has finished, including a desktop call that failed.
+    pub last_settled_seq: u64,
     pub drive: Option<FallbackDrive>,
     pub after_resume: Option<u64>,
 }
@@ -357,8 +360,14 @@ pub struct FallbackTrack {
     displacement_hold: Option<FallbackHold>,
     baseline_ready: bool,
     defer_seq: Option<u64>,
+    /// Start of the current uninterrupted injection chain. A new sequence does
+    /// not move this.
     defer_since_ms: u64,
-    /// Highest injection sequence that has matched a drive or timed out.
+    defer_open: bool,
+    /// The chain already used its [`INJECT_HOLD_MS`] budget. Stays set until a
+    /// poll shows nothing in flight.
+    defer_blocked: bool,
+    /// Highest injection sequence that has matched a drive or been settled.
     /// A later `start` that drops the drive must not defer this sequence again.
     settled_inject: u64,
 }
@@ -369,9 +378,10 @@ pub struct FallbackTrack {
 /// | --- | --- |
 /// | Start, or resume, with no usable drive | The first sample is the baseline. A later move over 12 px or a button change pauses. |
 /// | Type sample with `pointer_known` false | The same baseline. The type point is not a target. |
-/// | Click or drag in flight | Buttons and displacement wait while `injecting` is set, or until `drive.inject_seq` matches, for at most [`INJECT_HOLD_MS`]. The pointer is adopted and does not pause. |
-/// | Click or drag after that drive is visible | Displacement against the drive, confirmed on two later polls. A button pauses only when newly pressed. |
-/// | Injection still unmarked after 2 s | Classification resumes. The position already adopted is not an immediate pause. |
+/// | Click or drag in flight | Buttons and displacement wait while an injection is outstanding. The wait is one [`INJECT_HOLD_MS`] budget for the whole chain, measured from the last poll that had nothing in flight. The pre-deferral baseline is kept. |
+/// | Click or drag after that drive is visible | Displacement against the drive, confirmed on two later polls. A button pauses only when newly pressed. Age is how long the companion has been showing that drive. |
+/// | User move or click during the wait | It is not copied into the baseline. When the injection settles, that sample is judged against the pre-deferral baseline, or against the drive when the drive is usable. |
+/// | Chain still in flight after 2 s | Classification resumes against the pre-deferral baseline. Further sequences in that chain do not start a new wait. |
 /// | TCP `start` clears the drive | The baseline still sees a later physical move. |
 /// | Re-pause | [`Machine::see_visor`] accepts a paused snapshot whose `resume_seq` is newer than the local pause. |
 /// | Same or older paused snapshot during a local resume | Ignored. |
@@ -381,18 +391,14 @@ pub struct FallbackTrack {
 /// | Missed poll | The epoch does not bump, so a displacement does not confirm. |
 ///
 /// A drive is usable when its pointer is known and [`drive_counts`]. While an
-/// injection is outstanding, the sample is copied into the baseline and no
-/// pause is reported, so the visor's own move does not trip the baseline.
+/// injection is outstanding, the live sample is not copied into the baseline.
 pub fn classify_fallback(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
     if input.phase == Phase::Off {
         *track = FallbackTrack::default();
         return false;
     }
     if injection_deferred(input, track) {
-        track.baseline = Some((input.x, input.y, input.mask));
-        track.button_mask = input.mask;
         track.displacement_hold = None;
-        track.baseline_ready = true;
         return false;
     }
     if input.phase == Phase::Paused {
@@ -406,7 +412,7 @@ pub fn classify_fallback(input: &FallbackInput, track: &mut FallbackTrack) -> bo
         track.displacement_hold = None;
         return baseline_moved(input, track);
     };
-    let age = input.wall_ms.saturating_sub(drive.at_ms);
+    let age = input.sample_age_ms;
     let distance = pointer_distance(input.x, input.y, drive.x, drive.y);
     let displaced = fallback_displaced(true, drive.resume_seq, input.after_resume, age, distance);
     let (pause_move, hold) =
@@ -440,8 +446,13 @@ fn baseline_moved(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
 }
 
 /// An injection is outstanding when the visor says one is running, or its
-/// sequence has not appeared on a drive yet. Sequence 0 means none has started.
+/// sequence has not been settled and has not appeared on a drive yet.
+/// Sequence 0 means none has started. `last_settled_seq` covers a desktop
+/// call that failed and recorded nothing.
 fn injection_outstanding(input: &FallbackInput) -> Option<u64> {
+    if !input.injecting && input.inject_seq <= input.last_settled_seq {
+        return None;
+    }
     if input.injecting {
         return Some(input.inject_seq);
     }
@@ -461,28 +472,51 @@ fn injection_outstanding(input: &FallbackInput) -> Option<u64> {
 
 fn injection_deferred(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
     let Some(seq) = injection_outstanding(input) else {
-        // The drive already shows this sequence, including when the poll
-        // missed the `injecting` flag. A later start that drops the drive
-        // must not treat the same sequence as in flight again.
-        if input.inject_seq > 0 {
-            track.settled_inject = track.settled_inject.max(input.inject_seq);
+        // The drive or `last_settled_seq` already shows this sequence. A later
+        // start that drops the drive must not treat it as in flight again.
+        let seen = input.inject_seq.max(input.last_settled_seq);
+        if seen > 0 {
+            track.settled_inject = track.settled_inject.max(seen);
         }
         track.defer_seq = None;
+        track.defer_open = false;
+        track.defer_blocked = false;
         return false;
     };
-    if seq <= track.settled_inject {
+    if seq <= track.settled_inject || track.defer_blocked {
         return false;
     }
-    if track.defer_seq != Some(seq) {
-        track.defer_seq = Some(seq);
+    if !track.defer_open {
+        track.defer_open = true;
         track.defer_since_ms = input.now_ms;
     }
+    track.defer_seq = Some(seq);
     if input.now_ms.saturating_sub(track.defer_since_ms) >= INJECT_HOLD_MS {
-        track.settled_inject = track.settled_inject.max(seq);
-        track.defer_seq = None;
+        track.defer_blocked = true;
+        track.defer_open = false;
         return false;
     }
     true
+}
+
+/// Age of one drive sample on the companion's monotonic clock. The visor's
+/// `at_ms` only identifies the sample. The first poll that shows a key is age 0.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SampleAge {
+    key: Option<(u64, u64)>,
+    seen_ms: u64,
+}
+
+impl SampleAge {
+    pub fn observe(&mut self, inject_seq: u64, at_ms: u64, now_ms: u64) -> u64 {
+        let key = (inject_seq, at_ms);
+        if self.key == Some(key) {
+            return now_ms.saturating_sub(self.seen_ms);
+        }
+        self.key = Some(key);
+        self.seen_ms = now_ms;
+        0
+    }
 }
 
 /// XTEST device ids are synthetic. A real device is anything else.
@@ -953,10 +987,11 @@ mod tests {
             y,
             mask,
             now_ms,
-            wall_ms: 10_000,
+            sample_age_ms: 1_000,
             epoch: 1,
             injecting: false,
             inject_seq: 0,
+            last_settled_seq: 0,
             drive: None,
             after_resume: None,
         }
@@ -1014,7 +1049,6 @@ mod tests {
             resume_seq: 2,
             inject_seq: 1,
         });
-        sample.wall_ms = 9_200;
         assert!(!classify_fallback(&sample, &mut track));
         sample.drive = None;
         sample.inject_seq = 1;
@@ -1103,19 +1137,61 @@ mod tests {
             inject_seq: 1,
         });
         assert!(!classify_fallback(&sample, &mut track));
+    }
 
-        let mut hung = running_at(0, 0, 0, 0);
-        hung.injecting = true;
-        hung.inject_seq = 7;
-        assert!(!classify_fallback(&hung, &mut track));
-        hung.x = 50;
-        hung.now_ms = 10;
-        assert!(!classify_fallback(&hung, &mut track));
-        hung.now_ms = 10 + INJECT_HOLD_MS;
-        assert!(!classify_fallback(&hung, &mut track));
-        hung.x = 70;
-        hung.now_ms += 30;
-        assert!(classify_fallback(&hung, &mut track));
+    #[test]
+    fn fallback_bounds_deferral_across_a_chain_and_keeps_the_baseline() {
+        let mut track = FallbackTrack::default();
+        let mut sample = running_at(0, 0, 0, 0);
+        assert!(!classify_fallback(&sample, &mut track));
+
+        sample.injecting = true;
+        sample.inject_seq = 1;
+        sample.x = 40;
+        sample.now_ms = 100;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.inject_seq = 2;
+        sample.now_ms = 1_500;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.inject_seq = 3;
+        sample.now_ms = 100 + INJECT_HOLD_MS;
+        assert!(classify_fallback(&sample, &mut track));
+
+        sample.injecting = false;
+        sample.last_settled_seq = 3;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.injecting = true;
+        sample.inject_seq = 4;
+        sample.last_settled_seq = 3;
+        sample.x = 80;
+        sample.now_ms += 10;
+        assert!(!classify_fallback(&sample, &mut track));
+    }
+
+    #[test]
+    fn a_failed_injection_stops_deferral_immediately() {
+        let mut track = FallbackTrack::default();
+        let mut sample = running_at(0, 0, 0, 0);
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.injecting = true;
+        sample.inject_seq = 1;
+        sample.x = 50;
+        sample.now_ms = 10;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.injecting = false;
+        sample.last_settled_seq = 1;
+        sample.now_ms = 20;
+        assert!(classify_fallback(&sample, &mut track));
+    }
+
+    #[test]
+    fn sample_age_starts_when_the_companion_first_sees_the_drive() {
+        let mut age = SampleAge::default();
+        assert_eq!(age.observe(3, 90, 1_000), 0);
+        assert_eq!(age.observe(3, 90, 1_200), 200);
+        assert_eq!(age.observe(3, 90, 900), 0);
+        assert_eq!(age.observe(4, 90, 1_500), 0);
+        assert_eq!(age.observe(4, 90, 1_680), 180);
     }
 
     #[test]
@@ -1131,7 +1207,7 @@ mod tests {
             inject_seq: 1,
         });
         sample.inject_seq = 1;
-        sample.wall_ms = 2_000;
+        sample.sample_age_ms = 1_000;
         sample.x = 40;
         sample.epoch = 5;
         assert!(!classify_fallback(&sample, &mut track));
