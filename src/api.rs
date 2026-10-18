@@ -53,6 +53,10 @@ pub struct AppState {
     /// every poll; a Wayland probe spawns a helper process.
     focus_cache: Arc<Mutex<FocusCache>>,
     focus_refreshing: Arc<AtomicBool>,
+    /// Chosen once per process. A restart is a new value, published on
+    /// `GET /companion` so sequence numbers from the previous process are
+    /// not compared with this one.
+    instance: u64,
 }
 
 struct FocusCache {
@@ -134,6 +138,7 @@ impl AppState {
                 value: None,
             })),
             focus_refreshing: Arc::new(AtomicBool::new(false)),
+            instance: automation::fresh_instance(),
         }
     }
 
@@ -368,6 +373,8 @@ impl AppState {
 #[derive(Serialize)]
 struct CompanionBody {
     open: bool,
+    /// Process nonce. Changes when the visor starts again.
+    instance: u64,
     /// `x11`, `wayland`, or `fixture`. The companion uses this to decide
     /// whether XInput2 can tell injected input from a physical device.
     backend: &'static str,
@@ -756,6 +763,7 @@ async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
     };
     Json(CompanionBody {
         open: session.is_some(),
+        instance: state.instance,
         backend: state.desktop.backend_name(),
         notice,
         automation: AutomationBody {
@@ -2141,6 +2149,11 @@ while True:
         assert_eq!(running["automation"]["inject_seq"], 2);
         assert_eq!(running["automation"]["last_settled_seq"], 2);
         assert_eq!(running["automation"]["drive"]["inject_seq"], 2);
+        let instance = running["instance"].as_u64().expect("instance");
+        assert_ne!(instance, 0);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let again: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(again["instance"].as_u64(), Some(instance));
         assert!(running["session"]["idle_ms"].as_u64().is_some());
 
         let (status, _, _) = send(
@@ -2263,6 +2276,86 @@ while True:
         assert_eq!(resumed["automation"]["phase"], "running");
         assert_eq!(resumed["automation"]["resume_seq"], 1);
         assert!(resumed["automation"]["drive"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_stop_then_pause_latches_and_tcp_start_stays_blocked() {
+        let desktop = FakeDesktop::new();
+        let (addr, sock) = spawn_pair(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":4,"y":5}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"stop"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let stopped: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(stopped["automation"]["phase"], "off");
+
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"pause"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let paused: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paused["automation"]["phase"], "paused");
+
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 403, "{}", String::from_utf8_lossy(&body));
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let still: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(still["automation"]["phase"], "paused");
+        let before = lock(&desktop.mice).len();
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":9,"y":9}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 409);
+        assert_eq!(lock(&desktop.mice).len(), before);
+
+        let status = tokio::task::spawn_blocking(move || companion_post(&sock, "stop"))
+            .await
+            .unwrap();
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let lifted: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(lifted["automation"]["phase"], "off");
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(started["automation"]["phase"], "running");
     }
 
     async fn send_with_stale_header(addr: SocketAddr) -> (u16, http::HeaderMap, Bytes) {

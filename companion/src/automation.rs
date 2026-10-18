@@ -82,6 +82,8 @@ pub struct Machine {
     /// follows only when its sequence is newer, so a poll that skips the
     /// `paused` state still counts, and a poll from before the pause does not.
     pause_mark: u64,
+    /// Process nonce from the last connected poll. `None` until that poll.
+    seen_instance: Option<u64>,
 }
 
 impl Machine {
@@ -94,6 +96,7 @@ impl Machine {
             holding_resume: false,
             last_resume_seq: 0,
             pause_mark: 0,
+            seen_instance: None,
         }
     }
 
@@ -199,6 +202,35 @@ impl Machine {
         if self.asking {
             self.asking = false;
             self.last_input_ms = now_ms;
+        }
+    }
+
+    /// A connected poll's process nonce. The first one is stored and is not
+    /// a restart. A different nonce means the visor process started again, so
+    /// its sequences are not the ones this machine has been comparing.
+    ///
+    /// A local pause keeps its phase. `pause_mark` becomes this snapshot's
+    /// `resume_seq`, so the new process's running report does not undo the
+    /// pause. Anything else clears the mark and follows the new snapshot.
+    /// Returns true when the nonce changed.
+    pub fn note_instance(&mut self, instance: u64, resume_seq: u64) -> bool {
+        match self.seen_instance {
+            None => {
+                self.seen_instance = Some(instance);
+                false
+            }
+            Some(seen) if seen == instance => false,
+            Some(_) => {
+                self.seen_instance = Some(instance);
+                self.last_resume_seq = resume_seq;
+                self.holding_resume = false;
+                self.pause_mark = if self.phase == Phase::Paused {
+                    resume_seq
+                } else {
+                    0
+                };
+                true
+            }
         }
     }
 
@@ -364,6 +396,8 @@ pub struct FallbackInput {
     pub last_settled_seq: u64,
     pub drive: Option<FallbackDrive>,
     pub after_resume: Option<u64>,
+    /// Visor process nonce. A change drops this track's sequence marks.
+    pub instance: u64,
 }
 
 /// Baseline, button mask, and injection hold for the pointer fallback.
@@ -384,6 +418,8 @@ pub struct FallbackTrack {
     /// Highest injection sequence that has matched a drive or been settled.
     /// A later `start` that drops the drive must not defer this sequence again.
     settled_inject: u64,
+    /// Process nonce these marks belong to. A new visor reuses low sequences.
+    instance: Option<u64>,
 }
 
 /// Pointer-fallback cases.
@@ -399,14 +435,25 @@ pub struct FallbackTrack {
 /// | TCP `start` clears the drive | The baseline still sees a later physical move. |
 /// | Re-pause | [`Machine::see_visor`] accepts a paused snapshot whose `resume_seq` is newer than the local pause. |
 /// | Same or older paused snapshot during a local resume | Ignored. |
-/// | Backend becomes Wayland | The window disables raw events before it drains them, then this fallback runs. |
+/// | Backend is Wayland | Automation stays off until issue #17. This fallback is not used for portal input. |
 /// | Backend becomes X11 | Raw events are enabled before the drain, and this track is cleared. |
+/// | Visor process restarts | The instance nonce changes. Settled inject sequences, the baseline, and the sample age reset. A local pause is posted again. |
 /// | Reconnect | The same `resume_seq` does not undo a local pause. A newer running snapshot follows. |
 /// | Missed poll | The epoch does not bump, so a displacement does not confirm. |
 ///
 /// A drive is usable when its pointer is known and [`drive_counts`]. While an
 /// injection is outstanding, the live sample is not copied into the baseline.
 pub fn classify_fallback(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
+    match track.instance {
+        Some(seen) if seen != input.instance => {
+            *track = FallbackTrack {
+                instance: Some(input.instance),
+                ..FallbackTrack::default()
+            };
+        }
+        None => track.instance = Some(input.instance),
+        Some(_) => {}
+    }
     if input.phase == Phase::Off {
         *track = FallbackTrack::default();
         return false;
@@ -517,12 +564,17 @@ fn injection_deferred(input: &FallbackInput, track: &mut FallbackTrack) -> bool 
 /// `at_ms` only identifies the sample. The first poll that shows a key is age 0.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SampleAge {
+    instance: Option<u64>,
     key: Option<(u64, u64)>,
     seen_ms: u64,
 }
 
 impl SampleAge {
-    pub fn observe(&mut self, inject_seq: u64, at_ms: u64, now_ms: u64) -> u64 {
+    pub fn observe(&mut self, instance: u64, inject_seq: u64, at_ms: u64, now_ms: u64) -> u64 {
+        if self.instance != Some(instance) {
+            self.instance = Some(instance);
+            self.key = None;
+        }
         let key = (inject_seq, at_ms);
         if self.key == Some(key) {
             return now_ms.saturating_sub(self.seen_ms);
@@ -1028,6 +1080,7 @@ mod tests {
             last_settled_seq: 0,
             drive: None,
             after_resume: None,
+            instance: 1,
         }
     }
 
@@ -1221,11 +1274,67 @@ mod tests {
     #[test]
     fn sample_age_starts_when_the_companion_first_sees_the_drive() {
         let mut age = SampleAge::default();
-        assert_eq!(age.observe(3, 90, 1_000), 0);
-        assert_eq!(age.observe(3, 90, 1_200), 200);
-        assert_eq!(age.observe(3, 90, 900), 0);
-        assert_eq!(age.observe(4, 90, 1_500), 0);
-        assert_eq!(age.observe(4, 90, 1_680), 180);
+        assert_eq!(age.observe(1, 3, 90, 1_000), 0);
+        assert_eq!(age.observe(1, 3, 90, 1_200), 200);
+        assert_eq!(age.observe(1, 3, 90, 900), 0);
+        assert_eq!(age.observe(1, 4, 90, 1_500), 0);
+        assert_eq!(age.observe(1, 4, 90, 1_680), 180);
+        assert_eq!(age.observe(2, 4, 90, 1_900), 0);
+        assert_eq!(age.observe(2, 4, 90, 2_000), 100);
+    }
+
+    #[test]
+    fn a_new_visor_instance_keeps_a_local_pause() {
+        let mut machine = Machine::new(1_000);
+        assert!(!machine.note_instance(7, 4));
+        machine.see_visor(VisorPhase::Running, 0, 4);
+        assert_eq!(machine.user_input(10), Effect::Pause);
+        assert!(machine.note_instance(8, 1));
+        assert_eq!(machine.phase(), Phase::Paused);
+        // The restart poll itself does not call see_visor. The next poll of
+        // this process, still on resume sequence 1, must not follow either.
+        machine.see_visor(VisorPhase::Running, 20, 1);
+        assert_eq!(machine.phase(), Phase::Paused);
+        machine.see_visor(VisorPhase::Running, 30, 2);
+        assert_eq!(machine.phase(), Phase::Running);
+        assert!(!machine.note_instance(8, 2));
+
+        machine.see_visor(VisorPhase::Off, 40, 2);
+        assert!(machine.note_instance(9, 0));
+        machine.see_visor(VisorPhase::Running, 50, 1);
+        assert_eq!(machine.phase(), Phase::Running);
+    }
+
+    #[test]
+    fn a_new_instance_drops_settled_injection_and_the_baseline() {
+        let mut track = FallbackTrack::default();
+        let mut sample = running_at(0, 0, 0, 0);
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 40;
+        sample.injecting = true;
+        sample.inject_seq = 5;
+        sample.now_ms = 10;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.injecting = false;
+        sample.last_settled_seq = 5;
+        assert!(classify_fallback(&sample, &mut track));
+
+        sample.instance = 2;
+        sample.injecting = true;
+        sample.inject_seq = 1;
+        sample.last_settled_seq = 0;
+        sample.x = 0;
+        sample.now_ms = 20;
+        assert!(!classify_fallback(&sample, &mut track));
+
+        track = FallbackTrack::default();
+        sample = running_at(10, 10, 0, 0);
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.instance = 9;
+        sample.x = 80;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 93;
+        assert!(classify_fallback(&sample, &mut track));
     }
 
     #[test]

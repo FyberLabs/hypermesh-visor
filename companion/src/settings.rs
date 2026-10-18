@@ -114,14 +114,21 @@ fn warn_invalid(key: &str, detail: &str) {
 fn write_value(dir: &Path, key: &str, value: &str) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|err| err.to_string())?;
     let path = companion_path(dir);
-    let mut lines: Vec<String> = fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| !line.trim().starts_with(key))
-        .map(str::to_string)
-        .collect();
-    lines.push(format!("{key} = {value}"));
-    let mut body = lines.join("\n");
+    let text = fs::read_to_string(&path).unwrap_or_default();
+    let mut root = if text.trim().is_empty() {
+        toml::Table::new()
+    } else {
+        text.parse::<toml::Table>().map_err(|err| err.to_string())?
+    };
+    let wrapped = format!("value = {value}");
+    let mut parsed_table: toml::Table = wrapped
+        .parse()
+        .map_err(|err: toml::de::Error| err.to_string())?;
+    let parsed = parsed_table
+        .remove("value")
+        .ok_or_else(|| "setting value".to_string())?;
+    root.insert(key.to_string(), parsed);
+    let mut body = toml::to_string(&root).map_err(|err| err.to_string())?;
     if !body.ends_with('\n') {
         body.push('\n');
     }
@@ -179,6 +186,48 @@ mod tests {
         assert_eq!(sleep_after_secs(&dir), DEFAULT_SLEEP_AFTER_SECS);
         fs::write(dir.join("companion.toml"), "sleep_after_secs = [\n").unwrap();
         assert_eq!(sleep_after_secs(&dir), DEFAULT_SLEEP_AFTER_SECS);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_trailing_table_keeps_its_keys_when_a_root_setting_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "hypermesh-toml-extra-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("companion.toml"),
+            "bug_cursor = false\n\n[extra]\nkept = 1\n",
+        )
+        .unwrap();
+        set_bug_cursor(&dir, true).unwrap();
+        let table: toml::Table = fs::read_to_string(dir.join("companion.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(table.get("bug_cursor"), Some(&Value::Boolean(true)));
+        let extra = table.get("extra").and_then(Value::as_table).unwrap();
+        assert_eq!(extra.get("kept"), Some(&Value::Integer(1)));
+        assert!(extra.get("bug_cursor").is_none());
+        assert!(bug_cursor(&dir));
+
+        fs::write(dir.join("companion.toml"), "[extra]\nkept = 1\n").unwrap();
+        set_eyes_follow_pointer(&dir, true).unwrap();
+        let table: toml::Table = fs::read_to_string(dir.join("companion.toml"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            table.get("eyes_follow_pointer"),
+            Some(&Value::Boolean(true))
+        );
+        let extra = table.get("extra").and_then(Value::as_table).unwrap();
+        assert_eq!(extra.get("kept"), Some(&Value::Integer(1)));
+        assert!(extra.get("eyes_follow_pointer").is_none());
+        assert!(eyes_follow_pointer(&dir));
         let _ = fs::remove_dir_all(&dir);
     }
 }

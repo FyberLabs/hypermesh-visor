@@ -85,6 +85,8 @@ pub struct Snapshot {
     pub last_settled_seq: u64,
     /// How the visor injects. `wayland` means automation is unavailable until issue #17.
     pub backend: InjectionBackend,
+    /// Process nonce. `0` when the field is missing, including a disconnect.
+    pub instance: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +127,7 @@ impl Snapshot {
             inject_seq: 0,
             last_settled_seq: 0,
             backend: InjectionBackend::X11,
+            instance: 0,
         }
     }
 }
@@ -178,6 +181,10 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         Some("wayland") => InjectionBackend::Wayland,
         _ => InjectionBackend::X11,
     };
+    let instance = value
+        .get("instance")
+        .and_then(|item| item.as_u64())
+        .unwrap_or(0);
     Some(Snapshot {
         connected: true,
         upgrading,
@@ -190,6 +197,7 @@ pub fn snapshot_from_body(body: &str) -> Option<Snapshot> {
         inject_seq,
         last_settled_seq,
         backend,
+        instance,
     })
 }
 
@@ -317,7 +325,12 @@ mod tests {
         assert_eq!(paused.resume_seq, 3);
         assert_eq!(paused.last_settled_seq, 2);
         assert!(paused.drive.is_none());
+        assert_eq!(stamped.instance, 0);
         assert_eq!(stamped.backend, InjectionBackend::X11);
+        let stamped_instance =
+            snapshot_from_body(r#"{"open":false,"instance":42,"automation":{"phase":"off"}}"#)
+                .unwrap();
+        assert_eq!(stamped_instance.instance, 42);
         let wayland = snapshot_from_body(r#"{"open":false,"backend":"wayland"}"#).unwrap();
         assert_eq!(wayland.backend, InjectionBackend::Wayland);
         assert!(snapshot_from_body("not-json").is_none());

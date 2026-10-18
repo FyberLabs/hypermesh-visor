@@ -265,9 +265,10 @@ impl Gate {
                 Ok(())
             }
             Control::Pause => {
-                if self.phase == Phase::Running {
-                    self.phase = Phase::Paused;
-                }
+                // A companion pause is a latch. It applies from running, off,
+                // or any other phase, so a TCP stop that landed first cannot
+                // leave the gate open for the next injection.
+                self.phase = Phase::Paused;
                 Ok(())
             }
             Control::Resume => {
@@ -410,6 +411,25 @@ pub fn distance(x0: i32, y0: i32, x1: i32, y1: i32) -> u32 {
         u32::MAX
     } else {
         pixels as u32
+    }
+}
+
+/// Non-zero nonce for this visor process. A restart picks a new value, so
+/// the companion can tell a fresh `resume_seq` of 0 from the process it paused.
+pub fn fresh_instance() -> u64 {
+    let mut bytes = [0u8; 8];
+    let drawn = std::fs::File::open("/dev/urandom").and_then(|mut file| {
+        use std::io::Read;
+        file.read_exact(&mut bytes)?;
+        Ok(u64::from_ne_bytes(bytes))
+    });
+    match drawn {
+        Ok(value) if value != 0 => value,
+        _ => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(1))
+            .unwrap_or(1)
+            .max(1),
     }
 }
 
@@ -685,6 +705,53 @@ mod tests {
         assert!(!lifts_user_pause(Control::Pause, Phase::Paused));
         assert!(!lifts_user_pause(Control::Start, Phase::Off));
         assert!(!lifts_user_pause(Control::Stop, Phase::Running));
+    }
+
+    #[test]
+    fn a_pause_after_stop_latches_and_start_does_not_run_until_it_is_lifted() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let generation = gate.generation();
+        gate.record_mouse(
+            id,
+            &MouseOp::Move {
+                x: 3,
+                y: 4,
+                clickable: false,
+            },
+            Some((0, 0)),
+            generation,
+            10,
+        );
+        assert_eq!(gate.phase(), Phase::Running);
+        gate.control(None, Control::Stop).unwrap();
+        assert_eq!(gate.phase(), Phase::Off);
+        gate.control(Some(id), Control::Pause).unwrap();
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert!(gate.blocks(id));
+        let paused_generation = gate.generation();
+        gate.record_mouse(
+            id,
+            &MouseOp::Move {
+                x: 9,
+                y: 9,
+                clickable: false,
+            },
+            Some((3, 4)),
+            paused_generation,
+            20,
+        );
+        assert!(gate.drive().is_none());
+        assert_eq!(gate.phase(), Phase::Paused);
+        // The gate action itself would start. TCP is refused before this runs
+        // while the latch is set. A start that raced in before the pause
+        // still loses when the pause arrives.
+        gate.control(None, Control::Stop).unwrap();
+        gate.control(Some(id), Control::Start).unwrap();
+        assert_eq!(gate.phase(), Phase::Running);
+        gate.control(Some(id), Control::Pause).unwrap();
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert!(gate.blocks(id));
     }
 
     #[test]

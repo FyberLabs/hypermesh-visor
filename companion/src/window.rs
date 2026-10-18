@@ -195,9 +195,24 @@ fn show(mut app: App) -> Result<(), String> {
         let dt = last_frame.elapsed().as_millis() as u64;
         last_frame = Instant::now();
         let (snap, epoch) = app.poller.snapshot();
+        let restarted = if snap.connected {
+            app.machine.note_instance(snap.instance, snap.resume_seq)
+        } else {
+            false
+        };
+        if restarted {
+            app.seen_resume_seq = 0;
+            app.resume_seq_prior = 0;
+            app.fallback_after_resume = None;
+            app.fallback = automation::FallbackTrack::default();
+            app.sample_age = automation::SampleAge::default();
+            if app.machine.phase() == Phase::Paused {
+                app.pending = Some("pause");
+            }
+        }
         let sample_age_ms = snap.drive.as_ref().map_or(0, |drive| {
             app.sample_age
-                .observe(drive.inject_seq, drive.at_ms, now_ms)
+                .observe(snap.instance, drive.inject_seq, drive.at_ms, now_ms)
         });
         let wayland = matches!(snap.backend, crate::auth::InjectionBackend::Wayland);
         if snap.connected && wayland && !app.wayland_note_logged {
@@ -214,7 +229,13 @@ fn show(mut app: App) -> Result<(), String> {
         };
         let phase_before = app.machine.phase();
         if snap.connected {
-            app.machine.see_visor(visor_phase, now_ms, snap.resume_seq);
+            // see_visor(off) would drop a local pause. On a new process the
+            // pause is posted again instead, and pause_mark is already this
+            // snapshot's resume sequence.
+            let keep_pause = restarted && phase_before == Phase::Paused;
+            if !keep_pause {
+                app.machine.see_visor(visor_phase, now_ms, snap.resume_seq);
+            }
         } else {
             app.machine.note_disconnect();
         }
@@ -288,6 +309,7 @@ fn show(mut app: App) -> Result<(), String> {
                     last_settled_seq: snap.last_settled_seq,
                     drive,
                     after_resume: app.fallback_after_resume,
+                    instance: snap.instance,
                 };
                 if automation::classify_fallback(&input, &mut app.fallback) {
                     let effect = app.machine.user_input(now_ms);
