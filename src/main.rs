@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hypermesh_visor::{
     current_euid, parse_listen, serve, AppState, Desktop, DoorConfig, FixtureDesktop, LinuxDesktop,
-    DEFAULT_CATALOG_ID,
+    DEFAULT_CATALOG_ID, SHUTDOWN_DEADLINE,
 };
 
 #[derive(Debug)]
@@ -85,7 +85,11 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    if let Err(err) = runtime.block_on(serve(addr, state)) {
+    let result = runtime.block_on(serve(addr, state));
+    // Drop waits forever for a stuck spawn_blocking task. This bound is the
+    // same deadline `serve` uses before it exits the process.
+    runtime.shutdown_timeout(SHUTDOWN_DEADLINE);
+    if let Err(err) = result {
         eprintln!("hypermesh-visor: {err}");
         return ExitCode::from(1);
     }

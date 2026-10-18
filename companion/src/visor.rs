@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -34,6 +34,8 @@ pub struct Poller {
     resume_dropped: Arc<AtomicBool>,
     /// Set until the keyboard-unavailable report is accepted.
     keyboard_report: Arc<AtomicBool>,
+    /// `0` omit, `1` keyboard present, `2` keyboard missing. Sent on every poll.
+    keyboard_level: Arc<AtomicU8>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -47,11 +49,13 @@ impl Poller {
         let stop = Arc::new(AtomicBool::new(false));
         let resume_dropped = Arc::new(AtomicBool::new(false));
         let keyboard_report = Arc::new(AtomicBool::new(false));
+        let keyboard_level = Arc::new(AtomicU8::new(0));
         let snapshot_thread = Arc::clone(&snapshot);
         let queue_thread = Arc::clone(&queue);
         let stop_thread = Arc::clone(&stop);
         let dropped_thread = Arc::clone(&resume_dropped);
         let keyboard_thread = Arc::clone(&keyboard_report);
+        let level_thread = Arc::clone(&keyboard_level);
         let thread = thread::Builder::new()
             .name("hypermesh-companion-visor".into())
             .spawn(move || {
@@ -61,6 +65,7 @@ impl Poller {
                     stop_thread,
                     dropped_thread,
                     keyboard_thread,
+                    level_thread,
                 )
             })
             .ok();
@@ -70,6 +75,7 @@ impl Poller {
             stop,
             resume_dropped,
             keyboard_report,
+            keyboard_level,
             thread,
         }
     }
@@ -99,6 +105,12 @@ impl Poller {
     pub fn report_keyboard_unavailable(&self) {
         self.keyboard_report.store(true, Ordering::SeqCst);
     }
+
+    /// Level sent on the next poll. `true` is present, `false` is missing.
+    pub fn set_keyboard_available(&self, available: bool) {
+        self.keyboard_level
+            .store(if available { 1 } else { 2 }, Ordering::SeqCst);
+    }
 }
 
 impl Drop for Poller {
@@ -116,6 +128,7 @@ fn visor_loop(
     stop: Arc<AtomicBool>,
     resume_dropped: Arc<AtomicBool>,
     keyboard_report: Arc<AtomicBool>,
+    keyboard_level: Arc<AtomicU8>,
 ) {
     let mut link = Link::new(Snapshot::disconnected());
     let mut pause_asked = false;
@@ -138,7 +151,7 @@ fn visor_loop(
         if stop.load(Ordering::SeqCst) {
             break;
         }
-        let fetched = fetch();
+        let fetched = fetch(keyboard_header(keyboard_level.load(Ordering::SeqCst)));
         let fresh = {
             let mut queued = queue.lock().unwrap();
             apply_poll(&mut link, &mut queued, &mut pause_asked, fetched)
@@ -230,8 +243,16 @@ enum PollFetch {
     Unreadable,
 }
 
-fn fetch() -> PollFetch {
-    let request = auth::visor_request("hypermesh");
+fn keyboard_header(level: u8) -> Option<bool> {
+    match level {
+        1 => Some(true),
+        2 => Some(false),
+        _ => None,
+    }
+}
+
+fn fetch(keyboard: Option<bool>) -> PollFetch {
+    let request = auth::visor_request_with_keyboard("hypermesh", keyboard);
     match exchange(&request) {
         Exchange::Failed => PollFetch::Down,
         Exchange::Truncated => PollFetch::Unreadable,

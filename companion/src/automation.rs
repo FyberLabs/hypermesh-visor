@@ -37,6 +37,35 @@ pub const WAYLAND_AUTOMATION_NOTE: &str =
 /// Menu note and visor report when X11 cannot see a physical key press.
 pub const KEYBOARD_INTERRUPT_NOTE: &str = "no keyboard interrupt available";
 
+/// The missing-keyboard report is owed again whenever the visor process
+/// nonce changes. A ready keyboard is never reported.
+pub fn keyboard_report_due(reported_for: Option<u64>, instance: u64, keyboard_ready: bool) -> bool {
+    !keyboard_ready && reported_for != Some(instance)
+}
+
+/// Apply queued physical input to the phase the companion is already showing,
+/// then take the new visor snapshot. A pause from that input survives an
+/// `off` snapshot so the companion still posts it.
+pub fn settle_live_input(
+    machine: &mut Machine,
+    live: bool,
+    visor: VisorPhase,
+    now_ms: u64,
+    resume_seq: u64,
+) -> Effect {
+    let from_input = if live {
+        machine.user_input(now_ms)
+    } else {
+        Effect::None
+    };
+    machine.see_visor(visor, now_ms, resume_seq);
+    if from_input == Effect::Pause {
+        Effect::Pause
+    } else {
+        Effect::None
+    }
+}
+
 /// A Wayland visor does not drive the desktop until issue #17. The companion
 /// keeps idle, sleeping, disconnected, and upgrading, and does not enter the
 /// automation state.
@@ -849,6 +878,26 @@ mod tests {
         assert_eq!(machine.continue_now(1_600), Effect::Resume);
         assert_eq!(machine.phase(), Phase::Running);
         assert!(!machine.asking());
+    }
+
+    #[test]
+    fn a_queued_input_still_pauses_when_the_snapshot_is_off() {
+        let mut machine = Machine::new(DEFAULT_RESUME_MS);
+        machine.see_visor(VisorPhase::Running, 0, 1);
+        let effect = settle_live_input(&mut machine, true, VisorPhase::Off, 10, 1);
+        assert_eq!(effect, Effect::Pause);
+        assert_eq!(machine.phase(), Phase::Off);
+        let quiet = settle_live_input(&mut machine, false, VisorPhase::Off, 20, 1);
+        assert_eq!(quiet, Effect::None);
+    }
+
+    #[test]
+    fn a_keyboard_report_is_due_again_for_a_new_visor_instance() {
+        assert!(!keyboard_report_due(None, 1, true));
+        assert!(keyboard_report_due(None, 7, false));
+        assert!(!keyboard_report_due(Some(7), 7, false));
+        assert!(keyboard_report_due(Some(7), 8, false));
+        assert!(!keyboard_report_due(Some(8), 9, true));
     }
 
     #[test]

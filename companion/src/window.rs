@@ -65,8 +65,10 @@ struct App {
     scroll: i32,
     /// The Wayland automation note has already been logged.
     wayland_note_logged: bool,
-    /// The missing-keyboard note has already been logged and reported.
+    /// The missing-keyboard note has already been logged.
     keyboard_note_logged: bool,
+    /// Visor instance the missing-keyboard report was posted for.
+    keyboard_reported_instance: Option<u64>,
     /// Config directory captured at startup. The frame loop does not look it up again.
     config: std::path::PathBuf,
     /// `companion-notice`, stat'ed at most once a second.
@@ -108,6 +110,7 @@ pub fn run() -> Result<(), String> {
         scroll: 0,
         wayland_note_logged: false,
         keyboard_note_logged: false,
+        keyboard_reported_instance: None,
         config,
         notice: settings::NoticeCache::default(),
         fallback_sample: None,
@@ -234,13 +237,47 @@ fn show(mut app: App) -> Result<(), String> {
             );
             app.wayland_note_logged = true;
         }
-        if !wayland && !watch.accepts_raw_keyboard() && !app.keyboard_note_logged {
-            eprintln!(
-                "hypermesh-companion: {}",
-                automation::KEYBOARD_INTERRUPT_NOTE
-            );
+        let keyboard_ready = wayland || watch.accepts_raw_keyboard();
+        app.poller.set_keyboard_available(keyboard_ready);
+        if snap.connected
+            && automation::keyboard_report_due(
+                app.keyboard_reported_instance,
+                snap.instance,
+                keyboard_ready,
+            )
+        {
+            if !app.keyboard_note_logged {
+                eprintln!(
+                    "hypermesh-companion: {}",
+                    automation::KEYBOARD_INTERRUPT_NOTE
+                );
+                app.keyboard_note_logged = true;
+            }
             app.poller.report_keyboard_unavailable();
-            app.keyboard_note_logged = true;
+            app.keyboard_reported_instance = Some(snap.instance);
+        }
+        // Queued physical input is judged against the phase already on screen.
+        // The new snapshot is applied after that, so an `off` poll cannot
+        // swallow a key or click that arrived while the gate was running.
+        let mut events = Vec::new();
+        while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
+            events.push(event);
+        }
+        let mut saw_pause = false;
+        for event in &events {
+            if let Some(live) = watch.observe(event) {
+                let effect = app.machine.user_input(now_ms);
+                if effect == Effect::Pause {
+                    saw_pause = true;
+                }
+                note_user_input(&mut app, effect);
+                app.last_used = Instant::now();
+                match live {
+                    LiveInput::Button => app.click_at = Some(now_ms),
+                    LiveInput::Key => app.key_at = Some(now_ms),
+                    LiveInput::Motion => {}
+                }
+            }
         }
         let visor_phase = if snap.connected {
             automation::displayed_visor_phase(wayland, snap.phase)
@@ -274,23 +311,13 @@ fn show(mut app: App) -> Result<(), String> {
             app.resume_seq_prior = prior;
             app.seen_resume_seq = snap.resume_seq;
         }
-        if app.machine.phase() == Phase::Off {
+        if app.machine.phase() == Phase::Off && !saw_pause {
             app.pending = None;
             app.fallback_after_resume = None;
         }
         let was_paused = app.machine.phase() == Phase::Paused;
         let mut click: Option<(i32, i32)> = None;
-        while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
-            if let Some(live) = watch.observe(&event) {
-                let effect = app.machine.user_input(now_ms);
-                note_user_input(&mut app, effect);
-                app.last_used = Instant::now();
-                match live {
-                    LiveInput::Button => app.click_at = Some(now_ms),
-                    LiveInput::Key => app.key_at = Some(now_ms),
-                    LiveInput::Motion => {}
-                }
-            }
+        for event in events {
             if let Event::ButtonPress(press) = event {
                 if press.event != window {
                     continue;

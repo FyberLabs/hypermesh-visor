@@ -17,7 +17,21 @@ pub enum Pose {
 
 /// The visor poll is a GET of session purpose and verb. It does not send a key.
 pub fn visor_request(host: &str) -> String {
-    format!("GET /companion HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n")
+    visor_request_with_keyboard(host, None)
+}
+
+/// `available` is the XTEST keyboard. `Some(false)` sends
+/// `x-hypermesh-keyboard: 0` on every poll so the visor state is level-triggered.
+pub fn visor_request_with_keyboard(host: &str, available: Option<bool>) -> String {
+    match available {
+        Some(ready) => {
+            let bit = if ready { "1" } else { "0" };
+            format!(
+                "GET /companion HTTP/1.1\r\nhost: {host}\r\nx-hypermesh-keyboard: {bit}\r\nconnection: close\r\n\r\n"
+            )
+        }
+        None => format!("GET /companion HTTP/1.1\r\nhost: {host}\r\nconnection: close\r\n\r\n"),
+    }
 }
 
 pub fn pose_from_companion(body: &str) -> Pose {
@@ -251,6 +265,11 @@ mod tests {
         assert!(request.starts_with("GET /companion "));
         assert!(!request.to_ascii_lowercase().contains("api_key"));
         assert!(!request.contains("authorization"));
+        assert!(!request.contains("x-hypermesh-keyboard"));
+        let missing = visor_request_with_keyboard("hypermesh", Some(false));
+        assert!(missing.contains("x-hypermesh-keyboard: 0\r\n"));
+        let ready = visor_request_with_keyboard("hypermesh", Some(true));
+        assert!(ready.contains("x-hypermesh-keyboard: 1\r\n"));
     }
 
     #[test]

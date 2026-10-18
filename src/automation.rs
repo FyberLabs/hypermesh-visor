@@ -20,6 +20,14 @@ pub const KEYBOARD_INTERRUPT: &str = "no keyboard interrupt available";
 /// How long shutdown waits for an in-flight injection before it continues.
 pub const SHUTDOWN_INJECTION_WAIT: Duration = Duration::from_secs(2);
 
+/// The process exits if graceful shutdown is still running after this long,
+/// including a desktop call stuck inside one request.
+pub const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// TCP `start` is refused with this sentence when no companion-socket poll
+/// has landed inside the watchdog window.
+pub const STALE_POLL: &str = "no recent companion poll";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Off,
@@ -99,6 +107,23 @@ impl Control {
     }
 }
 
+/// Why [`Gate::apply`] refused a control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlReject {
+    NeedsSession,
+    StalePoll,
+}
+
+/// A control that arrived while an injection held the desktop. Replayed in
+/// sequence order when the call unwinds, and only for the owner it named.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deferred {
+    Stop,
+    Pause,
+    Close { session: Uuid, generation: u64 },
+    KeyboardUnavailable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Drive {
     pub kind: DriveKind,
@@ -144,18 +169,21 @@ pub struct Gate {
     last_settled_seq: u64,
     /// True from the moment an injection starts until its desktop call returns.
     injecting: bool,
-    /// Stop arrived while an injection held the desktop. Applied in
-    /// [`Gate::end_inject`] unless a pause latched first.
-    pending_stop: bool,
-    /// The driving session closed while an injection was in flight. Applied
-    /// in [`Gate::end_inject`], not from a companion poll.
-    closed_during_inject: bool,
+    /// Monotonic id of the latest control. Deferred actions keep the value
+    /// from when they were posted, so unwind replays them in order.
+    control_seq: u64,
+    /// Controls posted during an injection. Applied in order on unwind.
+    deferred: Vec<(u64, Deferred)>,
     /// Cancellation generation. Published with the phase in one word.
     epoch: u64,
-    /// When the current running stretch began. A later start or resume
-    /// replaces it. Pause and stop clear it.
-    running_since: Option<Instant>,
-    /// Last companion-socket poll that was still inside the quiet window.
+    /// Last instant the companion itself extended the watchdog: a socket
+    /// poll, or the one grace from a socket transition into `running`.
+    /// The first injection may arm it once. TCP start does not write it,
+    /// and reset does not clear it.
+    trusted_at: Option<Instant>,
+    /// Last companion-socket poll, including one that arrived while the
+    /// phase was off or paused. TCP start may enter `running` only while
+    /// this instant is inside the watchdog window.
     last_poll: Option<Instant>,
     /// False after the companion reports that X11 cannot see key presses.
     keyboard_interrupt: bool,
@@ -179,10 +207,10 @@ impl Default for Gate {
             inject_seq: 0,
             last_settled_seq: 0,
             injecting: false,
-            pending_stop: false,
-            closed_during_inject: false,
+            control_seq: 0,
+            deferred: Vec::new(),
             epoch: 0,
-            running_since: None,
+            trusted_at: None,
             last_poll: None,
             keyboard_interrupt: true,
             published: Arc::new(AtomicU64::new(0)),
@@ -259,13 +287,29 @@ impl Gate {
         self.keyboard_interrupt
     }
 
-    /// The companion posts this once when X11 cannot see key presses.
-    /// `false` stays until the process exits.
+    /// The companion reports that X11 cannot see key presses. `false` stays
+    /// until the process exits. A repeated report while the gate is already
+    /// paused does not bump the epoch again. An active phase pauses, and an
+    /// in-flight injection is cancelled at its next chunk.
     pub fn set_keyboard_interrupt(&mut self, available: bool) {
         if available {
             return;
         }
+        let fresh = self.keyboard_interrupt;
         self.keyboard_interrupt = false;
+        if self.injecting {
+            if fresh || self.phase != Phase::Paused {
+                self.bump_epoch();
+                self.phase = Phase::Paused;
+                self.touch();
+                self.defer(Deferred::KeyboardUnavailable);
+                self.publish();
+            }
+            return;
+        }
+        if self.phase == Phase::Running {
+            self.pause();
+        }
     }
 
     /// Shared with request threads. Loading it does not take the gate lock.
@@ -283,7 +327,11 @@ impl Gate {
         self.inject_seq = self.inject_seq.saturating_add(1);
         self.injecting = true;
         if self.phase != Phase::Running {
-            self.running_since = Some(Instant::now());
+            // One window for the first injection. A later TCP entry does not
+            // move a clock the companion already recorded.
+            if self.trusted_at.is_none() {
+                self.trusted_at = Some(Instant::now());
+            }
             self.phase = Phase::Running;
         }
         self.session = Some(session);
@@ -293,24 +341,14 @@ impl Gate {
 
     /// The desktop call returned. A failure records no drive, so this sequence
     /// is settled on its own and the companion does not keep deferring.
-    /// A stop or a session close that arrived during the call is applied here,
-    /// after the call has stopped at its last chunk.
+    /// Controls posted during the call are applied in the order they arrived,
+    /// and a close applies only to the session generation it named.
     pub fn end_inject(&mut self) {
         self.injecting = false;
         self.last_settled_seq = self.last_settled_seq.max(self.inject_seq);
-        let stop = self.pending_stop;
-        let closed = self.closed_during_inject;
-        self.pending_stop = false;
-        self.closed_during_inject = false;
-        if stop && self.phase != Phase::Paused {
-            self.reset();
-            return;
-        }
-        if closed {
-            if let Some(id) = self.session {
-                self.clear_session(id);
-                return;
-            }
+        let deferred = std::mem::take(&mut self.deferred);
+        for (_seq, action) in deferred {
+            self.apply_deferred(action);
         }
         self.publish();
     }
@@ -323,13 +361,19 @@ impl Gate {
     }
 
     /// The driving session went away. While an injection is in flight the
-    /// phase stays put; [`Gate::end_inject`] applies the close.
+    /// phase stays put; [`Gate::end_inject`] applies the close to that session
+    /// only.
     pub fn note_session_closed(&mut self, session: Uuid) {
         if self.session != Some(session) {
             return;
         }
+        self.touch();
         if self.injecting {
-            self.closed_during_inject = true;
+            let generation = self.generation;
+            self.defer(Deferred::Close {
+                session,
+                generation,
+            });
             return;
         }
         self.bump_epoch();
@@ -337,10 +381,18 @@ impl Gate {
     }
 
     /// Called once the injection lock is free. A close that [`Gate::end_inject`]
-    /// already applied is a no-op.
+    /// already applied is a no-op. A close queued here names the session it
+    /// saw, so a newer session selected during the call is left alone.
     pub fn finish_closed_session(&mut self, session: Uuid) {
         if self.injecting {
-            self.closed_during_inject = self.session == Some(session);
+            if self.session == Some(session) {
+                self.touch();
+                let generation = self.generation;
+                self.defer(Deferred::Close {
+                    session,
+                    generation,
+                });
+            }
             return;
         }
         self.clear_session(session);
@@ -374,6 +426,8 @@ impl Gate {
         let published = Arc::clone(&self.published);
         let keyboard_interrupt = self.keyboard_interrupt;
         let last_poll = self.last_poll;
+        let trusted_at = self.trusted_at;
+        let control_seq = self.control_seq;
         *self = Self {
             notice,
             generation,
@@ -384,20 +438,23 @@ impl Gate {
             published,
             keyboard_interrupt,
             last_poll,
+            trusted_at,
+            control_seq,
             ..Self::default()
         };
         self.publish();
     }
 
     /// Epoch and `paused` land in one published word. A request cannot
-    /// observe the new epoch with the old phase.
+    /// observe the new epoch with the old phase. A stop already queued for
+    /// this injection stays queued: the newer control wins when the call ends.
     pub fn pause(&mut self) {
         self.bump_epoch();
         self.phase = Phase::Paused;
-        self.running_since = None;
-        // A stop that was waiting for this injection must not wipe the latch
-        // when the call returns.
-        self.pending_stop = false;
+        self.touch();
+        if self.injecting {
+            self.defer(Deferred::Pause);
+        }
         self.publish();
     }
 
@@ -405,7 +462,10 @@ impl Gate {
     /// stays until [`Gate::reset`] after the bounded wait.
     pub fn shutdown_cancel(&mut self) {
         self.bump_epoch();
-        self.pending_stop = true;
+        self.touch();
+        if self.injecting {
+            self.defer(Deferred::Stop);
+        }
         self.publish();
     }
 
@@ -417,18 +477,15 @@ impl Gate {
             return true;
         }
         self.last_poll = Some(now);
-        if self.phase != Phase::Running {
-            self.running_since = None;
-        }
+        self.trusted_at = Some(now);
         false
     }
 
     /// Watchdog tick. Does not record a poll and does not grant time.
-    /// The anchor is the last companion-socket poll, or the single grace
-    /// instant from the transition that entered `running`.
+    /// Freshness is the last trusted companion instant, not when this
+    /// running stretch began.
     pub fn watchdog(&mut self, now: Instant, timeout: Duration) {
         if self.phase != Phase::Running {
-            self.running_since = None;
             return;
         }
         if self.gap_expired(now, timeout) {
@@ -436,15 +493,63 @@ impl Gate {
         }
     }
 
-    /// `start` needs the session the companion is showing. The other actions
-    /// apply to the drive already in progress.
+    /// True when a companion-socket poll landed inside the watchdog window.
+    pub fn poll_fresh(&self, now: Instant, timeout: Duration) -> bool {
+        match self.last_poll {
+            Some(at) => now.saturating_duration_since(at) < timeout,
+            None => false,
+        }
+    }
+
+    /// TCP mouse or type must not enter `running` once a recorded trust
+    /// instant has expired. The first entry, with nothing recorded, is
+    /// still allowed and arms one window.
+    pub fn stale_reentry(&self, now: Instant, timeout: Duration) -> bool {
+        if self.phase != Phase::Off {
+            return false;
+        }
+        match self.trusted_at {
+            Some(at) => now.saturating_duration_since(at) >= timeout,
+            None => false,
+        }
+    }
+
+    /// Companion-origin control. Grants the socket grace and does not
+    /// require a prior poll. Unit tests use this path.
+    #[cfg(test)]
     pub fn control(&mut self, session: Option<Uuid>, action: Control) -> Result<(), ()> {
+        self.apply(
+            session,
+            action,
+            true,
+            Instant::now(),
+            Duration::from_secs(3_600),
+        )
+        .map_err(|_| ())
+    }
+
+    /// `start` needs the session the companion is showing. The other actions
+    /// apply to the drive already in progress. A TCP start or resume that
+    /// would enter `running` needs a companion-socket poll inside `timeout`.
+    pub fn apply(
+        &mut self,
+        session: Option<Uuid>,
+        action: Control,
+        from_companion: bool,
+        now: Instant,
+        timeout: Duration,
+    ) -> Result<(), ControlReject> {
         match action {
             Control::Start => {
                 let Some(id) = session else {
-                    return Err(());
+                    return Err(ControlReject::NeedsSession);
                 };
-                self.enter_running(id);
+                if self.phase != Phase::Running && !from_companion && !self.poll_fresh(now, timeout)
+                {
+                    return Err(ControlReject::StalePoll);
+                }
+                self.touch();
+                self.enter_running(id, from_companion);
                 Ok(())
             }
             Control::Pause => {
@@ -456,16 +561,22 @@ impl Gate {
             }
             Control::Resume => {
                 if self.phase != Phase::Paused {
+                    self.touch();
                     return Ok(());
                 }
                 // The driving session may have been closed while paused.
                 // The selected session becomes the owner. With none left,
                 // the phase ends instead of running with no session.
                 let Some(id) = session else {
+                    self.touch();
                     self.reset();
                     return Ok(());
                 };
-                self.enter_running(id);
+                if !from_companion && !self.poll_fresh(now, timeout) {
+                    return Err(ControlReject::StalePoll);
+                }
+                self.touch();
+                self.enter_running(id, from_companion);
                 Ok(())
             }
             Control::Stop => {
@@ -476,12 +587,13 @@ impl Gate {
     }
 
     /// While an injection is in flight, stop only cancels it. The phase stays
-    /// `running` until [`Gate::end_inject`], so a companion can still pause
-    /// and a TCP stop cannot publish `off` underneath the call.
+    /// until [`Gate::end_inject`], so a later pause is still applied and a
+    /// TCP stop cannot publish `off` underneath the call.
     pub fn stop(&mut self) {
         self.bump_epoch();
+        self.touch();
         if self.injecting {
-            self.pending_stop = true;
+            self.defer(Deferred::Stop);
             self.publish();
             return;
         }
@@ -555,7 +667,41 @@ impl Gate {
         self.epoch = self.epoch.saturating_add(1);
     }
 
-    fn enter_running(&mut self, session: Uuid) {
+    fn touch(&mut self) {
+        self.control_seq = self.control_seq.saturating_add(1);
+    }
+
+    fn defer(&mut self, action: Deferred) {
+        let seq = self.control_seq;
+        self.deferred.push((seq, action));
+    }
+
+    fn apply_deferred(&mut self, action: Deferred) {
+        match action {
+            Deferred::Stop => {
+                self.reset();
+            }
+            Deferred::Pause => {
+                self.phase = Phase::Paused;
+                self.publish();
+            }
+            Deferred::Close {
+                session,
+                generation,
+            } => {
+                if self.session == Some(session) && self.generation == generation {
+                    self.clear_session(session);
+                }
+            }
+            Deferred::KeyboardUnavailable => {
+                self.keyboard_interrupt = false;
+                self.phase = Phase::Paused;
+                self.publish();
+            }
+        }
+    }
+
+    fn enter_running(&mut self, session: Uuid, grant_grace: bool) {
         let fresh = self.phase != Phase::Running;
         self.session = Some(session);
         // A sample from the previous drive would look like a user move
@@ -564,27 +710,24 @@ impl Gate {
         // last point so a later type still has somewhere to land, but do
         // not let the fallback compare against that target.
         self.drive = None;
-        // One grace window per off/paused → running transition. A start
-        // that is already running leaves the poll and that grace alone.
-        if fresh {
-            self.running_since = Some(Instant::now());
+        // One grace window when the companion socket itself enters running.
+        // A start that is already running, and every TCP start, leave the
+        // last trusted instant alone.
+        if fresh && grant_grace {
+            self.trusted_at = Some(Instant::now());
         }
         self.phase = Phase::Running;
         self.bump_resume();
         self.publish();
     }
 
-    /// Last companion-socket poll when one is recorded, otherwise the grace
-    /// instant from the transition into `running`. A newer grace does not
-    /// outrank a poll, and a poll does not erase a fresher grace.
+    /// The last trusted companion instant. No instant means the window has
+    /// already passed: a TCP start must not invent one.
     fn gap_expired(&self, now: Instant, timeout: Duration) -> bool {
-        let anchor = match (self.last_poll, self.running_since) {
-            (Some(poll), Some(grace)) => poll.max(grace),
-            (Some(poll), None) => poll,
-            (None, Some(grace)) => grace,
-            (None, None) => return true,
-        };
-        now.saturating_duration_since(anchor) >= timeout
+        match self.trusted_at {
+            Some(at) => now.saturating_duration_since(at) >= timeout,
+            None => true,
+        }
     }
 
     fn publish(&self) {
@@ -609,8 +752,8 @@ impl Gate {
             .map(|then| now_ms.saturating_sub(then).min(u32::MAX as u64) as u32)
             .unwrap_or(0);
         self.session = Some(session);
-        if self.phase != Phase::Running {
-            self.running_since = Some(Instant::now());
+        if self.phase != Phase::Running && self.trusted_at.is_none() {
+            self.trusted_at = Some(Instant::now());
         }
         self.phase = Phase::Running;
         if pointer_known {
@@ -1238,5 +1381,116 @@ mod tests {
         gate.end_inject();
         assert_eq!(gate.phase(), Phase::Off);
         assert!(!gate.injecting());
+    }
+
+    #[test]
+    fn a_stop_after_an_inflight_pause_ends_off() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.begin_inject(id, gate.epoch()).unwrap();
+        gate.pause();
+        gate.stop();
+        assert_eq!(gate.phase(), Phase::Paused);
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Off);
+        assert!(!gate.injecting());
+        assert!(gate.drive().is_none());
+    }
+
+    #[test]
+    fn a_close_during_injection_does_not_clear_the_session_selected_next() {
+        let mut gate = Gate::default();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        gate.begin_inject(first, gate.epoch()).unwrap();
+        gate.note_session_closed(first);
+        gate.control(Some(second), Control::Start).unwrap();
+        assert_eq!(gate.session(), Some(second));
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Running);
+        assert_eq!(gate.session(), Some(second));
+        assert!(!gate.injecting());
+    }
+
+    #[test]
+    fn a_tcp_stop_start_never_refreshes_the_watchdog() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let timeout = Duration::from_millis(100);
+        let opened = Instant::now();
+        assert_eq!(
+            gate.apply(Some(id), Control::Start, false, opened, timeout),
+            Err(ControlReject::StalePoll)
+        );
+        gate.begin_inject(id, gate.epoch()).unwrap();
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Running);
+        gate.apply(None, Control::Stop, false, opened, timeout)
+            .unwrap();
+        assert_eq!(gate.phase(), Phase::Off);
+        assert_eq!(
+            gate.apply(
+                Some(id),
+                Control::Start,
+                false,
+                opened + Duration::from_millis(20),
+                timeout
+            ),
+            Err(ControlReject::StalePoll)
+        );
+        let late = opened + timeout + Duration::from_millis(1);
+        assert!(gate.stale_reentry(late, timeout));
+        assert_eq!(
+            gate.apply(Some(id), Control::Start, false, late, timeout),
+            Err(ControlReject::StalePoll)
+        );
+        assert_eq!(gate.phase(), Phase::Off);
+    }
+
+    #[test]
+    fn a_companion_poll_allows_tcp_start_without_moving_the_deadline() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let timeout = Duration::from_millis(100);
+        let polled = Instant::now();
+        assert!(!gate.note_poll(polled, timeout));
+        gate.apply(Some(id), Control::Start, false, polled, timeout)
+            .unwrap();
+        assert_eq!(gate.phase(), Phase::Running);
+        gate.apply(None, Control::Stop, false, polled, timeout)
+            .unwrap();
+        gate.apply(
+            Some(id),
+            Control::Start,
+            false,
+            polled + Duration::from_millis(40),
+            timeout,
+        )
+        .unwrap();
+        gate.watchdog(polled + Duration::from_millis(90), timeout);
+        assert_eq!(gate.phase(), Phase::Running);
+        gate.watchdog(polled + timeout, timeout);
+        assert_eq!(
+            gate.phase(),
+            Phase::Paused,
+            "a TCP stop and start must keep the poll that allowed the start"
+        );
+    }
+
+    #[test]
+    fn a_missing_keyboard_pauses_a_live_injection() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let epoch = gate.epoch();
+        gate.begin_inject(id, epoch).unwrap();
+        gate.set_keyboard_interrupt(false);
+        assert!(!gate.keyboard_interrupt());
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert_ne!(gate.epoch(), epoch);
+        gate.set_keyboard_interrupt(false);
+        assert_eq!(gate.epoch(), epoch + 1, "a repeat must not bump again");
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert!(gate.begin_inject(id, gate.epoch()).is_err());
     }
 }

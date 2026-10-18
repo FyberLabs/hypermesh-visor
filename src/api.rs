@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -430,8 +430,17 @@ impl AppState {
                 "a paused automation can only be resumed by the companion",
             ));
         }
-        gate.control(session, action)
-            .map_err(|_| ApiError::bad("start needs an open session"))
+        let now = Instant::now();
+        let timeout = self.companion_poll_timeout;
+        gate.apply(session, action, companion, now, timeout)
+            .map_err(|err| match err {
+                automation::ControlReject::NeedsSession => {
+                    ApiError::bad("start needs an open session")
+                }
+                automation::ControlReject::StalePoll => {
+                    ApiError::unavailable(automation::STALE_POLL)
+                }
+            })
     }
 
     /// The gate's live session while one exists. The most recently touched
@@ -605,13 +614,46 @@ pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()
     spawn_companion_watch(Arc::clone(&state));
     // The bearer file from earlier builds is not a credential anymore.
     let _ = std::fs::remove_file(state.mcp_dir.join("companion.token"));
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let app = router(Arc::clone(&state));
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            state.close_all();
-        })
-        .await
+    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+        let _ = shutdown_rx.wait_for(|stop| *stop).await;
+    });
+    shutdown_signal().await;
+    let outcome = wait_bounded(automation::SHUTDOWN_DEADLINE, async move {
+        state.close_all();
+        let _ = shutdown_tx.send(true);
+        server.await
+    })
+    .await;
+    match outcome {
+        ShutdownWait::Finished(result) => result,
+        ShutdownWait::Deadline => {
+            // A desktop call stuck in one request never reaches the injection
+            // lock. The X server drops this client's grabs when the process
+            // exits. ReleaseGuard has already had the injection-wait budget.
+            eprintln!(
+                "hypermesh-visor: shutdown exceeded {}s; exiting",
+                automation::SHUTDOWN_DEADLINE.as_secs()
+            );
+            std::process::exit(0);
+        }
+    }
+}
+
+enum ShutdownWait<T> {
+    Finished(T),
+    Deadline,
+}
+
+async fn wait_bounded<F, T>(deadline: Duration, future: F) -> ShutdownWait<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    match tokio::time::timeout(deadline, future).await {
+        Ok(value) => ShutdownWait::Finished(value),
+        Err(_) => ShutdownWait::Deadline,
+    }
 }
 
 async fn shutdown_signal() {
@@ -846,8 +888,18 @@ fn clip_text(value: &str, max: usize) -> String {
 async fn companion(
     State(state): State<Arc<AppState>>,
     Extension(CompanionLink(from_companion)): Extension<CompanionLink>,
+    headers: HeaderMap,
 ) -> Json<CompanionBody> {
     if from_companion {
+        // Level-triggered. A missing keyboard pauses a live gate before this
+        // poll is stored, so the heartbeat cannot keep that stretch running.
+        if headers
+            .get("x-hypermesh-keyboard")
+            .and_then(|value| value.to_str().ok())
+            == Some("0")
+        {
+            lock(&state.automation).set_keyboard_interrupt(false);
+        }
         lock(&state.automation).note_poll(Instant::now(), state.companion_poll_timeout);
     } else {
         lock(&state.automation).watchdog(Instant::now(), state.companion_poll_timeout);
@@ -1480,6 +1532,9 @@ async fn mouse(
     if injection_cancelled(epoch, gate_word(&state)) {
         return Err(ApiError::conflict("automation paused"));
     }
+    if lock(&state.automation).stale_reentry(Instant::now(), state.companion_poll_timeout) {
+        return Err(ApiError::unavailable(automation::STALE_POLL));
+    }
     if !state.mark_verb(id, Verb::Mouse) {
         return Err(ApiError::missing());
     }
@@ -1538,6 +1593,9 @@ async fn type_keys(
     }
     if injection_cancelled(epoch, gate_word(&state)) {
         return Err(ApiError::conflict("automation paused"));
+    }
+    if lock(&state.automation).stale_reentry(Instant::now(), state.companion_poll_timeout) {
+        return Err(ApiError::unavailable(automation::STALE_POLL));
     }
     let (secret, typed, secret_handle, key_line) = {
         let mut sessions = lock(&state.sessions);
@@ -1947,6 +2005,13 @@ impl ApiError {
     fn not_implemented(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::NOT_IMPLEMENTED,
+            message: message.into(),
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
         }
     }
@@ -2362,6 +2427,34 @@ mod tests {
         stream
             .write_all(b"GET /companion HTTP/1.1\r\nhost: hypermesh\r\nconnection: close\r\n\r\n")
             .unwrap();
+        let mut buf = Vec::new();
+        if let Err(err) = stream.read_to_end(&mut buf) {
+            if buf.is_empty() {
+                panic!("companion get read: {err}");
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.contains(" 200 "), "{text}");
+        let body = text
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .unwrap_or("");
+        serde_json::from_str(body).unwrap_or_else(|err| panic!("{err}: {text}"))
+    }
+
+    fn companion_get_keyboard(dir: &std::path::Path, available: bool) -> serde_json::Value {
+        use std::io::{Read, Write};
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(crate::companion_sock::socket_file(dir))
+                .unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let bit = if available { "1" } else { "0" };
+        let request = format!(
+            "GET /companion HTTP/1.1\r\nhost: hypermesh\r\nx-hypermesh-keyboard: {bit}\r\nconnection: close\r\n\r\n"
+        );
+        stream.write_all(request.as_bytes()).unwrap();
         let mut buf = Vec::new();
         if let Err(err) = stream.read_to_end(&mut buf) {
             if buf.is_empty() {
@@ -3074,6 +3167,7 @@ while True:
         assert_eq!(status, 409);
         assert_eq!(lock(&desktop.mice).len(), before);
 
+        let poll_sock = sock.clone();
         let status = tokio::task::spawn_blocking(move || companion_post(&sock, "stop"))
             .await
             .unwrap();
@@ -3081,6 +3175,9 @@ while True:
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let lifted: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(lifted["automation"]["phase"], "off");
+        let _ = tokio::task::spawn_blocking(move || companion_get(&poll_sock))
+            .await
+            .unwrap();
         let (status, _, _) = send(
             addr,
             "POST",
@@ -3544,6 +3641,73 @@ while True:
     }
 
     #[tokio::test]
+    async fn a_tcp_stop_start_loop_cannot_keep_automation_alive() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn_timeout(Arc::clone(&desktop), Duration::from_millis(80)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":1,"y":2}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"stop"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        for _ in 0..3 {
+            let (status, _, body) = send(
+                addr,
+                "POST",
+                "/companion/automation",
+                Some(r#"{"action":"start"}"#.into()),
+            )
+            .await;
+            let text = String::from_utf8_lossy(&body);
+            assert_eq!(status, 503, "{text}");
+            assert!(text.contains("no recent companion poll"), "{text}");
+            let (status, _, _) = send(
+                addr,
+                "POST",
+                "/companion/automation",
+                Some(r#"{"action":"stop"}"#.into()),
+            )
+            .await;
+            assert_eq!(status, 204);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":3,"y":4}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 503, "{text}");
+        assert!(
+            lock(&desktop.mice).len() == 1,
+            "the later move must not inject"
+        );
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"text":"a"}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 503, "{text}");
+        assert!(lock(&desktop.typed).is_empty());
+    }
+
+    #[tokio::test]
     async fn a_quiet_companion_pauses_until_a_socket_resume() {
         let desktop = FakeDesktop::new();
         let (addr, dir) = spawn_pair_timeout(Arc::clone(&desktop), Duration::from_millis(80)).await;
@@ -3851,6 +4015,17 @@ while True:
     }
 
     #[tokio::test]
+    async fn shutdown_deadline_ends_a_stuck_future() {
+        let started = tokio::time::Instant::now();
+        let outcome = wait_bounded(Duration::from_millis(40), std::future::pending::<()>()).await;
+        assert!(matches!(outcome, ShutdownWait::Deadline));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the deadline did not bound the wait"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stop_during_injection_stays_running_until_the_call_ends() {
         let desktop = FakeDesktop::new();
         desktop.block_type.store(true, Ordering::SeqCst);
@@ -4017,6 +4192,88 @@ while True:
     }
 
     #[tokio::test]
+    async fn a_keyboard_report_pauses_an_inflight_type() {
+        let desktop = FakeDesktop::new();
+        desktop.block_type.store(true, Ordering::SeqCst);
+        let (addr, dir) = spawn_pair(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let type_addr = addr;
+        let type_id = id;
+        let job = tokio::spawn(async move {
+            send(
+                type_addr,
+                "POST",
+                &format!("/session/{type_id}/type"),
+                Some(r#"{"text":"ab"}"#.into()),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (_, _, body) = send(addr, "GET", "/companion", None).await;
+                let live: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if live["automation"]["injecting"] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "type did not enter the gate");
+        let sock = dir.clone();
+        let status = tokio::task::spawn_blocking(move || companion_interrupt(&sock))
+            .await
+            .unwrap();
+        assert_eq!(status, 204);
+        desktop.block_type.store(false, Ordering::SeqCst);
+        let (status, _, body) = job.await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let paused: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paused["automation"]["phase"], "paused");
+        assert_eq!(paused["interrupt"], "no keyboard interrupt available");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_companion_poll_reporting_no_keyboard_pauses() {
+        let desktop = FakeDesktop::new();
+        let (addr, dir) = spawn_pair(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":1,"y":2}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let sock = dir.clone();
+        let body = tokio::task::spawn_blocking(move || companion_get_keyboard(&sock, false))
+            .await
+            .unwrap();
+        assert_eq!(body["automation"]["phase"], "paused");
+        assert_eq!(body["interrupt"], "no keyboard interrupt available");
+        let sock = dir.clone();
+        let again = tokio::task::spawn_blocking(move || companion_get_keyboard(&sock, false))
+            .await
+            .unwrap();
+        assert_eq!(again["automation"]["phase"], "paused");
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":3,"y":4}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 501, "{text}");
+        assert_eq!(lock(&desktop.mice).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn a_coordinate_outside_the_root_is_refused() {
         let desktop = FakeDesktop::new();
         *lock(&desktop.root_size) = Some((100, 80));
@@ -4140,7 +4397,7 @@ while True:
 
     #[tokio::test]
     async fn start_keeps_the_session_the_gate_is_driving() {
-        let addr = spawn(FakeDesktop::new()).await;
+        let (addr, dir) = spawn_pair(FakeDesktop::new()).await;
         let (_, _, first) = open_session_id(addr, serde_json::json!([])).await;
         let (status, _, _) = send(
             addr,
@@ -4174,6 +4431,10 @@ while True:
         )
         .await;
         assert_eq!(status, 204);
+        let poll_dir = dir.clone();
+        let _ = tokio::task::spawn_blocking(move || companion_get(&poll_dir))
+            .await
+            .unwrap();
         let (status, _, _) = send(
             addr,
             "POST",
@@ -4186,6 +4447,7 @@ while True:
         let fresh: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(fresh["automation"]["phase"], "running");
         assert_eq!(fresh["session"]["id"], second.to_string());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
