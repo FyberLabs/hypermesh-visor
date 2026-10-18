@@ -1047,6 +1047,10 @@ scenario_auto_resume() {
   stop_companion
   start_companion 2
   ensure_running
+  # The visor reports running as soon as the socket start lands. The
+  # companion learns that on its next poll. A move before that poll is
+  # input while the bug still shows off, and it does not pause.
+  sleep 0.5
   uinput_cmd "rel 28 6"
   wait_phase paused 40
   sleep 0.4
