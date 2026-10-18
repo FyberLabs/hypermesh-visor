@@ -83,7 +83,7 @@ pub struct Snapshot {
     pub inject_seq: u64,
     /// Highest sequence whose desktop call has returned, including a failure.
     pub last_settled_seq: u64,
-    /// How the visor injects. Wayland portal input is not an XTEST device.
+    /// How the visor injects. `wayland` means automation is unavailable until issue #17.
     pub backend: InjectionBackend,
 }
 

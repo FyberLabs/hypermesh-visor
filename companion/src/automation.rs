@@ -31,6 +31,20 @@ const FALLBACK_BUTTONS: u32 = 0b1_1111 << 8;
 /// How long a published injection may suppress fallback checks. A hung
 /// `mouse` or `type` must not keep a physical move from pausing.
 pub const INJECT_HOLD_MS: u64 = 2_000;
+/// Menu note and log line while the visor backend is the Wayland portal.
+pub const WAYLAND_AUTOMATION_NOTE: &str =
+    "Automation is disabled on Wayland until the portal backend lands (#17)";
+
+/// A Wayland visor does not drive the desktop until issue #17. The companion
+/// keeps idle, sleeping, disconnected, and upgrading, and does not enter the
+/// automation state.
+pub fn displayed_visor_phase(wayland: bool, phase: VisorPhase) -> VisorPhase {
+    if wayland {
+        VisorPhase::Off
+    } else {
+        phase
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -693,6 +707,26 @@ mod tests {
             elapsed_ms: elapsed,
             clickable,
         }
+    }
+
+    #[test]
+    fn wayland_hides_the_visor_state() {
+        assert_eq!(
+            displayed_visor_phase(true, VisorPhase::Running),
+            VisorPhase::Off
+        );
+        assert_eq!(
+            displayed_visor_phase(true, VisorPhase::Paused),
+            VisorPhase::Off
+        );
+        assert_eq!(
+            displayed_visor_phase(false, VisorPhase::Running),
+            VisorPhase::Running
+        );
+        assert_eq!(
+            WAYLAND_AUTOMATION_NOTE,
+            "Automation is disabled on Wayland until the portal backend lands (#17)"
+        );
     }
 
     #[test]

@@ -134,6 +134,7 @@ pub fn render(
     status: Option<&str>,
     eyes_follow: bool,
     bug_cursor: bool,
+    automation_note: Option<&str>,
     pointer: Option<(i32, i32)>,
     max_height: u32,
     scroll: i32,
@@ -224,6 +225,17 @@ pub fn render(
             y += h + 4;
         }
     } else if menu {
+        if let Some(note) = automation_note.filter(|line| !line.is_empty()) {
+            let lines = wrap_note(note, note_columns(width, 2));
+            let row = text_card(width, 2, &lines, [40, 24, 16, 245], [236, 220, 190, 255]);
+            let h = row.h as i32;
+            blocks.push(Block {
+                y,
+                image: row,
+                hits: Vec::new(),
+            });
+            y += h + 4;
+        }
         let eyes_label = if eyes_follow {
             "Eyes follow: on"
         } else {
@@ -349,6 +361,7 @@ pub fn dump_frames(dir: &Path) -> std::io::Result<()> {
         false,
         false,
         None,
+        None,
         u32::MAX,
         0,
     );
@@ -366,6 +379,7 @@ pub fn dump_frames(dir: &Path) -> std::io::Result<()> {
         None,
         false,
         false,
+        None,
         None,
         u32::MAX,
         0,
@@ -565,6 +579,35 @@ fn put_px(image: &mut Image, x: i32, y: i32, color: [u8; 4]) {
     }
     let i = (y as u32 * image.w + x as u32) as usize * 4;
     image.rgba[i..i + 4].copy_from_slice(&color);
+}
+
+fn note_columns(width: u32, scale: i32) -> usize {
+    let advance = (6 * scale).max(1) as u32;
+    (width.saturating_sub(16) / advance).max(1) as usize
+}
+
+/// Wrap a note on spaces so each line fits a bitmap card.
+pub fn wrap_note(text: &str, max_chars: usize) -> Vec<String> {
+    let max_chars = max_chars.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current = word.to_string();
+            continue;
+        }
+        if current.chars().count() + 1 + word.chars().count() <= max_chars {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn sanitize(value: &str) -> String {
@@ -964,6 +1007,7 @@ mod tests {
             None,
             eyes,
             false,
+            None,
             pointer,
             u32::MAX,
             0,
@@ -1073,6 +1117,7 @@ mod tests {
             false,
             false,
             None,
+            None,
             u32::MAX,
             0,
         );
@@ -1112,6 +1157,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
                 max_height,
                 0,
             );
@@ -1140,6 +1186,7 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
                 max_height,
                 i32::MAX,
             );
@@ -1165,11 +1212,56 @@ mod tests {
                 false,
                 false,
                 None,
+                None,
                 max_height,
                 clamp_scroll(i32::MAX, top.scroll_max),
             );
             assert_eq!(stored.rgba, bottom.rgba);
         }
+    }
+
+    #[test]
+    fn menu_notes_that_wayland_automation_is_disabled() {
+        let sprites = Sprites::load();
+        let note = "Automation is disabled on Wayland until the portal backend lands (#17)";
+        let plain = render(
+            &sprites,
+            &Pose::Idle,
+            Mascot::Idle,
+            0,
+            true,
+            false,
+            None,
+            false,
+            false,
+            None,
+            None,
+            u32::MAX,
+            0,
+        );
+        let noted = render(
+            &sprites,
+            &Pose::Idle,
+            Mascot::Idle,
+            0,
+            true,
+            false,
+            None,
+            false,
+            false,
+            Some(note),
+            None,
+            u32::MAX,
+            0,
+        );
+        assert!(noted.height > plain.height);
+        assert_eq!(noted.hits.len(), plain.hits.len());
+        let lines = wrap_note(note, note_columns(400, 2));
+        assert_eq!(lines.join(" "), note);
+        assert!(lines.len() > 1);
+        assert!(lines
+            .iter()
+            .all(|line| line.chars().count() <= note_columns(400, 2)));
     }
 
     fn row_h() -> i32 {

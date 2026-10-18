@@ -320,6 +320,13 @@ impl AppState {
     }
 
     fn control_automation(&self, action: Control, companion: bool) -> Result<(), ApiError> {
+        if matches!(action, Control::Start | Control::Resume)
+            && self.desktop.backend_name() == "wayland"
+        {
+            return Err(ApiError::not_implemented(
+                crate::desktop::WAYLAND_AUTOMATION,
+            ));
+        }
         let _injection = lock(&self.injection);
         let session = self.control_session();
         let mut gate = lock(&self.automation);
@@ -1030,6 +1037,11 @@ async fn mouse(
     Json(op): Json<MouseOp>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
+    if state.desktop.backend_name() == "wayland" {
+        return Err(ApiError::not_implemented(
+            crate::desktop::WAYLAND_AUTOMATION,
+        ));
+    }
     if state.drive_blocked(id) {
         return Err(ApiError::conflict("automation paused"));
     }
@@ -1067,6 +1079,11 @@ async fn type_keys(
     Json(mut body): Json<TypeBody>,
 ) -> Result<StatusCode, ApiError> {
     let id = parse_id(&id)?;
+    if state.desktop.backend_name() == "wayland" {
+        return Err(ApiError::not_implemented(
+            crate::desktop::WAYLAND_AUTOMATION,
+        ));
+    }
     if state.drive_blocked(id) {
         return Err(ApiError::conflict("automation paused"));
     }
@@ -1447,6 +1464,13 @@ impl ApiError {
         }
     }
 
+    fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            message: message.into(),
+        }
+    }
+
     fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -1546,6 +1570,7 @@ mod tests {
         focus: Mutex<Option<FocusedApp>>,
         pointer: Mutex<Option<(i32, i32)>>,
         focus_probes: AtomicUsize,
+        wayland: AtomicBool,
     }
 
     impl FakeDesktop {
@@ -1561,6 +1586,7 @@ mod tests {
                 focus: Mutex::new(None),
                 pointer: Mutex::new(None),
                 focus_probes: AtomicUsize::new(0),
+                wayland: AtomicBool::new(false),
             })
         }
 
@@ -1612,6 +1638,14 @@ mod tests {
 
         fn pointer_position(&self) -> Result<Option<(i32, i32)>, DesktopError> {
             Ok(*lock(&self.pointer))
+        }
+
+        fn backend_name(&self) -> &'static str {
+            if self.wayland.load(Ordering::SeqCst) {
+                "wayland"
+            } else {
+                "fixture"
+            }
         }
     }
 
@@ -2014,6 +2048,55 @@ while True:
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["session"]["focused"]["wm_class"], "Terminal");
         assert_eq!(desktop.focus_probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wayland_refuses_automation_start_resume_and_injection() {
+        let desktop = FakeDesktop::new();
+        desktop.wayland.store(true, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let before: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(before["backend"], "wayland");
+        assert_eq!(before["automation"]["phase"], "off");
+        for action in ["start", "resume"] {
+            let (status, _, body) = send(
+                addr,
+                "POST",
+                "/companion/automation",
+                Some(format!(r#"{{"action":"{action}"}}"#)),
+            )
+            .await;
+            assert_eq!(status, 501, "{action}");
+            let text = String::from_utf8(body.to_vec()).unwrap();
+            assert!(text.contains(crate::desktop::WAYLAND_AUTOMATION), "{text}");
+        }
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mouse"),
+            Some(r#"{"action":"move","x":4,"y":5}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 501);
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("#17"));
+        assert!(lock(&desktop.mice).is_empty());
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/type"),
+            Some(r#"{"text":"hi"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 501);
+        assert!(lock(&desktop.typed).is_empty());
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let after: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(after["automation"]["phase"], "off");
+        assert_eq!(after["automation"]["injecting"], false);
+        let (status, _, _) = send(addr, "POST", &format!("/session/{id}/view"), None).await;
+        assert_eq!(status, 200);
     }
 
     #[tokio::test]

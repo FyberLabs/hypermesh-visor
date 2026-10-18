@@ -11,6 +11,11 @@ use std::sync::Mutex;
 
 use crate::input::{MouseOp, Stroke};
 
+/// Shown when start, resume, mouse, or type would inject on the portal backend.
+/// The RemoteDesktop calls stay in `wayland` for issue #17 and are not used.
+pub const WAYLAND_AUTOMATION: &str =
+    "Automation is disabled on Wayland until the portal backend lands (#17)";
+
 pub const AUDIO_FORMAT: &str = "s16le;rate=48000;channels=1";
 pub const AUDIO_RATE: u32 = 48_000;
 pub const AUDIO_CHANNELS: u8 = 1;
@@ -146,6 +151,8 @@ fn present(value: &Option<String>) -> bool {
 
 pub struct LinuxDesktop {
     env: SessionEnv,
+    /// Held for issue #17. Nothing calls it while portal injection is gated off.
+    #[allow(dead_code)]
     wayland_input: Mutex<Option<wayland::WaylandInput>>,
 }
 
@@ -178,14 +185,14 @@ impl Desktop for LinuxDesktop {
     fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError> {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::mouse(self.env.display.as_deref(), op),
-            BackendKind::Wayland => self.with_wayland(|input| input.mouse(op)),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
         }
     }
 
     fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError> {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::type_strokes(self.env.display.as_deref(), strokes),
-            BackendKind::Wayland => self.with_wayland(|input| input.type_strokes(strokes)),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
         }
     }
 
@@ -223,6 +230,8 @@ impl Desktop for LinuxDesktop {
 }
 
 impl LinuxDesktop {
+    /// Opens a RemoteDesktop session. Issue #17 is what calls this again.
+    #[allow(dead_code)]
     fn with_wayland<T>(
         &self,
         op: impl FnOnce(&wayland::WaylandInput) -> Result<T, DesktopError>,
@@ -294,5 +303,21 @@ mod tests {
                 .to_string(),
             "x11 session has no DISPLAY"
         );
+    }
+
+    #[test]
+    fn wayland_injection_does_not_open_the_portal() {
+        let desktop = LinuxDesktop::new(env(Some("wayland"), Some(":0"), Some("wayland-0"), 1000));
+        assert_eq!(desktop.backend_name(), "wayland");
+        let mouse = desktop
+            .mouse(&crate::input::MouseOp::Move {
+                x: 1,
+                y: 2,
+                clickable: false,
+            })
+            .unwrap_err();
+        assert_eq!(mouse.to_string(), WAYLAND_AUTOMATION);
+        let typed = desktop.type_input(&[]).unwrap_err();
+        assert_eq!(typed.to_string(), WAYLAND_AUTOMATION);
     }
 }

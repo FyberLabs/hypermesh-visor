@@ -20,6 +20,8 @@ pub struct WaylandInput {
     session_handle: String,
 }
 
+/// Pointer and keyboard portal calls. Gated off until issue #17.
+#[allow(dead_code)]
 impl WaylandInput {
     pub fn start() -> Result<Self, DesktopError> {
         let conn = session_bus()?;

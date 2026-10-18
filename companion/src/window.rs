@@ -63,6 +63,8 @@ struct App {
     sample_age: automation::SampleAge,
     /// Menu and continue-prompt scroll, in pixels.
     scroll: i32,
+    /// The Wayland automation note has already been logged.
+    wayland_note_logged: bool,
 }
 
 pub fn run() -> Result<(), String> {
@@ -96,6 +98,7 @@ pub fn run() -> Result<(), String> {
         fallback: automation::FallbackTrack::default(),
         sample_age: automation::SampleAge::default(),
         scroll: 0,
+        wayland_note_logged: false,
     };
     show(app)
 }
@@ -120,6 +123,7 @@ fn show(mut app: App) -> Result<(), String> {
         Some(status.as_str()),
         app.eyes_follow,
         app.bug_cursor,
+        None,
         None,
         u32::from(screen.height_in_pixels)
             .saturating_sub(draw::VIEW_MARGIN)
@@ -195,8 +199,16 @@ fn show(mut app: App) -> Result<(), String> {
             app.sample_age
                 .observe(drive.inject_seq, drive.at_ms, now_ms)
         });
+        let wayland = matches!(snap.backend, crate::auth::InjectionBackend::Wayland);
+        if snap.connected && wayland && !app.wayland_note_logged {
+            eprintln!(
+                "hypermesh-companion: {}",
+                automation::WAYLAND_AUTOMATION_NOTE
+            );
+            app.wayland_note_logged = true;
+        }
         let visor_phase = if snap.connected {
-            snap.phase
+            automation::displayed_visor_phase(wayland, snap.phase)
         } else {
             VisorPhase::Off
         };
@@ -222,10 +234,6 @@ fn show(mut app: App) -> Result<(), String> {
             app.fallback_after_resume = None;
         }
         let was_paused = app.machine.phase() == Phase::Paused;
-        watch.sync_backend(
-            snap.connected,
-            matches!(snap.backend, crate::auth::InjectionBackend::Wayland),
-        );
         let mut click: Option<(i32, i32)> = None;
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
             if let Some(live) = watch.observe(&event) {
@@ -322,6 +330,11 @@ fn show(mut app: App) -> Result<(), String> {
             Some(status.as_str()),
             app.eyes_follow,
             app.bug_cursor,
+            if wayland && app.menu {
+                Some(automation::WAYLAND_AUTOMATION_NOTE)
+            } else {
+                None
+            },
             pointer,
             u32::from(screen.height_in_pixels)
                 .saturating_sub(draw::VIEW_MARGIN)
