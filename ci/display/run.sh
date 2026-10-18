@@ -313,6 +313,10 @@ start_companion() {
     return 0
   fi
   local code
+  # A leftover user pause rejects TCP start with 403. The socket may clear
+  # it. TCP start is the ready signal only once the phase is not running,
+  # because that is when a missing poll is a 503.
+  socket_action stop || true
   for i in $(seq 1 50); do
     http_code "$DISPLAY_LOG_DIR/ready.code" POST "$BASE/companion/automation" '{"action":"start"}'
     code=$(cat "$DISPLAY_LOG_DIR/ready.code")
@@ -321,7 +325,12 @@ start_companion() {
       wait_phase off
       return 0
     fi
-    if [[ $code == 403 || $code == 501 ]]; then
+    if [[ $code == 403 ]]; then
+      socket_action stop || true
+      sleep 0.1
+      continue
+    fi
+    if [[ $code == 501 ]]; then
       echo "companion poll returned $code" >&2
       cat "$HTTP_BODY" >&2 || true
       return 1
