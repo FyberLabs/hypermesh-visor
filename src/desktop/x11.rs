@@ -43,7 +43,14 @@ pub fn focused_wm_class(display: Option<&str>) -> Result<Option<String>, Desktop
     let atom_active = intern(&conn, "_NET_ACTIVE_WINDOW")?;
     let atom_wm_class = intern(&conn, "WM_CLASS")?;
     let reply = conn
-        .get_property(false, root, atom_active, x11rb::protocol::xproto::AtomEnum::WINDOW, 0, 1)
+        .get_property(
+            false,
+            root,
+            atom_active,
+            x11rb::protocol::xproto::AtomEnum::WINDOW,
+            0,
+            1,
+        )
         .map_err(unavailable)?
         .reply()
         .map_err(unavailable)?;
@@ -60,7 +67,14 @@ pub fn focused_wm_class(display: Option<&str>) -> Result<Option<String>, Desktop
         return Ok(None);
     }
     let class = conn
-        .get_property(false, window, atom_wm_class, x11rb::protocol::xproto::AtomEnum::STRING, 0, 256)
+        .get_property(
+            false,
+            window,
+            atom_wm_class,
+            x11rb::protocol::xproto::AtomEnum::STRING,
+            0,
+            256,
+        )
         .map_err(unavailable)?
         .reply()
         .map_err(unavailable)?;
@@ -154,6 +168,25 @@ pub fn mouse(display: Option<&str>, op: &MouseOp) -> Result<(), DesktopError> {
             button_event(&conn, root, button, true)?;
             move_abs(&conn, root, to_x, to_y)?;
             button_event(&conn, root, button, false)?;
+        }
+    }
+    conn.flush().map_err(input_err)?;
+    Ok(())
+}
+
+pub fn pointer_steps(
+    display: Option<&str>,
+    steps: &[crate::input::PointerStep],
+) -> Result<(), DesktopError> {
+    let (conn, screen_num) = connect(display)?;
+    ensure_xtest(&conn)?;
+    let root = conn.setup().roots[screen_num].root;
+    for step in steps {
+        match *step {
+            crate::input::PointerStep::Move { x, y } => move_abs(&conn, root, x, y)?,
+            crate::input::PointerStep::Button { button, down } => {
+                button_event(&conn, root, button, down)?;
+            }
         }
     }
     conn.flush().map_err(input_err)?;

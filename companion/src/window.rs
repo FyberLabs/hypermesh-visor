@@ -312,9 +312,13 @@ fn show(mut app: App) -> Result<(), String> {
                     instance: snap.instance,
                 };
                 if automation::classify_fallback(&input, &mut app.fallback) {
-                    let effect = app.machine.user_input(now_ms);
-                    note_effect(&mut app, effect);
-                    app.last_used = Instant::now();
+                    if app.machine.phase() == Phase::Off {
+                        app.last_used = Instant::now();
+                    } else {
+                        let effect = app.machine.user_input(now_ms);
+                        note_effect(&mut app, effect);
+                        app.last_used = Instant::now();
+                    }
                 }
             }
         } else {

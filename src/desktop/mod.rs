@@ -9,7 +9,7 @@ pub use fixture::FixtureDesktop;
 
 use std::sync::Mutex;
 
-use crate::input::{MouseOp, Stroke};
+use crate::input::{MouseOp, PointerStep, Stroke};
 
 /// Shown when start, resume, mouse, or type would inject on the portal backend.
 /// The RemoteDesktop calls stay in `wayland` for issue #17 and are not used.
@@ -66,6 +66,9 @@ pub trait Desktop: Send + Sync {
     fn open_audio(&self) -> Result<Box<dyn AudioRead>, DesktopError>;
     fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError>;
     fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError>;
+    /// One or more pointer events. A long drag calls this per step so a pause
+    /// can land between them.
+    fn pointer_steps(&self, steps: &[PointerStep]) -> Result<(), DesktopError>;
 
     /// Current pointer, when the backend can read it. Used to tell a long
     /// automation move from a short one. Default: unknown.
@@ -192,6 +195,13 @@ impl Desktop for LinuxDesktop {
     fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError> {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::type_strokes(self.env.display.as_deref(), strokes),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
+        }
+    }
+
+    fn pointer_steps(&self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => x11::pointer_steps(self.env.display.as_deref(), steps),
             BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
         }
     }

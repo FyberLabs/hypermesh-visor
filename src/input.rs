@@ -161,6 +161,91 @@ impl std::fmt::Display for PlanError {
 
 impl std::error::Error for PlanError {}
 
+/// Keystrokes sent in one desktop call before the pause latch is checked again.
+pub const TYPE_CHUNK_KEYSTROKES: usize = 32;
+/// One `type` request may not plan more keystrokes than this.
+pub const TYPE_MAX_KEYSTROKES: usize = 4_096;
+/// A drag longer than this, in Chebyshev pixels, is sent as separate steps.
+pub const DRAG_STEP_PX: i32 = 64;
+
+/// One injected pointer event. A drag is a run of these so a pause can land
+/// between them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointerStep {
+    Move { x: i32, y: i32 },
+    Button { button: Button, down: bool },
+}
+
+/// How many strokes belong to the next keystroke. A press and its matching
+/// release stay together. A lone down or up is its own keystroke.
+pub fn keystroke_width(strokes: &[Stroke]) -> usize {
+    match strokes {
+        [down, up, ..] if down.down && !up.down && down.keysym == up.keysym => 2,
+        [_, ..] => 1,
+        [] => 0,
+    }
+}
+
+pub fn keystroke_count(strokes: &[Stroke]) -> usize {
+    let mut count = 0;
+    let mut index = 0;
+    while index < strokes.len() {
+        index += keystroke_width(&strokes[index..]);
+        count += 1;
+    }
+    count
+}
+
+/// The prefix of `strokes` that contains at most `limit` keystrokes.
+pub fn take_keystrokes(strokes: &[Stroke], limit: usize) -> &[Stroke] {
+    let mut count = 0;
+    let mut index = 0;
+    while index < strokes.len() && count < limit {
+        index += keystroke_width(&strokes[index..]);
+        count += 1;
+    }
+    &strokes[..index]
+}
+
+/// Points from `(x0, y0)` toward `(x1, y1)`, including the end and excluding
+/// the start. A short drag is just the end, so it stays one mouse call.
+pub fn drag_waypoints(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
+    let dx = i64::from(x1) - i64::from(x0);
+    let dy = i64::from(y1) - i64::from(y0);
+    let dist = dx.abs().max(dy.abs());
+    if dist <= i64::from(DRAG_STEP_PX) {
+        return vec![(x1, y1)];
+    }
+    let steps = (dist + i64::from(DRAG_STEP_PX) - 1) / i64::from(DRAG_STEP_PX);
+    let mut points = Vec::with_capacity(steps as usize);
+    for i in 1..=steps {
+        let x = i64::from(x0) + dx * i / steps;
+        let y = i64::from(y0) + dy * i / steps;
+        points.push((i32_coord(x), i32_coord(y)));
+    }
+    points
+}
+
+fn i32_coord(value: i64) -> i32 {
+    i32::try_from(value).unwrap_or(if value > 0 { i32::MAX } else { i32::MIN })
+}
+
+/// Move to the start, press, step along the path, and release.
+pub fn drag_steps(x: i32, y: i32, to_x: i32, to_y: i32, button: Button) -> Vec<PointerStep> {
+    let mut steps = vec![
+        PointerStep::Move { x, y },
+        PointerStep::Button { button, down: true },
+    ];
+    for (px, py) in drag_waypoints(x, y, to_x, to_y) {
+        steps.push(PointerStep::Move { x: px, y: py });
+    }
+    steps.push(PointerStep::Button {
+        button,
+        down: false,
+    });
+    steps
+}
+
 pub fn plan_type(body: &TypeBody, secret: Option<&[u8]>) -> Result<Vec<Stroke>, PlanError> {
     let has_text = body.text.as_ref().is_some_and(|text| !text.is_empty());
     let has_keys = !body.keys.is_empty();
@@ -336,5 +421,38 @@ mod tests {
             secret: None,
         };
         assert_eq!(plan_type(&empty, None), Err(PlanError::Empty));
+    }
+
+    #[test]
+    fn keystrokes_stay_paired_and_long_drags_step() {
+        let strokes = plan_type(
+            &TypeBody {
+                text: Some("ab".into()),
+                keys: vec![KeyBody {
+                    key: "shift".into(),
+                    action: KeyAction::Down,
+                }],
+                secret: None,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(keystroke_count(&strokes), 3);
+        assert_eq!(take_keystrokes(&strokes, 2).len(), 4);
+        assert_eq!(take_keystrokes(&strokes, 3).len(), strokes.len());
+        assert_eq!(drag_waypoints(1, 2, 8, 9), vec![(8, 9)]);
+        let far = drag_waypoints(0, 0, 130, 0);
+        assert!(far.len() > 1);
+        assert!(far[0].0 > 0 && far[0].0 < 130);
+        assert_eq!(far.last().copied(), Some((130, 0)));
+        let steps = drag_steps(0, 0, 130, 0, Button::Left);
+        assert!(matches!(
+            steps.first(),
+            Some(PointerStep::Move { x: 0, y: 0 })
+        ));
+        assert!(matches!(
+            steps.last(),
+            Some(PointerStep::Button { down: false, .. })
+        ));
     }
 }

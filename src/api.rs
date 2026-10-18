@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,9 +23,13 @@ use zeroize::Zeroize;
 use crate::automation::{self, Control, Notice, Phase};
 use crate::desktop::{AudioRead, Desktop, DesktopError, AUDIO_FORMAT};
 use crate::harness::{Agent, Harness, HarnessError, Recipe, Skill};
-use crate::input::{keys_activity, mouse_activity, plan_type, MouseOp, PlanError, TypeBody};
+use crate::input::{
+    drag_steps, drag_waypoints, keys_activity, keystroke_count, mouse_activity, plan_type,
+    take_keystrokes, MouseOp, PlanError, PointerStep, TypeBody, TYPE_CHUNK_KEYSTROKES,
+    TYPE_MAX_KEYSTROKES,
+};
 use crate::mcp::{
-    self, companion_mode, load_bindings, resolve_preferred, FocusedApp, McpAuditRow, McpAuditor,
+    self, companion_mode, resolve_preferred, BindingCache, FocusedApp, McpAuditRow, McpAuditor,
     McpError, ToolInfo,
 };
 use crate::prompt::{self, AuditRecord, PromptError};
@@ -46,9 +50,13 @@ pub struct AppState {
     frames: Mutex<HashMap<Uuid, CachedFrame>>,
     /// Driving phase for the desktop companion. Mouse and type enter it.
     automation: Mutex<automation::Gate>,
-    /// Held across injection and across pause, stop, and session close.
+    /// Held across injection and across stop and session close.
     /// Stop waits for an in-flight drive to finish recording, then clears it.
+    /// Pause does not take this lock. It bumps [`Self::pause_epoch`] first.
     injection: Mutex<()>,
+    /// Bumped when a companion pause is requested, before any lock. An
+    /// in-flight type or drag compares this between batches and stops.
+    pause_epoch: AtomicU64,
     /// Last focused app. `GET /companion` must not probe the compositor on
     /// every poll; a Wayland probe spawns a helper process.
     focus_cache: Arc<Mutex<FocusCache>>,
@@ -57,6 +65,8 @@ pub struct AppState {
     /// `GET /companion` so sequence numbers from the previous process are
     /// not compared with this one.
     instance: u64,
+    /// `mcp-bindings.json`, refreshed outside the sessions lock.
+    bindings: Mutex<BindingCache>,
 }
 
 struct FocusCache {
@@ -133,12 +143,14 @@ impl AppState {
             frames: Mutex::new(HashMap::new()),
             automation: Mutex::new(automation::Gate::default()),
             injection: Mutex::new(()),
+            pause_epoch: AtomicU64::new(0),
             focus_cache: Arc::new(Mutex::new(FocusCache {
                 fetched_at: None,
                 value: None,
             })),
             focus_refreshing: Arc::new(AtomicBool::new(false)),
             instance: automation::fresh_instance(),
+            bindings: Mutex::new(BindingCache::default()),
         }
     }
 
@@ -226,7 +238,6 @@ impl AppState {
     /// Purpose, verb, and prefer-MCP mode for the desktop companion.
     /// The CLI auth key is not a session secret and is not included.
     fn companion_session(&self) -> Option<CompanionSession> {
-        let focused = self.cached_focus();
         let driving = {
             let gate = lock(&self.automation);
             if gate.phase() == Phase::Off {
@@ -235,32 +246,39 @@ impl AppState {
                 gate.session()
             }
         };
-        let sessions = lock(&self.sessions);
-        let session = match driving {
-            Some(id) => sessions.get(&id),
-            None => None,
-        }
-        .or_else(|| sessions.values().max_by_key(|session| session.touched()))?;
-        let mcp_servers = session.mcp().server_names();
-        let healthy = session.mcp().healthy_server_names();
-        let bindings = load_bindings(&self.mcp_dir).unwrap_or_default().bindings;
+        let chosen = {
+            let sessions = lock(&self.sessions);
+            let session = match driving {
+                Some(id) => sessions.get(&id),
+                None => None,
+            }
+            .or_else(|| sessions.values().max_by_key(|session| session.touched()))?;
+            ChosenSession {
+                id: session.id(),
+                purpose: session.purpose().to_string(),
+                verb: session.verb().map(Verb::as_str),
+                mcp_servers: session.mcp().server_names(),
+                healthy: session.mcp().healthy_server_names(),
+                idle_ms: u64::try_from(session.touched().elapsed().as_millis()).unwrap_or(u64::MAX),
+            }
+        };
+        let focused = self.cached_focus();
+        let bindings = lock(&self.bindings).current(&self.mcp_dir, Instant::now());
         let preferred = focused
             .as_ref()
-            .and_then(|app| resolve_preferred(app, &bindings, &healthy));
-        let verb = session.verb().map(Verb::as_str);
-        let mode = companion_mode(preferred.as_deref(), verb);
+            .and_then(|app| resolve_preferred(app, &bindings, &chosen.healthy));
+        let mode = companion_mode(preferred.as_deref(), chosen.verb);
         let prefer_mcp = preferred.is_some();
-        let idle_ms = u64::try_from(session.touched().elapsed().as_millis()).unwrap_or(u64::MAX);
         Some(CompanionSession {
-            id: session.id(),
-            purpose: session.purpose().to_string(),
-            verb,
+            id: chosen.id,
+            purpose: chosen.purpose,
+            verb: chosen.verb,
             mode,
             mcp: preferred,
-            mcp_servers,
+            mcp_servers: chosen.mcp_servers,
             focused,
             prefer_mcp,
-            idle_ms,
+            idle_ms: chosen.idle_ms,
         })
     }
 
@@ -331,6 +349,16 @@ impl AppState {
             return Err(ApiError::not_implemented(
                 crate::desktop::WAYLAND_AUTOMATION,
             ));
+        }
+        if action == Control::Pause {
+            // Visible to an in-flight injection before this thread waits on
+            // any mutex, including the injection lock it must not take.
+            self.pause_epoch.fetch_add(1, Ordering::SeqCst);
+            let session = self.control_session();
+            let mut gate = lock(&self.automation);
+            return gate
+                .control(session, action)
+                .map_err(|_| ApiError::bad("start needs an open session"));
         }
         let _injection = lock(&self.injection);
         let session = self.control_session();
@@ -416,6 +444,15 @@ struct DriveBody {
     pointer_known: bool,
     resume_seq: u64,
     inject_seq: u64,
+}
+
+struct ChosenSession {
+    id: Uuid,
+    purpose: String,
+    verb: Option<&'static str>,
+    mcp_servers: Vec<String>,
+    healthy: Vec<String>,
+    idle_ms: u64,
 }
 
 #[derive(Serialize)]
@@ -716,6 +753,9 @@ async fn list_mcp_audit(State(state): State<Arc<AppState>>) -> Json<Vec<McpAudit
     Json(lock(&state.mcp_audit).rows().to_vec())
 }
 
+/// Hot path for the companion poll. Session choice, the focus cache, and the
+/// bindings cache are in memory. Focus is probed only when a session is open,
+/// and `mcp-bindings.json` is stat'ed at most about once a second.
 async fn companion(State(state): State<Arc<AppState>>) -> Json<CompanionBody> {
     let session = state.companion_session();
     let gate_session = lock(&state.automation).session();
@@ -1022,6 +1062,60 @@ fn audio_loop(
     }
 }
 
+fn paused_after(sent: usize, unit: &str) -> ApiError {
+    if sent == 0 {
+        ApiError::conflict("automation paused")
+    } else {
+        ApiError::conflict(format!("automation paused after {sent} {unit}"))
+    }
+}
+
+/// A short drag is one desktop call. A longer one is pointer steps, and the
+/// latch is checked between them. A pause after the button is down releases it.
+fn inject_mouse(
+    desktop: &dyn Desktop,
+    op: &MouseOp,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), ApiError> {
+    let MouseOp::Drag {
+        x,
+        y,
+        to_x,
+        to_y,
+        button,
+    } = *op
+    else {
+        desktop.mouse(op).map_err(ApiError::from_desktop)?;
+        return Ok(());
+    };
+    if drag_waypoints(x, y, to_x, to_y).len() <= 1 {
+        desktop.mouse(op).map_err(ApiError::from_desktop)?;
+        return Ok(());
+    }
+    let steps = drag_steps(x, y, to_x, to_y, button);
+    let mut down = false;
+    let mut done = 0usize;
+    for step in steps {
+        if cancelled() {
+            if down {
+                let _ = desktop.pointer_steps(&[PointerStep::Button {
+                    button,
+                    down: false,
+                }]);
+            }
+            return Err(paused_after(done, "pointer steps"));
+        }
+        desktop
+            .pointer_steps(&[step])
+            .map_err(ApiError::from_desktop)?;
+        if let PointerStep::Button { down: pressed, .. } = step {
+            down = pressed;
+        }
+        done += 1;
+    }
+    Ok(())
+}
+
 struct InjectGuard<'a> {
     gate: &'a Mutex<automation::Gate>,
 }
@@ -1071,7 +1165,13 @@ async fn mouse(
         let _injecting = InjectGuard::arm(&state2.automation);
         let generation = lock(&state2.automation).generation();
         let from = desktop.pointer_position().ok().flatten();
-        desktop.mouse(&op).map_err(ApiError::from_desktop)?;
+        let epoch = state2.pause_epoch.load(Ordering::SeqCst);
+        inject_mouse(&*desktop, &op, &|| {
+            state2.pause_epoch.load(Ordering::SeqCst) != epoch || state2.drive_blocked(id)
+        })?;
+        if state2.pause_epoch.load(Ordering::SeqCst) != epoch || state2.drive_blocked(id) {
+            return Err(ApiError::conflict("automation paused"));
+        }
         state2.record_mouse(id, &op_for_drive, from, generation);
         Ok(())
     })
@@ -1119,6 +1219,12 @@ async fn type_keys(
     };
     let strokes = plan_type(&body, secret.as_ref().map(|value| value.as_slice()))
         .map_err(ApiError::from_plan)?;
+    let planned = keystroke_count(&strokes);
+    if planned > TYPE_MAX_KEYSTROKES {
+        return Err(ApiError::bad(format!(
+            "type request is too large ({planned} keystrokes, max {TYPE_MAX_KEYSTROKES})"
+        )));
+    }
     if let Some(text) = &mut body.text {
         text.zeroize();
     }
@@ -1139,9 +1245,21 @@ async fn type_keys(
         let _injecting = InjectGuard::arm(&state2.automation);
         let generation = lock(&state2.automation).generation();
         let at = desktop.pointer_position().ok().flatten();
-        desktop
-            .type_input(&strokes)
-            .map_err(ApiError::from_desktop)?;
+        let epoch = state2.pause_epoch.load(Ordering::SeqCst);
+        let mut rest = strokes.as_slice();
+        let mut sent = 0usize;
+        while !rest.is_empty() {
+            if state2.pause_epoch.load(Ordering::SeqCst) != epoch || state2.drive_blocked(id) {
+                return Err(paused_after(sent, "keystrokes"));
+            }
+            let chunk = take_keystrokes(rest, TYPE_CHUNK_KEYSTROKES);
+            desktop.type_input(chunk).map_err(ApiError::from_desktop)?;
+            sent += keystroke_count(chunk);
+            rest = &rest[chunk.len()..];
+        }
+        if state2.pause_epoch.load(Ordering::SeqCst) != epoch || state2.drive_blocked(id) {
+            return Err(paused_after(sent, "keystrokes"));
+        }
         state2.record_type(id, at, generation);
         Ok(())
     })
@@ -1572,6 +1690,11 @@ mod tests {
         audio: Mutex<Vec<u8>>,
         mice: Mutex<Vec<MouseOp>>,
         typed: Mutex<Vec<Stroke>>,
+        pointer_log: Mutex<Vec<crate::input::PointerStep>>,
+        block_type: AtomicBool,
+        /// 1-based `pointer_steps` call to block inside. `0` blocks nothing.
+        block_step_call: AtomicUsize,
+        step_calls: AtomicUsize,
         views: AtomicUsize,
         audio_opens: AtomicUsize,
         root: AtomicBool,
@@ -1588,6 +1711,10 @@ mod tests {
                 audio: Mutex::new(b"pcm-bytes".to_vec()),
                 mice: Mutex::new(Vec::new()),
                 typed: Mutex::new(Vec::new()),
+                pointer_log: Mutex::new(Vec::new()),
+                block_type: AtomicBool::new(false),
+                block_step_call: AtomicUsize::new(0),
+                step_calls: AtomicUsize::new(0),
                 views: AtomicUsize::new(0),
                 audio_opens: AtomicUsize::new(0),
                 root: AtomicBool::new(false),
@@ -1636,6 +1763,21 @@ mod tests {
 
         fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError> {
             lock(&self.typed).extend_from_slice(strokes);
+            while self.block_type.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }
+
+        fn pointer_steps(&self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
+            lock(&self.pointer_log).extend_from_slice(steps);
+            let n = self.step_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            let hold = self.block_step_call.load(Ordering::SeqCst);
+            if hold != 0 && n == hold {
+                while self.block_step_call.load(Ordering::SeqCst) == hold {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
             Ok(())
         }
 
@@ -2059,6 +2201,31 @@ while True:
     }
 
     #[tokio::test]
+    async fn companion_skips_focus_when_no_session_is_open() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let idle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(idle["open"], false);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(desktop.focus_probes.load(Ordering::SeqCst), 0);
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let open: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(open["session"]["id"], id.to_string());
+        let saw = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if desktop.focus_probes.load(Ordering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(saw.is_ok(), "an open session did not probe focus");
+    }
+
+    #[tokio::test]
     async fn wayland_refuses_automation_start_resume_and_injection() {
         let desktop = FakeDesktop::new();
         desktop.wayland.store(true, Ordering::SeqCst);
@@ -2356,6 +2523,171 @@ while True:
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let started: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(started["automation"]["phase"], "running");
+    }
+
+    #[tokio::test]
+    async fn a_pause_during_type_stops_the_next_batch() {
+        let desktop = FakeDesktop::new();
+        desktop.block_type.store(true, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let text = "a".repeat(64);
+        let payload = format!(r#"{{"text":"{text}"}}"#);
+        let type_addr = addr;
+        let type_id = id;
+        let job = tokio::spawn(async move {
+            send(
+                type_addr,
+                "POST",
+                &format!("/session/{type_id}/type"),
+                Some(payload),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if lock(&desktop.typed).len() >= 64 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "the first type batch did not start");
+        let paused = tokio::time::timeout(
+            Duration::from_secs(2),
+            send(
+                addr,
+                "POST",
+                "/companion/automation",
+                Some(r#"{"action":"pause"}"#.into()),
+            ),
+        )
+        .await;
+        desktop.block_type.store(false, Ordering::SeqCst);
+        let (status, _, _) = paused.expect("pause waited on the injection lock");
+        assert_eq!(status, 204);
+        let (status, _, body) = job.await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        assert!(text.contains("after 32 keystrokes"), "{text}");
+        assert_eq!(lock(&desktop.typed).len(), 64);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let paused: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paused["automation"]["phase"], "paused");
+    }
+
+    #[tokio::test]
+    async fn a_type_request_over_the_cap_is_refused() {
+        let desktop = FakeDesktop::new();
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let text = "a".repeat(crate::input::TYPE_MAX_KEYSTROKES + 1);
+        let payload = format!(r#"{{"text":"{text}"}}"#);
+        let (status, _, body) =
+            send(addr, "POST", &format!("/session/{id}/type"), Some(payload)).await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 400, "{text}");
+        assert!(text.contains("too large"), "{text}");
+        assert!(lock(&desktop.typed).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pause_during_a_long_drag_stops_later_steps() {
+        let desktop = FakeDesktop::new();
+        desktop.block_step_call.store(3, Ordering::SeqCst);
+        let addr = spawn(Arc::clone(&desktop)).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let drag_addr = addr;
+        let drag_id = id;
+        let job = tokio::spawn(async move {
+            send(
+                drag_addr,
+                "POST",
+                &format!("/session/{drag_id}/mouse"),
+                Some(r#"{"action":"drag","x":0,"y":0,"to_x":200,"to_y":0}"#.into()),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if desktop.step_calls.load(Ordering::SeqCst) >= 3 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "the drag did not reach the third step");
+        let paused = tokio::time::timeout(
+            Duration::from_secs(2),
+            send(
+                addr,
+                "POST",
+                "/companion/automation",
+                Some(r#"{"action":"pause"}"#.into()),
+            ),
+        )
+        .await;
+        desktop.block_step_call.store(0, Ordering::SeqCst);
+        let (status, _, _) = paused.expect("pause waited on the injection lock");
+        assert_eq!(status, 204);
+        let (status, _, body) = job.await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        assert!(text.contains("after 3 pointer steps"), "{text}");
+        let steps = lock(&desktop.pointer_log).clone();
+        assert!(
+            matches!(
+                steps.last(),
+                Some(crate::input::PointerStep::Button { down: false, .. })
+            ),
+            "{steps:?}"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|step| matches!(step, crate::input::PointerStep::Move { x: 200, .. })),
+            "{steps:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_after_closing_the_driving_session_uses_the_other_session() {
+        let desktop = FakeDesktop::new();
+        let (addr, sock) = spawn_pair(Arc::clone(&desktop)).await;
+        let (_, _, driving) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{driving}/mouse"),
+            Some(r#"{"action":"move","x":1,"y":1}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"pause"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (_, _, other) = open_session_id(addr, serde_json::json!([])).await;
+        let (status, _, _) = send(addr, "DELETE", &format!("/session/{driving}"), None).await;
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let paused: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(paused["automation"]["phase"], "paused");
+        assert_eq!(paused["session"]["id"], other.to_string());
+        let status = tokio::task::spawn_blocking(move || companion_post(&sock, "resume"))
+            .await
+            .unwrap();
+        assert_eq!(status, 204);
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let resumed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resumed["automation"]["phase"], "running");
+        assert_eq!(resumed["session"]["id"], other.to_string());
     }
 
     async fn send_with_stale_header(addr: SocketAddr) -> (u16, http::HeaderMap, Bytes) {

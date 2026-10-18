@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use base64::Engine;
 
 use crate::desktop::{AudioRead, Desktop, DesktopError, Frame};
-use crate::input::{Button, MouseOp, Stroke};
+use crate::input::{Button, MouseOp, PointerStep, Stroke};
 
 fn view_png() -> Vec<u8> {
     decode_fixture(include_str!("../../tests/fixtures/view.png.b64"))
@@ -81,6 +81,26 @@ impl Desktop for FixtureDesktop {
                 "down": stroke.down,
             })).collect::<Vec<_>>(),
         }))
+    }
+
+    fn pointer_steps(&self, steps: &[PointerStep]) -> Result<(), DesktopError> {
+        for step in steps {
+            let value = match *step {
+                PointerStep::Move { x, y } => serde_json::json!({
+                    "kind": "pointer",
+                    "action": "move",
+                    "x": x,
+                    "y": y,
+                }),
+                PointerStep::Button { button, down } => serde_json::json!({
+                    "kind": "pointer",
+                    "action": if down { "down" } else { "up" },
+                    "button": button_name(button),
+                }),
+            };
+            self.record(value)?;
+        }
+        Ok(())
     }
 }
 

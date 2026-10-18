@@ -272,15 +272,24 @@ impl Gate {
                 Ok(())
             }
             Control::Resume => {
-                if self.phase == Phase::Paused {
-                    self.phase = Phase::Running;
-                    // The pointer is already away from this sample; that is
-                    // why the automation paused. Leave the last point so a
-                    // later type still has somewhere to land, but do not let
-                    // the fallback compare against the pre-pause target.
-                    self.drive = None;
-                    self.bump_resume();
+                if self.phase != Phase::Paused {
+                    return Ok(());
                 }
+                // The driving session may have been closed while paused.
+                // The selected session becomes the owner. With none left,
+                // the phase ends instead of running with no session.
+                let Some(id) = session else {
+                    self.reset();
+                    return Ok(());
+                };
+                self.session = Some(id);
+                self.phase = Phase::Running;
+                // The pointer is already away from this sample; that is
+                // why the automation paused. Leave the last point so a
+                // later type still has somewhere to land, but do not let
+                // the fallback compare against the pre-pause target.
+                self.drive = None;
+                self.bump_resume();
                 Ok(())
             }
             Control::Stop => {
@@ -752,6 +761,38 @@ mod tests {
         gate.control(Some(id), Control::Pause).unwrap();
         assert_eq!(gate.phase(), Phase::Paused);
         assert!(gate.blocks(id));
+    }
+
+    #[test]
+    fn resume_after_the_driving_session_closed_takes_the_selected_session() {
+        let mut gate = Gate::default();
+        let driving = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        gate.record_mouse(
+            driving,
+            &MouseOp::Move {
+                x: 1,
+                y: 1,
+                clickable: false,
+            },
+            Some((0, 0)),
+            gate.generation(),
+            10,
+        );
+        gate.control(Some(driving), Control::Pause).unwrap();
+        gate.clear_session(driving);
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert!(gate.session().is_none());
+        gate.control(Some(other), Control::Resume).unwrap();
+        assert_eq!(gate.phase(), Phase::Running);
+        assert_eq!(gate.session(), Some(other));
+        assert!(gate.drive().is_none());
+
+        gate.control(Some(other), Control::Pause).unwrap();
+        gate.clear_session(other);
+        gate.control(None, Control::Resume).unwrap();
+        assert_eq!(gate.phase(), Phase::Off);
+        assert!(gate.session().is_none());
     }
 
     #[test]

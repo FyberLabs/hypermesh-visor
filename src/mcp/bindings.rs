@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::path::Path;
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::Deserialize;
 
@@ -42,6 +43,59 @@ impl FocusedApp {
     }
 }
 
+/// How often `GET /companion` may stat `mcp-bindings.json`.
+pub const BINDINGS_REFRESH: Duration = Duration::from_secs(1);
+
+/// In-memory bindings. The file is read only when this is due and the mtime changed.
+#[derive(Debug, Default)]
+pub struct BindingCache {
+    checked_at: Option<Instant>,
+    mtime: Option<SystemTime>,
+    bindings: Vec<Binding>,
+}
+
+impl BindingCache {
+    pub fn current(&mut self, dir: &Path, now: Instant) -> Vec<Binding> {
+        let due = self
+            .checked_at
+            .map(|at| now.saturating_duration_since(at) >= BINDINGS_REFRESH)
+            .unwrap_or(true);
+        if !due {
+            return self.bindings.clone();
+        }
+        let path = dir.join("mcp-bindings.json");
+        let mtime = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
+        refresh_cached_bindings(self, now, BINDINGS_REFRESH, mtime, || {
+            load_bindings(dir).unwrap_or_default().bindings
+        })
+    }
+}
+
+/// Apply one refresh decision. `load` runs only on the first fill or when `mtime` changes.
+pub fn refresh_cached_bindings(
+    cache: &mut BindingCache,
+    now: Instant,
+    interval: Duration,
+    mtime: Option<SystemTime>,
+    load: impl FnOnce() -> Vec<Binding>,
+) -> Vec<Binding> {
+    if cache
+        .checked_at
+        .is_some_and(|at| now.saturating_duration_since(at) < interval)
+    {
+        return cache.bindings.clone();
+    }
+    if cache.checked_at.is_some() && cache.mtime == mtime {
+        cache.checked_at = Some(now);
+        return cache.bindings.clone();
+    }
+    let bindings = load();
+    cache.bindings.clone_from(&bindings);
+    cache.mtime = mtime;
+    cache.checked_at = Some(now);
+    bindings
+}
+
 pub fn load_bindings(dir: &Path) -> Result<BindingsFile, McpError> {
     let path = dir.join("mcp-bindings.json");
     if !path.exists() {
@@ -75,13 +129,23 @@ pub fn resolve_preferred(
 
 fn matches_focus(focus: &FocusedApp, binding: &Binding) -> bool {
     let mut any = false;
-    if let Some(want) = binding.wm_class.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(want) = binding
+        .wm_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         any = true;
         if !eq_ignore_case(focus.wm_class.as_deref(), want) {
             return false;
         }
     }
-    if let Some(want) = binding.app_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(want) = binding
+        .app_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         any = true;
         if !eq_ignore_case(focus.app_id.as_deref(), want) {
             return false;
@@ -106,10 +170,7 @@ fn eq_ignore_case(got: Option<&str>, want: &str) -> bool {
 }
 
 /// Companion display mode: prefer `mcp:<id>` when a healthy binding matches.
-pub fn companion_mode(
-    preferred_mcp: Option<&str>,
-    verb: Option<&str>,
-) -> Option<String> {
+pub fn companion_mode(preferred_mcp: Option<&str>, verb: Option<&str>) -> Option<String> {
     if let Some(id) = preferred_mcp.filter(|s| !s.is_empty()) {
         return Some(format!("mcp:{id}"));
     }
@@ -162,5 +223,66 @@ mod tests {
         }];
         assert!(resolve_preferred(&focus, &bindings, &["filesystem".into()]).is_none());
         assert!(resolve_preferred(&FocusedApp::default(), &bindings, &["cursor".into()]).is_none());
+    }
+
+    #[test]
+    fn bindings_reload_only_after_the_interval_when_mtime_changes() {
+        let mut cache = BindingCache::default();
+        let start = Instant::now();
+        let mtime = SystemTime::UNIX_EPOCH;
+        let mut loads = 0;
+        let first =
+            refresh_cached_bindings(&mut cache, start, BINDINGS_REFRESH, Some(mtime), || {
+                loads += 1;
+                vec![Binding {
+                    server: "chrome".into(),
+                    wm_class: Some("chrome".into()),
+                    app_id: None,
+                    executable: None,
+                }]
+            });
+        assert_eq!(loads, 1);
+        assert_eq!(first[0].server, "chrome");
+        let again = refresh_cached_bindings(
+            &mut cache,
+            start + Duration::from_millis(40),
+            BINDINGS_REFRESH,
+            Some(mtime + Duration::from_secs(5)),
+            || {
+                loads += 1;
+                Vec::new()
+            },
+        );
+        assert_eq!(loads, 1);
+        assert_eq!(again[0].server, "chrome");
+        let same = refresh_cached_bindings(
+            &mut cache,
+            start + BINDINGS_REFRESH,
+            BINDINGS_REFRESH,
+            Some(mtime),
+            || {
+                loads += 1;
+                Vec::new()
+            },
+        );
+        assert_eq!(loads, 1);
+        assert_eq!(same[0].server, "chrome");
+        let changed = refresh_cached_bindings(
+            &mut cache,
+            start + BINDINGS_REFRESH + BINDINGS_REFRESH,
+            BINDINGS_REFRESH,
+            Some(mtime + Duration::from_secs(5)),
+            || {
+                loads += 1;
+                vec![Binding {
+                    server: "editor".into(),
+                    wm_class: None,
+                    app_id: None,
+                    executable: None,
+                }]
+            },
+        );
+        assert_eq!(loads, 2);
+        assert_eq!(changed[0].server, "editor");
     }
 }

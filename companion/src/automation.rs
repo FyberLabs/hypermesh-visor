@@ -420,6 +420,9 @@ pub struct FallbackTrack {
     settled_inject: u64,
     /// Process nonce these marks belong to. A new visor reuses low sequences.
     instance: Option<u64>,
+    /// Pointer sample while automation is off. Movement here refreshes idle
+    /// time and does not pause.
+    idle_baseline: Option<(i32, i32, u32)>,
 }
 
 /// Pointer-fallback cases.
@@ -440,6 +443,7 @@ pub struct FallbackTrack {
 /// | Visor process restarts | The instance nonce changes. Settled inject sequences, the baseline, and the sample age reset. A local pause is posted again. |
 /// | Reconnect | The same `resume_seq` does not undo a local pause. A newer running snapshot follows. |
 /// | Missed poll | The epoch does not bump, so a displacement does not confirm. |
+/// | Automation off | Pointer movement and button changes refresh idle time. They do not pause, and they do not become the running baseline. |
 ///
 /// A drive is usable when its pointer is known and [`drive_counts`]. While an
 /// injection is outstanding, the live sample is not copied into the baseline.
@@ -455,8 +459,15 @@ pub fn classify_fallback(input: &FallbackInput, track: &mut FallbackTrack) -> bo
         Some(_) => {}
     }
     if input.phase == Phase::Off {
-        *track = FallbackTrack::default();
-        return false;
+        let moved = note_idle(input, track);
+        let instance = track.instance;
+        let idle_baseline = track.idle_baseline;
+        *track = FallbackTrack {
+            instance,
+            idle_baseline,
+            ..FallbackTrack::default()
+        };
+        return moved;
     }
     if injection_deferred(input, track) {
         track.displacement_hold = None;
@@ -489,6 +500,18 @@ pub fn classify_fallback(input: &FallbackInput, track: &mut FallbackTrack) -> bo
 fn pointer_distance(x0: i32, y0: i32, x1: i32, y1: i32) -> i32 {
     let span = x0.abs_diff(x1).saturating_add(y0.abs_diff(y1));
     span.min(i32::MAX as u32) as i32
+}
+
+fn note_idle(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
+    let Some((x, y, mask)) = track.idle_baseline else {
+        track.idle_baseline = Some((input.x, input.y, input.mask));
+        return false;
+    };
+    let moved = fallback_paused_activity(x, y, mask, input.x, input.y, input.mask);
+    if moved {
+        track.idle_baseline = Some((input.x, input.y, input.mask));
+    }
+    moved
 }
 
 fn baseline_moved(input: &FallbackInput, track: &mut FallbackTrack) -> bool {
@@ -1358,6 +1381,23 @@ mod tests {
         sample.epoch = 6;
         assert!(!classify_fallback(&sample, &mut track));
         sample.epoch = 7;
+        assert!(classify_fallback(&sample, &mut track));
+    }
+
+    #[test]
+    fn off_phase_pointer_motion_refreshes_idle_and_does_not_seed_a_pause() {
+        let mut track = FallbackTrack::default();
+        let mut sample = running_at(0, 0, 0, 0);
+        sample.phase = Phase::Off;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 40;
+        assert!(classify_fallback(&sample, &mut track));
+        sample.x = 40;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.phase = Phase::Running;
+        sample.x = 80;
+        assert!(!classify_fallback(&sample, &mut track));
+        sample.x = 100;
         assert!(classify_fallback(&sample, &mut track));
     }
 }
