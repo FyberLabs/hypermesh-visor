@@ -116,12 +116,16 @@ pub enum ControlReject {
 
 /// A control that arrived while an injection held the desktop. Replayed in
 /// sequence order when the call unwinds, and only for the owner it named.
+/// Start and resume are in this sequence so an older stop or pause cannot
+/// erase them when the call ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Deferred {
     Stop,
     Pause,
     Close { session: Uuid, generation: u64 },
     KeyboardUnavailable,
+    Start { session: Uuid, from_companion: bool },
+    Resume { session: Uuid, from_companion: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -549,6 +553,17 @@ impl Gate {
                     return Err(ControlReject::StalePoll);
                 }
                 self.touch();
+                // Join the deferred sequence while an injection is in flight.
+                // Applying this start now would let an older stop or pause
+                // replay over it. The newest control wins when the call ends.
+                // This still does not wait on the injection lock.
+                if self.injecting {
+                    self.defer(Deferred::Start {
+                        session: id,
+                        from_companion,
+                    });
+                    return Ok(());
+                }
                 self.enter_running(id, from_companion);
                 Ok(())
             }
@@ -576,6 +591,15 @@ impl Gate {
                     return Err(ControlReject::StalePoll);
                 }
                 self.touch();
+                // Same sequence as start. A pause already queued for this
+                // injection must not replay over the resume.
+                if self.injecting {
+                    self.defer(Deferred::Resume {
+                        session: id,
+                        from_companion,
+                    });
+                    return Ok(());
+                }
                 self.enter_running(id, from_companion);
                 Ok(())
             }
@@ -697,6 +721,21 @@ impl Gate {
                 self.keyboard_interrupt = false;
                 self.phase = Phase::Paused;
                 self.publish();
+            }
+            Deferred::Start {
+                session,
+                from_companion,
+            }
+            | Deferred::Resume {
+                session,
+                from_companion,
+            } => {
+                // A missing keyboard stays paused. Replaying a start or
+                // resume must not lift that latch.
+                if !self.keyboard_interrupt {
+                    return;
+                }
+                self.enter_running(session, from_companion);
             }
         }
     }
@@ -1405,11 +1444,86 @@ mod tests {
         gate.begin_inject(first, gate.epoch()).unwrap();
         gate.note_session_closed(first);
         gate.control(Some(second), Control::Start).unwrap();
-        assert_eq!(gate.session(), Some(second));
+        // The start is in the deferred sequence with the close. The session
+        // stays the one this injection captured until the call unwinds.
+        assert_eq!(gate.session(), Some(first));
+        assert_eq!(gate.phase(), Phase::Running);
         gate.end_inject();
         assert_eq!(gate.phase(), Phase::Running);
         assert_eq!(gate.session(), Some(second));
         assert!(!gate.injecting());
+    }
+
+    #[test]
+    fn a_start_during_injection_beats_an_older_stop() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let epoch = gate.epoch();
+        gate.begin_inject(id, epoch).unwrap();
+        gate.control(None, Control::Stop).unwrap();
+        assert_eq!(gate.phase(), Phase::Running);
+        assert_ne!(gate.epoch(), epoch);
+        gate.control(Some(id), Control::Start).unwrap();
+        assert_eq!(
+            gate.phase(),
+            Phase::Running,
+            "a deferred start waits for the call to finish"
+        );
+        let seq_before = gate.resume_seq();
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Running);
+        assert_eq!(gate.session(), Some(id));
+        assert!(!gate.injecting());
+        assert!(gate.drive().is_none());
+        assert_eq!(gate.resume_seq(), seq_before + 1);
+    }
+
+    #[test]
+    fn a_resume_during_injection_beats_an_older_pause() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.begin_inject(id, gate.epoch()).unwrap();
+        gate.pause();
+        assert_eq!(gate.phase(), Phase::Paused);
+        gate.control(Some(id), Control::Resume).unwrap();
+        assert_eq!(
+            gate.phase(),
+            Phase::Paused,
+            "the latch stays until the call ends, so the injection cannot continue"
+        );
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Running);
+        assert_eq!(gate.session(), Some(id));
+        assert!(!gate.injecting());
+        assert!(gate.drive().is_none());
+    }
+
+    #[test]
+    fn a_later_stop_still_beats_a_deferred_start() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.begin_inject(id, gate.epoch()).unwrap();
+        gate.control(Some(id), Control::Start).unwrap();
+        gate.control(None, Control::Stop).unwrap();
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Off);
+        assert!(gate.session().is_none());
+        assert!(!gate.injecting());
+    }
+
+    #[test]
+    fn a_missing_keyboard_beats_a_deferred_start() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        gate.begin_inject(id, gate.epoch()).unwrap();
+        gate.control(None, Control::Stop).unwrap();
+        gate.control(Some(id), Control::Start).unwrap();
+        gate.set_keyboard_interrupt(false);
+        assert!(!gate.keyboard_interrupt());
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Paused);
+        assert!(!gate.keyboard_interrupt());
+        assert!(gate.begin_inject(id, gate.epoch()).is_err());
     }
 
     #[test]

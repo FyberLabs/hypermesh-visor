@@ -43,9 +43,37 @@ pub fn keyboard_report_due(reported_for: Option<u64>, instance: u64, keyboard_re
     !keyboard_ready && reported_for != Some(instance)
 }
 
+/// Classify queued physical input against the phase already on screen.
+/// A pause here is kept even when the snapshot that follows is `off`.
+pub fn classify_shown_input(machine: &mut Machine, live: bool, now_ms: u64) -> Effect {
+    if live {
+        machine.user_input(now_ms)
+    } else {
+        Effect::None
+    }
+}
+
+/// Classify the same queued input against the phase the snapshot just
+/// applied, when the pass against the phase on screen did not already pause.
+/// An off-to-running transition in this frame still pauses.
+pub fn classify_incoming_input(
+    machine: &mut Machine,
+    live: bool,
+    shown: Effect,
+    now_ms: u64,
+) -> Effect {
+    if live && shown != Effect::Pause {
+        machine.user_input(now_ms)
+    } else {
+        Effect::None
+    }
+}
+
 /// Apply queued physical input to the phase the companion is already showing,
-/// then take the new visor snapshot. A pause from that input survives an
-/// `off` snapshot so the companion still posts it.
+/// then take the new visor snapshot, then classify that input against the
+/// phase the snapshot applied. A pause from the phase on screen survives an
+/// `off` snapshot so the companion still posts it. A pause from the incoming
+/// phase catches input that arrived before the first `running` snapshot.
 pub fn settle_live_input(
     machine: &mut Machine,
     live: bool,
@@ -53,16 +81,36 @@ pub fn settle_live_input(
     now_ms: u64,
     resume_seq: u64,
 ) -> Effect {
-    let from_input = if live {
-        machine.user_input(now_ms)
-    } else {
-        Effect::None
-    };
+    let shown = classify_shown_input(machine, live, now_ms);
     machine.see_visor(visor, now_ms, resume_seq);
-    if from_input == Effect::Pause {
+    let incoming = classify_incoming_input(machine, live, shown, now_ms);
+    if shown == Effect::Pause || incoming == Effect::Pause {
         Effect::Pause
     } else {
         Effect::None
+    }
+}
+
+/// What a press on the bug does. `was_paused` is the phase from before this
+/// frame drained input. The press that moved `running` to `paused` must not
+/// open Continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BugClick {
+    Ask,
+    Pause,
+    Ignore,
+    ToggleMenu,
+}
+
+pub fn bug_click(was_paused: bool, phase: Phase) -> BugClick {
+    if was_paused {
+        BugClick::Ask
+    } else if phase == Phase::Running {
+        BugClick::Pause
+    } else if phase == Phase::Paused {
+        BugClick::Ignore
+    } else {
+        BugClick::ToggleMenu
     }
 }
 
@@ -889,6 +937,39 @@ mod tests {
         assert_eq!(machine.phase(), Phase::Off);
         let quiet = settle_live_input(&mut machine, false, VisorPhase::Off, 20, 1);
         assert_eq!(quiet, Effect::None);
+    }
+
+    #[test]
+    fn a_queued_input_pauses_when_the_next_snapshot_is_running() {
+        let mut machine = Machine::new(DEFAULT_RESUME_MS);
+        assert_eq!(machine.phase(), Phase::Off);
+        let effect = settle_live_input(&mut machine, true, VisorPhase::Running, 10, 1);
+        assert_eq!(effect, Effect::Pause);
+        assert_eq!(machine.phase(), Phase::Paused);
+        assert!(!machine.asking());
+        let quiet = settle_live_input(&mut machine, false, VisorPhase::Running, 20, 1);
+        assert_eq!(quiet, Effect::None);
+        assert_eq!(
+            machine.phase(),
+            Phase::Paused,
+            "a running snapshot with the same sequence does not undo the pause"
+        );
+    }
+
+    #[test]
+    fn the_click_that_pauses_does_not_open_continue() {
+        let mut machine = Machine::new(DEFAULT_RESUME_MS);
+        machine.see_visor(VisorPhase::Running, 0, 1);
+        let was_paused = machine.phase() == Phase::Paused;
+        assert!(!was_paused);
+        assert_eq!(machine.user_input(10), Effect::Pause);
+        assert_eq!(bug_click(was_paused, machine.phase()), BugClick::Ignore);
+        assert!(!machine.asking());
+
+        let was_paused = machine.phase() == Phase::Paused;
+        assert_eq!(bug_click(was_paused, machine.phase()), BugClick::Ask);
+        machine.ask(20);
+        assert!(machine.asking());
     }
 
     #[test]

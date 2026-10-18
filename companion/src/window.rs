@@ -17,7 +17,7 @@ use x11rb::rust_connection::RustConnection;
 use hypermesh_session::{self, KeyringStore};
 
 use crate::auth::{Pose, Snapshot};
-use crate::automation::{self, CursorPose, Effect, Machine, Motion, Phase, VisorPhase};
+use crate::automation::{self, BugClick, CursorPose, Effect, Machine, Motion, Phase, VisorPhase};
 use crate::credentials;
 use crate::draw::{self, Action, Scene, Sprites};
 use crate::mascot::{self, Mascot, Reel};
@@ -256,19 +256,27 @@ fn show(mut app: App) -> Result<(), String> {
             app.poller.report_keyboard_unavailable();
             app.keyboard_reported_instance = Some(snap.instance);
         }
-        // Queued physical input is judged against the phase already on screen.
-        // The new snapshot is applied after that, so an `off` poll cannot
-        // swallow a key or click that arrived while the gate was running.
+        // Captured before this frame drains input. The click that moves
+        // running to paused must not open Continue.
+        let was_paused = app.machine.phase() == Phase::Paused;
+        // Queued physical input is judged against the phase already on screen,
+        // and again against the snapshot applied below. An `off` poll cannot
+        // swallow a key or click that arrived while the gate was running, and
+        // an off-to-running transition in this frame still pauses.
         let mut events = Vec::new();
         while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
             events.push(event);
         }
         let mut saw_pause = false;
+        let mut paused_on_shown = false;
+        let mut saw_live = false;
         for event in &events {
             if let Some(live) = watch.observe(event) {
+                saw_live = true;
                 let effect = app.machine.user_input(now_ms);
                 if effect == Effect::Pause {
                     saw_pause = true;
+                    paused_on_shown = true;
                 }
                 note_user_input(&mut app, effect);
                 app.last_used = Instant::now();
@@ -311,15 +319,31 @@ fn show(mut app: App) -> Result<(), String> {
             app.resume_seq_prior = prior;
             app.seen_resume_seq = snap.resume_seq;
         }
+        let shown = if paused_on_shown {
+            Effect::Pause
+        } else {
+            Effect::None
+        };
+        let incoming =
+            automation::classify_incoming_input(&mut app.machine, saw_live, shown, now_ms);
+        if incoming == Effect::Pause {
+            saw_pause = true;
+        }
+        if saw_live && !paused_on_shown {
+            note_user_input(&mut app, incoming);
+        }
         if app.machine.phase() == Phase::Off && !saw_pause {
             app.pending = None;
             app.fallback_after_resume = None;
         }
-        let was_paused = app.machine.phase() == Phase::Paused;
+        let synthetic_cores = watch.synthetic_core_presses(&events);
+        let mut core_at = 0usize;
         let mut click: Option<(i32, i32)> = None;
         for event in events {
             if let Event::ButtonPress(press) = event {
-                if press.event != window {
+                let synthetic = synthetic_cores.get(core_at).copied().unwrap_or(false);
+                core_at += 1;
+                if synthetic || press.event != window {
                     continue;
                 }
                 match press.detail {
@@ -641,18 +665,15 @@ fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_
         return;
     };
     match hit.action {
-        Action::ToggleMenu => {
-            if was_paused {
-                app.machine.ask(now_ms);
-            } else if app.machine.phase() == Phase::Running {
+        Action::ToggleMenu => match automation::bug_click(was_paused, app.machine.phase()) {
+            BugClick::Ask => app.machine.ask(now_ms),
+            BugClick::Pause => {
                 let effect = app.machine.user_input(now_ms);
                 note_user_input(app, effect);
-            } else if app.machine.phase() == Phase::Paused {
-                // This click is the one that paused the automation.
-            } else {
-                app.menu = !app.menu;
             }
-        }
+            BugClick::Ignore => {}
+            BugClick::ToggleMenu => app.menu = !app.menu,
+        },
         Action::ContinueAutomation => {
             let effect = app.machine.continue_now(now_ms);
             note_effect(app, effect);
