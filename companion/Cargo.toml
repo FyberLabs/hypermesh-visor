@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 hypermesh-session = { path = "../session" }
+libc = "0.2"
 png = "0.17"
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-x11rb = "0.13"
+toml = "0.8"
+x11rb = { version = "0.13", features = ["render", "xinput"] }

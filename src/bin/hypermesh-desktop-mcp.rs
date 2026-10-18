@@ -8,8 +8,8 @@ use std::io::{self, BufRead, Write};
 use serde_json::{json, Value};
 
 fn main() {
-    let visor = std::env::var("HYPERMESH_VISOR_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:9847".into());
+    let visor =
+        std::env::var("HYPERMESH_VISOR_URL").unwrap_or_else(|_| "http://127.0.0.1:9847".into());
     let session = std::env::var("HYPERMESH_SESSION_ID").unwrap_or_default();
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -121,10 +121,7 @@ fn call_visor(base: &str, session: &str, tool: &str, args: &Value) -> Result<Str
             let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
             let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
             let url = format!("{base}/session/{session}/mouse");
-            post_json(
-                &url,
-                &json!({"action": "move", "x": x, "y": y}),
-            )?;
+            post_json(&url, &json!({"action": "move", "x": x, "y": y}))?;
             Ok("moved".into())
         }
         "mouse_click" => {
@@ -148,6 +145,33 @@ fn call_visor(base: &str, session: &str, tool: &str, args: &Value) -> Result<Str
             Ok("typed".into())
         }
         other => Err(format!("unknown tool {other}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_tools_cannot_control_the_companion() {
+        let err = call_visor(
+            "http://127.0.0.1:9",
+            "00000000-0000-0000-0000-000000000001",
+            "read_file",
+            &json!({"path": "/run/user/1/hypermesh/companion.sock"}),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown tool"));
+        let err = call_visor(
+            "http://127.0.0.1:9",
+            "00000000-0000-0000-0000-000000000001",
+            "resume",
+            &json!({}),
+        )
+        .unwrap_err();
+        assert!(err.contains("unknown tool"));
+        let err = call_visor("http://127.0.0.1:9", "  ", "view", &json!({})).unwrap_err();
+        assert!(err.contains("HYPERMESH_SESSION_ID"));
     }
 }
 

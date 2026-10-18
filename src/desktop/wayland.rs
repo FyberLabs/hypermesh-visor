@@ -20,6 +20,8 @@ pub struct WaylandInput {
     session_handle: String,
 }
 
+/// Pointer and keyboard portal calls. Gated off until issue #17.
+#[allow(dead_code)]
 impl WaylandInput {
     pub fn start() -> Result<Self, DesktopError> {
         let conn = session_bus()?;
@@ -73,7 +75,7 @@ impl WaylandInput {
 
     pub fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError> {
         match *op {
-            MouseOp::Move { x, y } => self.move_abs(x, y),
+            MouseOp::Move { x, y, .. } => self.move_abs(x, y),
             MouseOp::Click { x, y, button } => {
                 self.move_abs(x, y)?;
                 self.button(button, true)?;
@@ -104,10 +106,12 @@ impl WaylandInput {
     fn move_abs(&self, x: i32, y: i32) -> Result<(), DesktopError> {
         let session = object_path(&self.session_handle)?;
         let options: HashMap<&str, Value> = HashMap::new();
+        let x = portal_coord(x)?;
+        let y = portal_coord(y)?;
         self.remote()?
             .call::<_, _, ()>(
                 "NotifyPointerMotionAbsolute",
-                &(session, &options, 0u32, f64::from(x), f64::from(y)),
+                &(session, &options, 0u32, x, y),
             )
             .map_err(input_err)
     }
@@ -338,6 +342,20 @@ fn object_path(path: &str) -> Result<OwnedObjectPath, DesktopError> {
         .map_err(|err| DesktopError::Input(format!("session handle: {err}")))
 }
 
+/// Wider than X11's i16 cursor, still far inside a real desktop. Values
+/// outside this are rejected before they reach the portal.
+const PORTAL_COORD_LIMIT: i32 = 1_048_576;
+
+fn portal_coord(value: i32) -> Result<f64, DesktopError> {
+    if (-PORTAL_COORD_LIMIT..=PORTAL_COORD_LIMIT).contains(&value) {
+        Ok(f64::from(value))
+    } else {
+        Err(DesktopError::Input(
+            "pointer coordinate is out of range".into(),
+        ))
+    }
+}
+
 fn evdev_button(button: Button) -> i32 {
     match button {
         Button::Left => 0x110,
@@ -372,6 +390,14 @@ mod tests {
         let bytes = read_local_uri(&uri).unwrap();
         assert_eq!(bytes, b"\x89PNG-test");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn portal_rejects_coordinates_outside_the_desktop() {
+        assert!(portal_coord(10).is_ok());
+        assert!(portal_coord(-PORTAL_COORD_LIMIT).is_ok());
+        assert!(portal_coord(i32::MAX).is_err());
+        assert!(portal_coord(i32::MIN).is_err());
     }
 
     #[test]

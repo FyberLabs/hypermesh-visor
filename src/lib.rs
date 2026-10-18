@@ -5,18 +5,21 @@
 compile_error!("hypermesh-visor version one is Linux only");
 
 mod api;
+mod automation;
 mod bind;
+mod companion_sock;
 mod desktop;
 mod harness;
 mod input;
 mod mcp;
-mod prompt;
 mod orchestrator;
+mod prompt;
 mod session;
 mod stream;
 mod vault;
 
 pub use api::{serve, AppState};
+pub use automation::SHUTDOWN_DEADLINE;
 pub use bind::parse_listen;
 pub use desktop::{current_euid, Desktop, FixtureDesktop, LinuxDesktop};
 pub use hypermesh_session::{refresh_token, MemoryStore, SessionStore};

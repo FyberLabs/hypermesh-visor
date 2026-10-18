@@ -1,9 +1,9 @@
 //! Always-on-top X11 window (XWayland on Wayland). The pixels are `draw::render`.
+//! Leaving the loop, including a panic unwind, puts the system cursor back.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -16,19 +16,65 @@ use x11rb::rust_connection::RustConnection;
 
 use hypermesh_session::{self, KeyringStore};
 
-use crate::auth::{self, Pose};
+use crate::auth::{Pose, Snapshot};
+use crate::automation::{self, CursorPose, Effect, Machine, Motion, Phase, VisorPhase};
 use crate::credentials;
 use crate::draw::{self, Action, Scene, Sprites};
+use crate::mascot::{self, Mascot, Reel};
 use crate::pages;
+use crate::pointer::{self, BugCursor, LiveInput, Watch};
 use crate::settings;
+use crate::visor::Poller;
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_stop(_: i32) {
+    STOP.store(true, Ordering::SeqCst);
+}
 
 struct App {
     sprites: Sprites,
     pose: Pose,
     menu: bool,
     eyes_follow: bool,
+    bug_cursor: bool,
+    sleep_after_ms: u64,
     status: Arc<Mutex<String>>,
     login_busy: Arc<Mutex<bool>>,
+    machine: Machine,
+    reel: Reel,
+    poller: Poller,
+    last_used: Instant,
+    started: Instant,
+    pending: Option<&'static str>,
+    pointer_sample: Option<(i32, i32, u64)>,
+    click_at: Option<u64>,
+    key_at: Option<u64>,
+    /// Resume sequence on the last connected snapshot.
+    seen_resume_seq: u64,
+    /// Resume sequence on the snapshot before that.
+    resume_seq_prior: u64,
+    /// Drives at or below this resume sequence were recorded before the last
+    /// resume. `None` until a resume happens.
+    fallback_after_resume: Option<u64>,
+    /// Pointer fallback: baseline, button mask, and the in-flight injection.
+    fallback: automation::FallbackTrack,
+    /// When the companion first showed the current drive sample.
+    sample_age: automation::SampleAge,
+    /// Menu and continue-prompt scroll, in pixels.
+    scroll: i32,
+    /// The Wayland automation note has already been logged.
+    wayland_note_logged: bool,
+    /// The missing-keyboard note has already been logged.
+    keyboard_note_logged: bool,
+    /// Visor instance the missing-keyboard report was posted for.
+    keyboard_reported_instance: Option<u64>,
+    /// Config directory captured at startup. The frame loop does not look it up again.
+    config: std::path::PathBuf,
+    /// `companion-notice`, stat'ed at most once a second.
+    notice: settings::NoticeCache,
+    /// Last root pointer sample used by the fallback, including its button mask.
+    fallback_sample: Option<(i32, i32, u32)>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -36,14 +82,38 @@ pub fn run() -> Result<(), String> {
         eprintln!("hypermesh-companion: DISPLAY is unset; the bug stays off");
         return Ok(());
     }
+    let config = credentials::config_dir();
     let sprites = Sprites::load();
     let app = App {
         sprites,
         pose: Pose::Idle,
         menu: false,
-        eyes_follow: settings::eyes_follow_pointer(&credentials::config_dir()),
+        eyes_follow: settings::eyes_follow_pointer(&config),
+        bug_cursor: settings::bug_cursor(&config),
+        sleep_after_ms: settings::sleep_after_secs(&config).saturating_mul(1000),
         status: Arc::new(Mutex::new(String::new())),
         login_busy: Arc::new(Mutex::new(false)),
+        machine: Machine::new(settings::automation_resume_secs(&config).saturating_mul(1000)),
+        reel: Reel::new(Mascot::Disconnected),
+        poller: Poller::new(),
+        last_used: Instant::now(),
+        started: Instant::now(),
+        pending: None,
+        pointer_sample: None,
+        click_at: None,
+        key_at: None,
+        seen_resume_seq: 0,
+        resume_seq_prior: 0,
+        fallback_after_resume: None,
+        fallback: automation::FallbackTrack::default(),
+        sample_age: automation::SampleAge::default(),
+        scroll: 0,
+        wayland_note_logged: false,
+        keyboard_note_logged: false,
+        keyboard_reported_instance: None,
+        config,
+        notice: settings::NoticeCache::default(),
+        fallback_sample: None,
     };
     show(app)
 }
@@ -61,11 +131,19 @@ fn show(mut app: App) -> Result<(), String> {
     let mut scene = draw::render(
         &app.sprites,
         &app.pose,
-        6,
+        Mascot::Disconnected,
+        0,
         app.menu,
+        false,
         Some(status.as_str()),
         app.eyes_follow,
+        app.bug_cursor,
         None,
+        None,
+        u32::from(screen.height_in_pixels)
+            .saturating_sub(draw::VIEW_MARGIN)
+            .max(1),
+        0,
     );
     let (x, y) = place(
         screen.width_in_pixels,
@@ -114,14 +192,214 @@ fn show(mut app: App) -> Result<(), String> {
     conn.map_window(window).map_err(|err| err.to_string())?;
     raise_above(&conn, screen_num, window)?;
     conn.flush().map_err(|err| err.to_string())?;
+    arm_signals();
     let lsb = conn.setup().image_byte_order == ImageOrder::LSB_FIRST;
-    let mut tick = 6u32;
     let mut size = (scene.width, scene.height);
+    let mut watch = Watch::attach(&conn, root);
+    let art = pointer::Art::load();
+    let mut guard = CursorGuard {
+        conn: &conn,
+        cursor: BugCursor::new(root, window, depth, visual_id, colormap, red, green, blue),
+    };
+    let mut last_frame = Instant::now();
     loop {
-        if tick % 4 == 0 {
-            app.pose = poll_pose();
+        if STOP.load(Ordering::SeqCst) {
+            break;
         }
-        let status = app.status.lock().unwrap().clone();
+        let now_ms = app.started.elapsed().as_millis() as u64;
+        let dt = last_frame.elapsed().as_millis() as u64;
+        last_frame = Instant::now();
+        let (snap, epoch) = app.poller.snapshot();
+        let restarted = if snap.connected {
+            app.machine.note_instance(snap.instance, snap.resume_seq)
+        } else {
+            false
+        };
+        if restarted {
+            app.seen_resume_seq = 0;
+            app.resume_seq_prior = 0;
+            app.fallback_after_resume = None;
+            app.fallback = automation::FallbackTrack::default();
+            app.sample_age = automation::SampleAge::default();
+            if app.machine.phase() == Phase::Paused {
+                app.pending = Some("pause");
+            }
+        }
+        let sample_age_ms = snap.drive.as_ref().map_or(0, |drive| {
+            app.sample_age
+                .observe(snap.instance, drive.inject_seq, drive.at_ms, now_ms)
+        });
+        let wayland = matches!(snap.backend, crate::auth::InjectionBackend::Wayland);
+        if snap.connected && wayland && !app.wayland_note_logged {
+            eprintln!(
+                "hypermesh-companion: {}",
+                automation::WAYLAND_AUTOMATION_NOTE
+            );
+            app.wayland_note_logged = true;
+        }
+        let keyboard_ready = wayland || watch.accepts_raw_keyboard();
+        app.poller.set_keyboard_available(keyboard_ready);
+        if snap.connected
+            && automation::keyboard_report_due(
+                app.keyboard_reported_instance,
+                snap.instance,
+                keyboard_ready,
+            )
+        {
+            if !app.keyboard_note_logged {
+                eprintln!(
+                    "hypermesh-companion: {}",
+                    automation::KEYBOARD_INTERRUPT_NOTE
+                );
+                app.keyboard_note_logged = true;
+            }
+            app.poller.report_keyboard_unavailable();
+            app.keyboard_reported_instance = Some(snap.instance);
+        }
+        // Queued physical input is judged against the phase already on screen.
+        // The new snapshot is applied after that, so an `off` poll cannot
+        // swallow a key or click that arrived while the gate was running.
+        let mut events = Vec::new();
+        while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
+            events.push(event);
+        }
+        let mut saw_pause = false;
+        for event in &events {
+            if let Some(live) = watch.observe(event) {
+                let effect = app.machine.user_input(now_ms);
+                if effect == Effect::Pause {
+                    saw_pause = true;
+                }
+                note_user_input(&mut app, effect);
+                app.last_used = Instant::now();
+                match live {
+                    LiveInput::Button => app.click_at = Some(now_ms),
+                    LiveInput::Key => app.key_at = Some(now_ms),
+                    LiveInput::Motion => {}
+                }
+            }
+        }
+        let visor_phase = if snap.connected {
+            automation::displayed_visor_phase(wayland, snap.phase)
+        } else {
+            VisorPhase::Off
+        };
+        let phase_before = app.machine.phase();
+        if snap.connected {
+            // see_visor(off) would drop a local pause. On a new process the
+            // pause is posted again instead, and pause_mark is already this
+            // snapshot's resume sequence.
+            let keep_pause = restarted && phase_before == Phase::Paused;
+            if !keep_pause {
+                app.machine.see_visor(visor_phase, now_ms, snap.resume_seq);
+            }
+        } else {
+            app.machine.note_disconnect();
+            if app.pending.as_deref() == Some("resume") {
+                app.pending = None;
+            }
+            app.poller.cancel_resume();
+        }
+        if snap.connected {
+            let prior = app.seen_resume_seq;
+            if phase_before == Phase::Paused && app.machine.phase() == Phase::Running {
+                // This snapshot already carries the post-resume sequence. A
+                // drive recorded between the resume and this poll carries it
+                // too, so the cutoff stays on the sequence from before.
+                app.fallback_after_resume = Some(prior);
+            }
+            app.resume_seq_prior = prior;
+            app.seen_resume_seq = snap.resume_seq;
+        }
+        if app.machine.phase() == Phase::Off && !saw_pause {
+            app.pending = None;
+            app.fallback_after_resume = None;
+        }
+        let was_paused = app.machine.phase() == Phase::Paused;
+        let mut click: Option<(i32, i32)> = None;
+        for event in events {
+            if let Event::ButtonPress(press) = event {
+                if press.event != window {
+                    continue;
+                }
+                match press.detail {
+                    4 | 5 if app.menu || app.machine.asking() => {
+                        let step = draw::MENU_SCROLL_STEP;
+                        if press.detail == 4 {
+                            app.scroll = app.scroll.saturating_sub(step);
+                        } else {
+                            app.scroll = app.scroll.saturating_add(step);
+                        }
+                        app.scroll = draw::clamp_scroll(app.scroll, scene.scroll_max);
+                    }
+                    1 => click = Some((i32::from(press.event_x), i32::from(press.event_y))),
+                    _ => {}
+                }
+            }
+        }
+        if !watch.accepts_raw_pointer() {
+            if let Some((x, y, mask)) = pointer::root_pointer_state(&conn, root) {
+                app.fallback_sample = Some((x, y, mask));
+                let drive = snap.drive.as_ref().map(|drive| automation::FallbackDrive {
+                    x: drive.x,
+                    y: drive.y,
+                    at_ms: drive.at_ms,
+                    pointer_known: drive.pointer_known,
+                    resume_seq: drive.resume_seq,
+                    inject_seq: drive.inject_seq,
+                });
+                let input = automation::FallbackInput {
+                    phase: app.machine.phase(),
+                    x,
+                    y,
+                    mask,
+                    now_ms,
+                    sample_age_ms,
+                    epoch,
+                    injecting: snap.injecting,
+                    inject_seq: snap.inject_seq,
+                    last_settled_seq: snap.last_settled_seq,
+                    drive,
+                    after_resume: app.fallback_after_resume,
+                    instance: snap.instance,
+                };
+                if automation::classify_fallback(&input, &mut app.fallback) {
+                    if app.machine.phase() == Phase::Off {
+                        app.last_used = Instant::now();
+                    } else {
+                        let effect = app.machine.user_input(now_ms);
+                        note_user_input(&mut app, effect);
+                        app.last_used = Instant::now();
+                    }
+                }
+            }
+        } else {
+            app.fallback = automation::FallbackTrack::default();
+            app.fallback_sample = None;
+        }
+        if let Some((x, y)) = click {
+            app.last_used = Instant::now();
+            on_click(&mut app, &scene, x, y, was_paused, now_ms);
+        }
+        let effect = app.machine.poll(now_ms);
+        note_effect(&mut app, effect);
+        if let Some(action) = app.pending.take() {
+            app.poller.enqueue(action);
+        }
+        if !app.menu && !app.machine.asking() {
+            app.scroll = 0;
+        }
+        // The frame loop does not read settings or spawn processes. Menu
+        // toggles, login, and xdg-open run only from a click. The poller
+        // snapshot is already in memory. This stat of companion-notice is
+        // skipped until a second has passed, and the file is read only when
+        // its mtime changes.
+        let upgrading_file = app.notice.current(&app.config, Instant::now());
+        let mascot = mascot_now(&app, &snap, upgrading_file);
+        app.reel.set_state(mascot);
+        let (frame_ms, count, looped) = app.sprites.timing(mascot);
+        app.reel.advance(dt, frame_ms, count, looped);
+        let status = display_status(&app);
         let pointer = if app.eyes_follow && matches!(app.pose, Pose::Active { .. }) {
             pointer_in_window(&conn, window)
         } else {
@@ -130,12 +408,27 @@ fn show(mut app: App) -> Result<(), String> {
         scene = draw::render(
             &app.sprites,
             &app.pose,
-            tick,
-            app.menu,
+            mascot,
+            app.reel.frame(),
+            app.menu && !app.machine.asking(),
+            app.machine.asking(),
             Some(status.as_str()),
             app.eyes_follow,
+            app.bug_cursor,
+            if wayland && app.menu {
+                Some(automation::WAYLAND_AUTOMATION_NOTE)
+            } else if !wayland && !watch.accepts_raw_keyboard() && app.menu {
+                Some(automation::KEYBOARD_INTERRUPT_NOTE)
+            } else {
+                None
+            },
             pointer,
+            u32::from(screen.height_in_pixels)
+                .saturating_sub(draw::VIEW_MARGIN)
+                .max(1),
+            app.scroll,
         );
+        app.scroll = draw::clamp_scroll(app.scroll, scene.scroll_max);
         if (scene.width, scene.height) != size {
             let (x, y) = place(
                 screen.width_in_pixels,
@@ -155,25 +448,227 @@ fn show(mut app: App) -> Result<(), String> {
             size = (scene.width, scene.height);
         }
         put_scene(&conn, window, gc, &scene, depth, lsb, red, green, blue)?;
+        sync_cursor(
+            &mut app,
+            &mut guard,
+            &art,
+            &snap,
+            &conn,
+            root,
+            now_ms,
+            sample_age_ms,
+        )?;
         conn.flush().map_err(|err| err.to_string())?;
-        while let Some(event) = conn.poll_for_event().map_err(|err| err.to_string())? {
-            if let Event::ButtonPress(press) = event {
-                if press.detail == 1 {
-                    on_click(&mut app, &scene, press.event_x as i32, press.event_y as i32);
-                }
-            }
-        }
-        tick = tick.wrapping_add(1);
         std::thread::sleep(Duration::from_millis(80));
+    }
+    Ok(())
+}
+
+struct CursorGuard<'a> {
+    conn: &'a RustConnection,
+    cursor: BugCursor,
+}
+
+impl Drop for CursorGuard<'_> {
+    fn drop(&mut self) {
+        self.cursor.restore(self.conn);
     }
 }
 
-fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32) {
+fn arm_signals() {
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_stop as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        libc::sigaction(libc::SIGINT, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGTERM, &action, std::ptr::null_mut());
+        libc::sigaction(libc::SIGHUP, &action, std::ptr::null_mut());
+    }
+}
+
+fn note_user_input(app: &mut App, effect: Effect) {
+    app.poller.cancel_resume();
+    if app.pending.as_deref() == Some("resume") {
+        app.pending = None;
+    }
+    note_effect(app, effect);
+}
+
+fn note_effect(app: &mut App, effect: Effect) {
+    match effect {
+        Effect::Pause => app.pending = Some("pause"),
+        Effect::Resume => {
+            app.pending = Some("resume");
+            // The snapshot can still carry the pre-pause drive until the next
+            // poll. Ignore that sequence. If this frame's snapshot is already
+            // the post-resume one, `resume_seq_prior` is the sequence before
+            // it, and the minimum keeps a drive recorded after the resume.
+            app.fallback_after_resume = Some(automation::resume_cutoff(
+                app.resume_seq_prior,
+                app.seen_resume_seq,
+            ));
+        }
+        Effect::None => {}
+    }
+}
+
+fn mascot_now(app: &App, snap: &Snapshot, upgrading_file: bool) -> Mascot {
+    let session_idle = if snap.connected { snap.idle_ms } else { None };
+    let unused = mascot::unused_for_ms(app.last_used.elapsed().as_millis() as u64, session_idle);
+    mascot::choose(&mascot::Signals {
+        connected: snap.connected,
+        upgrading: snap.upgrading || upgrading_file,
+        automation_running: app.machine.phase() == Phase::Running,
+        unused_for_ms: unused,
+        sleep_after_ms: app.sleep_after_ms,
+    })
+}
+
+fn display_status(app: &App) -> String {
+    if app.machine.phase() == Phase::Paused {
+        return "Paused. Click the bug to continue.".into();
+    }
+    app.status.lock().unwrap().clone()
+}
+
+fn sync_cursor(
+    app: &mut App,
+    guard: &mut CursorGuard<'_>,
+    art: &pointer::Art,
+    snap: &Snapshot,
+    conn: &RustConnection,
+    root: u32,
+    now_ms: u64,
+    sample_age_ms: u64,
+) -> Result<(), String> {
+    app.pose = if snap.connected {
+        snap.pose.clone()
+    } else {
+        Pose::Idle
+    };
+    let opt_in = app.bug_cursor && snap.connected;
+    let motion = if app.machine.phase() == Phase::Running {
+        snap.drive.as_ref().map(|drive| Motion {
+            kind: drive.kind,
+            age_ms: sample_age_ms,
+            distance_px: drive.distance_px,
+            elapsed_ms: drive.elapsed_ms,
+            clickable: drive.clickable,
+        })
+    } else if opt_in {
+        local_motion(app, conn, root, now_ms)
+    } else {
+        None
+    };
+    let pose = automation::cursor_pose(app.machine.phase(), opt_in, motion);
+    if pose == CursorPose::System || !snap.connected {
+        guard.cursor.restore(conn);
+        return Ok(());
+    }
+    let age = motion.map(|item| item.age_ms).unwrap_or(now_ms);
+    let frame = automation::cursor_frame(pose, age);
+    if guard.cursor.shown() == Some((pose, frame)) {
+        if let Some((x, y)) = pointer::root_pointer(conn, root) {
+            guard.cursor.follow(conn, x, y);
+        }
+        return Ok(());
+    }
+    let image = art.frame(automation::cursor_frame_name(pose, frame));
+    if let Err(err) = guard.cursor.apply(conn, image, pose, frame) {
+        eprintln!("hypermesh-companion: cursor: {err}");
+        guard.cursor.restore(conn);
+    } else if let Some((x, y)) = pointer::root_pointer(conn, root) {
+        guard.cursor.follow(conn, x, y);
+    }
+    Ok(())
+}
+
+fn local_motion(app: &mut App, conn: &RustConnection, root: u32, now_ms: u64) -> Option<Motion> {
+    if let Some(at) = app.click_at {
+        if now_ms.saturating_sub(at) < automation::CLICK_FRESH_MS {
+            return Some(Motion {
+                kind: automation::MotionKind::Click,
+                age_ms: now_ms.saturating_sub(at),
+                distance_px: 0,
+                elapsed_ms: 0,
+                clickable: false,
+            });
+        }
+    }
+    if let Some(at) = app.key_at {
+        if now_ms.saturating_sub(at) < automation::TYPE_FRESH_MS {
+            return Some(Motion {
+                kind: automation::MotionKind::Type,
+                age_ms: now_ms.saturating_sub(at),
+                distance_px: 0,
+                elapsed_ms: 0,
+                clickable: false,
+            });
+        }
+    }
+    let Some((x, y)) = pointer::root_pointer(conn, root) else {
+        return None;
+    };
+    let moved = if let Some((px, py, at)) = app.pointer_sample {
+        let dx = (x - px).unsigned_abs();
+        let dy = (y - py).unsigned_abs();
+        let distance = ((u64::from(dx) * u64::from(dx) + u64::from(dy) * u64::from(dy)) as f64)
+            .sqrt()
+            .round() as u32;
+        let elapsed = now_ms.saturating_sub(at).min(u32::MAX as u64) as u32;
+        app.pointer_sample = Some((x, y, now_ms));
+        if distance >= 4 {
+            Some(Motion {
+                kind: automation::MotionKind::Move,
+                age_ms: 0,
+                distance_px: distance,
+                elapsed_ms: elapsed.max(1),
+                clickable: false,
+            })
+        } else {
+            None
+        }
+    } else {
+        app.pointer_sample = Some((x, y, now_ms));
+        None
+    };
+    moved
+}
+
+fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_ms: u64) {
     let Some(hit) = scene.hits.iter().find(|hit| hit.contains(x, y)) else {
         return;
     };
     match hit.action {
-        Action::ToggleMenu => app.menu = !app.menu,
+        Action::ToggleMenu => {
+            if was_paused {
+                app.machine.ask(now_ms);
+            } else if app.machine.phase() == Phase::Running {
+                let effect = app.machine.user_input(now_ms);
+                note_user_input(app, effect);
+            } else if app.machine.phase() == Phase::Paused {
+                // This click is the one that paused the automation.
+            } else {
+                app.menu = !app.menu;
+            }
+        }
+        Action::ContinueAutomation => {
+            let effect = app.machine.continue_now(now_ms);
+            note_effect(app, effect);
+            if effect == Effect::Resume {
+                if let Some((x, y, mask)) = app.fallback_sample {
+                    app.fallback.rebaseline(x, y, mask);
+                }
+            }
+        }
+        Action::DismissAutomation => app.machine.dismiss(now_ms),
+        Action::ToggleBugCursor => {
+            app.bug_cursor = !app.bug_cursor;
+            if let Err(err) = settings::set_bug_cursor(&credentials::config_dir(), app.bug_cursor) {
+                *app.status.lock().unwrap() = err;
+            }
+        }
         Action::OpenCli => {
             app.menu = false;
             if let Err(err) = open_cli() {
@@ -308,10 +803,7 @@ fn open_hypermesh_args(extra: &[&str]) -> std::io::Result<()> {
             "alacritty",
             vec!["-e".into(), "sh".into(), "-c".into(), joined.clone()],
         ),
-        (
-            "xterm",
-            vec!["-e".into(), "sh".into(), "-c".into(), joined],
-        ),
+        ("xterm", vec!["-e".into(), "sh".into(), "-c".into(), joined]),
     ];
     for (bin, args) in terminals {
         if std::process::Command::new(bin).args(args).spawn().is_ok() {
@@ -336,39 +828,6 @@ fn shell_join(parts: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn poll_pose() -> Pose {
-    let request = auth::visor_request("127.0.0.1:9847");
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &"127.0.0.1:9847".parse().unwrap(),
-        Duration::from_millis(150),
-    ) else {
-        return Pose::Idle;
-    };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(200)));
-    if stream.write_all(request.as_bytes()).is_err() {
-        return Pose::Idle;
-    }
-    let mut buf = Vec::new();
-    let mut tmp = [0u8; 1024];
-    loop {
-        match stream.read(&mut tmp) {
-            Ok(0) => break,
-            Ok(n) => {
-                buf.extend_from_slice(&tmp[..n]);
-                if buf.len() > 64 * 1024 {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let Some((_, body)) = text.split_once("\r\n\r\n") else {
-        return Pose::Idle;
-    };
-    auth::pose_from_companion(body)
 }
 
 fn place(screen_w: u16, screen_h: u16, width: u32, height: u32) -> (i16, i16) {

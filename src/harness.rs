@@ -30,12 +30,21 @@ pub struct Skill {
     pub instructions: String,
 }
 
+/// Names and purpose. Long enough for a sentence, short enough that
+/// `GET /companion` stays far under the companion's read cap.
+pub const SESSION_TEXT_MAX: usize = 512;
+/// Instructions and recipe steps.
+pub const SESSION_BODY_MAX: usize = 2_048;
+/// Recipes, skills, and steps in one recipe.
+pub const SESSION_LIST_MAX: usize = 16;
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum HarnessError {
     PurposeRequired,
     AgentNameRequired,
     RecipeNameRequired,
     SkillNameRequired,
+    TooLong(&'static str),
 }
 
 impl std::fmt::Display for HarnessError {
@@ -45,6 +54,7 @@ impl std::fmt::Display for HarnessError {
             Self::AgentNameRequired => write!(f, "agent name is required"),
             Self::RecipeNameRequired => write!(f, "recipe name is required"),
             Self::SkillNameRequired => write!(f, "skill name is required"),
+            Self::TooLong(what) => write!(f, "{what} is too long"),
         }
     }
 }
@@ -69,6 +79,40 @@ impl Harness {
         if self.skills.iter().any(|skill| skill.name.trim().is_empty()) {
             return Err(HarnessError::SkillNameRequired);
         }
+        limited(&self.purpose, SESSION_TEXT_MAX, "purpose")?;
+        limited(&self.agent.name, SESSION_TEXT_MAX, "agent name")?;
+        limited(
+            &self.agent.instructions,
+            SESSION_BODY_MAX,
+            "agent instructions",
+        )?;
+        if self.recipes.len() > SESSION_LIST_MAX {
+            return Err(HarnessError::TooLong("recipes"));
+        }
+        if self.skills.len() > SESSION_LIST_MAX {
+            return Err(HarnessError::TooLong("skills"));
+        }
+        for recipe in &self.recipes {
+            limited(&recipe.name, SESSION_TEXT_MAX, "recipe name")?;
+            if recipe.steps.len() > SESSION_LIST_MAX {
+                return Err(HarnessError::TooLong("recipe steps"));
+            }
+            for step in &recipe.steps {
+                limited(step, SESSION_BODY_MAX, "recipe step")?;
+            }
+        }
+        for skill in &self.skills {
+            limited(&skill.name, SESSION_TEXT_MAX, "skill name")?;
+            limited(&skill.instructions, SESSION_BODY_MAX, "skill instructions")?;
+        }
+        Ok(())
+    }
+}
+
+fn limited(value: &str, max: usize, field: &'static str) -> Result<(), HarnessError> {
+    if value.chars().count() > max {
+        Err(HarnessError::TooLong(field))
+    } else {
         Ok(())
     }
 }
@@ -108,5 +152,16 @@ mod tests {
         blank = harness();
         blank.agent.name.clear();
         assert_eq!(blank.validate(), Err(HarnessError::AgentNameRequired));
+        let mut huge = harness();
+        huge.purpose = "p".repeat(SESSION_TEXT_MAX + 1);
+        assert_eq!(huge.validate(), Err(HarnessError::TooLong("purpose")));
+        huge = harness();
+        huge.recipes = (0..SESSION_LIST_MAX + 1)
+            .map(|index| Recipe {
+                name: format!("r{index}"),
+                steps: Vec::new(),
+            })
+            .collect();
+        assert_eq!(huge.validate(), Err(HarnessError::TooLong("recipes")));
     }
 }

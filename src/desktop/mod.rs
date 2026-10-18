@@ -9,7 +9,12 @@ pub use fixture::FixtureDesktop;
 
 use std::sync::Mutex;
 
-use crate::input::{MouseOp, Stroke};
+use crate::input::{MouseOp, PointerStep, Stroke};
+
+/// Shown when start, resume, mouse, or type would inject on the portal backend.
+/// The RemoteDesktop calls stay in `wayland` for issue #17 and are not used.
+pub const WAYLAND_AUTOMATION: &str =
+    "Automation is disabled on Wayland until the portal backend lands (#17)";
 
 pub const AUDIO_FORMAT: &str = "s16le;rate=48000;channels=1";
 pub const AUDIO_RATE: u32 = 48_000;
@@ -61,10 +66,56 @@ pub trait Desktop: Send + Sync {
     fn open_audio(&self) -> Result<Box<dyn AudioRead>, DesktopError>;
     fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError>;
     fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError>;
+    /// One batch of pointer events. A stepped drag sends these through
+    /// [`Desktop::open_pointer`] so the whole drag shares one connection.
+    fn pointer_steps(&self, steps: &[PointerStep]) -> Result<(), DesktopError>;
+    /// One connection for a stepped drag. Batches go through [`PointerPipe::send`].
+    fn open_pointer(&self) -> Result<Box<dyn PointerPipe + '_>, DesktopError>;
+    /// One connection and keymap for every chunk of a type request.
+    fn open_keyboard(&self) -> Result<Box<dyn KeyboardPipe + '_>, DesktopError>;
+
+    /// Root window size in pixels, when the backend can read it. Coordinates
+    /// outside this rectangle are refused before injection. Default: unknown.
+    fn root_size(&self) -> Result<Option<(u16, u16)>, DesktopError> {
+        Ok(None)
+    }
+
+    /// Current pointer, when the backend can read it. Used to tell a long
+    /// automation move from a short one. Default: unknown.
+    fn pointer_position(&self) -> Result<Option<(i32, i32)>, DesktopError> {
+        Ok(None)
+    }
 
     /// Focused window identity for MCP prefer detection. Default: unknown.
     fn focused_app(&self) -> Result<Option<crate::mcp::FocusedApp>, DesktopError> {
         Ok(None)
+    }
+
+    /// `x11`, `wayland`, or `fixture`. The companion uses this to tell whether
+    /// injected input is visible as an XTEST device.
+    fn backend_name(&self) -> &'static str {
+        "fixture"
+    }
+}
+
+/// Pointer events on one backend connection.
+pub trait PointerPipe: Send {
+    fn send(&mut self, steps: &[PointerStep]) -> Result<(), DesktopError>;
+}
+
+/// Key strokes on one backend connection and one keymap.
+pub trait KeyboardPipe: Send {
+    fn send(&mut self, strokes: &[Stroke]) -> Result<(), DesktopError>;
+
+    /// Keysyms this chunk will press, including implicit modifiers such as
+    /// Shift. The caller records them before [`KeyboardPipe::send`]. Releasing
+    /// a key that is not down is harmless.
+    fn presses(&self, strokes: &[Stroke]) -> Vec<u32> {
+        strokes
+            .iter()
+            .filter(|stroke| stroke.down)
+            .map(|stroke| stroke.keysym)
+            .collect()
     }
 }
 
@@ -134,6 +185,8 @@ fn present(value: &Option<String>) -> bool {
 
 pub struct LinuxDesktop {
     env: SessionEnv,
+    /// Held for issue #17. Nothing calls it while portal injection is gated off.
+    #[allow(dead_code)]
     wayland_input: Mutex<Option<wayland::WaylandInput>>,
 }
 
@@ -166,14 +219,57 @@ impl Desktop for LinuxDesktop {
     fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError> {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::mouse(self.env.display.as_deref(), op),
-            BackendKind::Wayland => self.with_wayland(|input| input.mouse(op)),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
         }
     }
 
     fn type_input(&self, strokes: &[Stroke]) -> Result<(), DesktopError> {
         match choose_backend(&self.env)? {
             BackendKind::X11 => x11::type_strokes(self.env.display.as_deref(), strokes),
-            BackendKind::Wayland => self.with_wayland(|input| input.type_strokes(strokes)),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
+        }
+    }
+
+    fn pointer_steps(&self, steps: &[crate::input::PointerStep]) -> Result<(), DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => x11::pointer_steps(self.env.display.as_deref(), steps),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
+        }
+    }
+
+    fn open_pointer(&self) -> Result<Box<dyn PointerPipe + '_>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => Ok(Box::new(x11::XPointer::open(self.env.display.as_deref())?)),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
+        }
+    }
+
+    fn open_keyboard(&self) -> Result<Box<dyn KeyboardPipe + '_>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => Ok(Box::new(x11::XKeyboard::open(self.env.display.as_deref())?)),
+            BackendKind::Wayland => Err(DesktopError::Unavailable(WAYLAND_AUTOMATION.into())),
+        }
+    }
+
+    fn root_size(&self) -> Result<Option<(u16, u16)>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => x11::root_size(self.env.display.as_deref()).map(Some),
+            BackendKind::Wayland => Ok(None),
+        }
+    }
+
+    fn pointer_position(&self) -> Result<Option<(i32, i32)>, DesktopError> {
+        match choose_backend(&self.env)? {
+            BackendKind::X11 => x11::pointer(self.env.display.as_deref()).map(Some),
+            BackendKind::Wayland => Ok(None),
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match choose_backend(&self.env) {
+            Ok(BackendKind::Wayland) => "wayland",
+            Ok(BackendKind::X11) => "x11",
+            Err(_) => "unknown",
         }
     }
 
@@ -196,6 +292,8 @@ impl Desktop for LinuxDesktop {
 }
 
 impl LinuxDesktop {
+    /// Opens a RemoteDesktop session. Issue #17 is what calls this again.
+    #[allow(dead_code)]
     fn with_wayland<T>(
         &self,
         op: impl FnOnce(&wayland::WaylandInput) -> Result<T, DesktopError>,
@@ -267,5 +365,21 @@ mod tests {
                 .to_string(),
             "x11 session has no DISPLAY"
         );
+    }
+
+    #[test]
+    fn wayland_injection_does_not_open_the_portal() {
+        let desktop = LinuxDesktop::new(env(Some("wayland"), Some(":0"), Some("wayland-0"), 1000));
+        assert_eq!(desktop.backend_name(), "wayland");
+        let mouse = desktop
+            .mouse(&crate::input::MouseOp::Move {
+                x: 1,
+                y: 2,
+                clickable: false,
+            })
+            .unwrap_err();
+        assert_eq!(mouse.to_string(), WAYLAND_AUTOMATION);
+        let typed = desktop.type_input(&[]).unwrap_err();
+        assert_eq!(typed.to_string(), WAYLAND_AUTOMATION);
     }
 }

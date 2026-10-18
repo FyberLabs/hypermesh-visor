@@ -1,6 +1,6 @@
 # Companion cursor sprites
 
-Optional art for a cursor mode: the desktop beetle drawn as the mouse pointer. The companion binary leaves this directory unused. The on-screen bug still uses `../bug-idle.png` and `../bug-active.png`.
+Top-down art for the beetle pointer. The companion installs these frames as the X11 cursor while an automation runs, and outside an automation only when `bug_cursor` is on in `companion.toml`. The click point is `hotspot.json`.
 
 During an automation this cursor is paired with the automation visor on the companion. That pairing is [Automation mode](../../../README.md#automation-mode). Away from an automation, this cursor stays optional.
 

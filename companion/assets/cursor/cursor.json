@@ -1,6 +1,6 @@
 {
   "name": "companion-cursor",
-  "description": "Optional beetle cursor sprites. Art only; the hypermesh-companion binary leaves this directory unused.",
+  "description": "Beetle cursor sprites. The companion uses the 32 px frames as the X11 pointer during an automation, and outside an automation when bug_cursor is on.",
   "license": "MIT",
   "orientation": "top-down, head toward the up-left, like a standard arrow cursor",
   "sizes": [32, 64, 128],

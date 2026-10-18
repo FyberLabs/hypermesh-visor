@@ -5,8 +5,8 @@ use std::sync::Mutex;
 
 use base64::Engine;
 
-use crate::desktop::{AudioRead, Desktop, DesktopError, Frame};
-use crate::input::{Button, MouseOp, Stroke};
+use crate::desktop::{AudioRead, Desktop, DesktopError, Frame, KeyboardPipe, PointerPipe};
+use crate::input::{Button, MouseOp, PointerStep, Stroke};
 
 fn view_png() -> Vec<u8> {
     decode_fixture(include_str!("../../tests/fixtures/view.png.b64"))
@@ -82,11 +82,59 @@ impl Desktop for FixtureDesktop {
             })).collect::<Vec<_>>(),
         }))
     }
+
+    fn open_pointer(&self) -> Result<Box<dyn PointerPipe + '_>, DesktopError> {
+        Ok(Box::new(FixturePipe { desktop: self }))
+    }
+
+    fn open_keyboard(&self) -> Result<Box<dyn KeyboardPipe + '_>, DesktopError> {
+        Ok(Box::new(FixtureKeys { desktop: self }))
+    }
+
+    fn pointer_steps(&self, steps: &[PointerStep]) -> Result<(), DesktopError> {
+        for step in steps {
+            let value = match *step {
+                PointerStep::Move { x, y } => serde_json::json!({
+                    "kind": "pointer",
+                    "action": "move",
+                    "x": x,
+                    "y": y,
+                }),
+                PointerStep::Button { button, down } => serde_json::json!({
+                    "kind": "pointer",
+                    "action": if down { "down" } else { "up" },
+                    "button": button_name(button),
+                }),
+            };
+            self.record(value)?;
+        }
+        Ok(())
+    }
+}
+
+struct FixturePipe<'a> {
+    desktop: &'a FixtureDesktop,
+}
+
+impl PointerPipe for FixturePipe<'_> {
+    fn send(&mut self, steps: &[PointerStep]) -> Result<(), DesktopError> {
+        self.desktop.pointer_steps(steps)
+    }
+}
+
+struct FixtureKeys<'a> {
+    desktop: &'a FixtureDesktop,
+}
+
+impl KeyboardPipe for FixtureKeys<'_> {
+    fn send(&mut self, strokes: &[Stroke]) -> Result<(), DesktopError> {
+        self.desktop.type_input(strokes)
+    }
 }
 
 fn mouse_event(op: &MouseOp) -> serde_json::Value {
     match op {
-        MouseOp::Move { x, y } => serde_json::json!({
+        MouseOp::Move { x, y, .. } => serde_json::json!({
             "kind": "mouse",
             "action": "move",
             "x": x,
