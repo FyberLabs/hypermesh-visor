@@ -903,11 +903,24 @@ PY
 scenario_off_bug_toggles_menu() {
   ensure_companion
   ensure_off
-  local ox oy h_off h_menu h_back i
+  local ox oy h h_off h_menu h_back prev i
+  # Stopping drops the continue prompt and the window moves down with it.
+  # Wait until that height has settled, then aim at the bug that is on screen.
+  prev=0
+  for i in $(seq 1 20); do
+    h=$(window_height)
+    if [[ $h == "$prev" ]]; then
+      break
+    fi
+    prev=$h
+    sleep 0.2
+  done
   read -r ox oy < <(window_origin)
   warp $((ox + 30)) $((oy + 30))
-  sleep 0.3
+  read -r ox oy < <(window_origin)
+  warp $((ox + 30)) $((oy + 30))
   h_off=$(window_height)
+  echo "off window at $ox,$oy height $h_off"
   uinput_cmd click
   h_menu=$h_off
   for i in $(seq 1 30); do
