@@ -95,11 +95,13 @@ pub fn settle_live_input(
     }
 }
 
-/// What a press on the bug does. `was_paused` is the phase from before this
-/// frame drained input. The press that moved `running` to `paused` must not
-/// open Continue. Ask only when the phase is still paused: a snapshot that
-/// has since left paused would make [`Machine::ask`] a no-op and swallow the
-/// click.
+/// What a press on the bug does.
+///
+/// `at_frame_start` and `now` are [`Machine::pause_origin`] values. Ask only
+/// when they name the same pause: the frame began on that pause, the snapshot
+/// did not replace it, and this click did not start the pause on screen. A
+/// snapshot that resumes and is then paused again has a new origin, so the
+/// click does not open Continue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BugClick {
     Ask,
@@ -108,8 +110,8 @@ pub enum BugClick {
     ToggleMenu,
 }
 
-pub fn bug_click(was_paused: bool, phase: Phase) -> BugClick {
-    if was_paused && phase == Phase::Paused {
+pub fn bug_click(at_frame_start: Option<u64>, phase: Phase, now: Option<u64>) -> BugClick {
+    if phase == Phase::Paused && at_frame_start.is_some() && at_frame_start == now {
         BugClick::Ask
     } else if phase == Phase::Running {
         BugClick::Pause
@@ -167,6 +169,11 @@ pub struct Machine {
     /// follows only when its sequence is newer, so a poll that skips the
     /// `paused` state still counts, and a poll from before the pause does not.
     pause_mark: u64,
+    /// Identity of the pause on screen. It advances every time a pause
+    /// begins, and [`Machine::pause_origin`] is `None` while the phase is
+    /// not paused. A frame compares the value from its start with the value
+    /// after the snapshot.
+    pause_epoch: u64,
     /// Process nonce from the last connected poll. `None` until that poll.
     seen_instance: Option<u64>,
 }
@@ -181,6 +188,7 @@ impl Machine {
             holding_resume: false,
             last_resume_seq: 0,
             pause_mark: 0,
+            pause_epoch: 0,
             seen_instance: None,
         }
     }
@@ -191,6 +199,31 @@ impl Machine {
 
     pub fn asking(&self) -> bool {
         self.asking
+    }
+
+    /// The pause on screen, or `None` when the phase is not paused.
+    /// Each new pause has a new value.
+    pub fn pause_origin(&self) -> Option<u64> {
+        if self.phase == Phase::Paused {
+            Some(self.pause_epoch)
+        } else {
+            None
+        }
+    }
+
+    /// Enter `paused` from another phase and advance [`Self::pause_epoch`].
+    /// `now_ms` updates the idle clock. `None` leaves that clock alone.
+    fn enter_paused(&mut self, now_ms: Option<u64>) -> bool {
+        if self.phase == Phase::Paused {
+            return false;
+        }
+        self.pause_epoch = self.pause_epoch.wrapping_add(1);
+        self.phase = Phase::Paused;
+        if let Some(now_ms) = now_ms {
+            self.last_input_ms = now_ms;
+        }
+        self.asking = false;
+        true
     }
 
     pub fn resume_after_ms(&self) -> u64 {
@@ -228,12 +261,7 @@ impl Machine {
                 if stale {
                     Effect::None
                 } else {
-                    let entered = self.phase != Phase::Paused;
-                    if entered {
-                        self.phase = Phase::Paused;
-                        self.last_input_ms = now_ms;
-                        self.asking = false;
-                    }
+                    let entered = self.enter_paused(Some(now_ms));
                     self.holding_resume = false;
                     if entered || resume_seq > self.pause_mark {
                         self.pause_mark = resume_seq;
@@ -249,9 +277,7 @@ impl Machine {
     pub fn user_input(&mut self, now_ms: u64) -> Effect {
         match self.phase {
             Phase::Running => {
-                self.phase = Phase::Paused;
-                self.last_input_ms = now_ms;
-                self.asking = false;
+                self.enter_paused(Some(now_ms));
                 self.holding_resume = false;
                 self.pause_mark = self.last_resume_seq;
                 Effect::Pause
@@ -325,8 +351,7 @@ impl Machine {
     /// restarts the timer instead of being ignored on `off`.
     pub fn note_disconnect(&mut self) {
         if self.holding_resume {
-            self.phase = Phase::Paused;
-            self.asking = false;
+            self.enter_paused(None);
             self.holding_resume = false;
             return;
         }
@@ -966,26 +991,33 @@ mod tests {
     fn the_click_that_pauses_does_not_open_continue() {
         let mut machine = Machine::new(DEFAULT_RESUME_MS);
         machine.see_visor(VisorPhase::Running, 0, 1);
-        let was_paused = machine.phase() == Phase::Paused;
-        assert!(!was_paused);
+        let at_frame_start = machine.pause_origin();
+        assert!(at_frame_start.is_none());
         assert_eq!(machine.user_input(10), Effect::Pause);
-        assert_eq!(bug_click(was_paused, machine.phase()), BugClick::Ignore);
+        assert_eq!(
+            bug_click(at_frame_start, machine.phase(), machine.pause_origin()),
+            BugClick::Ignore
+        );
         assert!(!machine.asking());
 
-        let was_paused = machine.phase() == Phase::Paused;
-        assert_eq!(bug_click(was_paused, machine.phase()), BugClick::Ask);
+        let at_frame_start = machine.pause_origin();
+        assert_eq!(
+            bug_click(at_frame_start, machine.phase(), machine.pause_origin()),
+            BugClick::Ask
+        );
         machine.ask(20);
         assert!(machine.asking());
     }
 
     #[test]
     fn a_bug_click_asks_only_while_the_phase_is_still_paused() {
-        assert_eq!(bug_click(true, Phase::Paused), BugClick::Ask);
-        assert_eq!(bug_click(true, Phase::Off), BugClick::ToggleMenu);
-        assert_eq!(bug_click(true, Phase::Running), BugClick::Pause);
-        assert_eq!(bug_click(false, Phase::Paused), BugClick::Ignore);
-        assert_eq!(bug_click(false, Phase::Running), BugClick::Pause);
-        assert_eq!(bug_click(false, Phase::Off), BugClick::ToggleMenu);
+        assert_eq!(bug_click(Some(1), Phase::Paused, Some(1)), BugClick::Ask);
+        assert_eq!(bug_click(Some(1), Phase::Off, None), BugClick::ToggleMenu);
+        assert_eq!(bug_click(Some(1), Phase::Running, None), BugClick::Pause);
+        assert_eq!(bug_click(None, Phase::Paused, Some(1)), BugClick::Ignore);
+        assert_eq!(bug_click(None, Phase::Running, None), BugClick::Pause);
+        assert_eq!(bug_click(None, Phase::Off, None), BugClick::ToggleMenu);
+        assert_eq!(bug_click(Some(1), Phase::Paused, Some(2)), BugClick::Ignore);
 
         let mut machine = Machine::new(DEFAULT_RESUME_MS);
         machine.see_visor(VisorPhase::Running, 0, 1);
@@ -993,9 +1025,38 @@ mod tests {
         assert_eq!(machine.phase(), Phase::Paused);
         machine.see_visor(VisorPhase::Off, 20, 1);
         assert_eq!(machine.phase(), Phase::Off);
-        assert_eq!(bug_click(true, machine.phase()), BugClick::ToggleMenu);
+        assert_eq!(
+            bug_click(Some(1), machine.phase(), machine.pause_origin()),
+            BugClick::ToggleMenu
+        );
         machine.ask(30);
         assert!(!machine.asking());
+    }
+
+    #[test]
+    fn a_click_after_a_snapshot_lifts_the_pause_does_not_ask() {
+        let mut machine = Machine::new(DEFAULT_RESUME_MS);
+        machine.see_visor(VisorPhase::Running, 0, 1);
+        assert_eq!(machine.user_input(10), Effect::Pause);
+        let at_frame_start = machine.pause_origin();
+        assert!(at_frame_start.is_some());
+        // The queued click is classified against the phase still on screen.
+        assert_eq!(machine.user_input(20), Effect::None);
+        machine.see_visor(VisorPhase::Running, 20, 2);
+        assert_eq!(machine.phase(), Phase::Running);
+        assert!(machine.pause_origin().is_none());
+        let incoming = classify_incoming_input(&mut machine, true, Effect::None, 20);
+        assert_eq!(incoming, Effect::Pause);
+        assert_eq!(machine.phase(), Phase::Paused);
+        assert_ne!(machine.pause_origin(), at_frame_start);
+        assert_eq!(
+            bug_click(at_frame_start, machine.phase(), machine.pause_origin()),
+            BugClick::Ignore
+        );
+        assert!(
+            !machine.asking(),
+            "the window only asks on BugClick::Ask, so Continue stays closed"
+        );
     }
 
     #[test]

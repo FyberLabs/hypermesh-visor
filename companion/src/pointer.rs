@@ -954,11 +954,14 @@ mod tests {
 
         let mut machine = Machine::new(DEFAULT_RESUME_MS);
         machine.see_visor(VisorPhase::Running, 0, 1);
-        let was_paused = machine.phase() == Phase::Paused;
+        let pause_at_frame = machine.pause_origin();
         // The window drops this core press before `on_click`, so the bug
         // does not pause, ask, or open the menu.
         assert!(cores[0]);
-        assert_ne!(bug_click(was_paused, machine.phase()), BugClick::Ask);
+        assert_ne!(
+            bug_click(pause_at_frame, machine.phase(), machine.pause_origin()),
+            BugClick::Ask
+        );
         assert_eq!(machine.phase(), Phase::Running);
         assert!(!machine.asking());
 
@@ -983,7 +986,7 @@ mod tests {
             &mut pending,
         );
         assert_eq!(user, vec![false]);
-        assert_eq!(bug_click(false, Phase::Running), BugClick::Pause);
+        assert_eq!(bug_click(None, Phase::Running, None), BugClick::Pause);
     }
 
     #[test]

@@ -256,9 +256,9 @@ fn show(mut app: App) -> Result<(), String> {
             app.poller.report_keyboard_unavailable();
             app.keyboard_reported_instance = Some(snap.instance);
         }
-        // Captured before this frame drains input. The click that moves
-        // running to paused must not open Continue.
-        let was_paused = app.machine.phase() == Phase::Paused;
+        // The pause on screen before this frame drains input. A later pause
+        // has a new origin, so a click does not open Continue for it.
+        let pause_at_frame = app.machine.pause_origin();
         // Queued physical input is judged against the phase already on screen,
         // and again against the snapshot applied below. An `off` poll cannot
         // swallow a key or click that arrived while the gate was running, and
@@ -404,7 +404,7 @@ fn show(mut app: App) -> Result<(), String> {
         }
         if let Some((x, y)) = click {
             app.last_used = Instant::now();
-            on_click(&mut app, &scene, x, y, was_paused, now_ms);
+            on_click(&mut app, &scene, x, y, pause_at_frame, now_ms);
         }
         let effect = app.machine.poll(now_ms);
         note_effect(&mut app, effect);
@@ -661,12 +661,23 @@ fn local_motion(app: &mut App, conn: &RustConnection, root: u32, now_ms: u64) ->
     moved
 }
 
-fn on_click(app: &mut App, scene: &Scene, x: i32, y: i32, was_paused: bool, now_ms: u64) {
+fn on_click(
+    app: &mut App,
+    scene: &Scene,
+    x: i32,
+    y: i32,
+    pause_at_frame: Option<u64>,
+    now_ms: u64,
+) {
     let Some(hit) = scene.hits.iter().find(|hit| hit.contains(x, y)) else {
         return;
     };
     match hit.action {
-        Action::ToggleMenu => match automation::bug_click(was_paused, app.machine.phase()) {
+        Action::ToggleMenu => match automation::bug_click(
+            pause_at_frame,
+            app.machine.phase(),
+            app.machine.pause_origin(),
+        ) {
             BugClick::Ask => app.machine.ask(now_ms),
             BugClick::Pause => {
                 let effect = app.machine.user_input(now_ms);

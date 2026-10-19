@@ -298,33 +298,45 @@ pub fn accept_is_transient(err: &io::Error) -> bool {
 
 /// Accept on a private socket. `role` is only the log label (`companion` or
 /// `control`). Both roles drop a peer whose uid is not this process.
+/// `stop` ends the loop before the next accept. A dropped sender does too.
 pub async fn accept_loop(
     listener: UnixListener,
     app: axum::Router,
     role: &'static str,
+    mut stop: tokio::sync::watch::Receiver<bool>,
 ) -> io::Result<()> {
     let mut pause = Duration::from_millis(10);
     loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                pause = Duration::from_millis(10);
-                if !peer_is_current_user(&stream) {
-                    eprintln!(
-                        "hypermesh-visor: refused a {role} socket peer that is not this user"
-                    );
-                    continue;
+        tokio::select! {
+            biased;
+            // The watch guard has to die inside this future. Leaving it in
+            // the select output makes the accept arm, which sleeps, not Send.
+            _ = async {
+                let _ = stop.wait_for(|stop| *stop).await;
+            } => return Ok(()),
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _)) => {
+                        pause = Duration::from_millis(10);
+                        if !peer_is_current_user(&stream) {
+                            eprintln!(
+                                "hypermesh-visor: refused a {role} socket peer that is not this user"
+                            );
+                            continue;
+                        }
+                        let app = app.clone();
+                        tokio::spawn(async move {
+                            serve_one(stream, app).await;
+                        });
+                    }
+                    Err(err) if accept_is_transient(&err) => {
+                        eprintln!("hypermesh-visor: {role} accept: {err}");
+                        tokio::time::sleep(pause).await;
+                        pause = (pause * 2).min(Duration::from_secs(1));
+                    }
+                    Err(err) => return Err(err),
                 }
-                let app = app.clone();
-                tokio::spawn(async move {
-                    serve_one(stream, app).await;
-                });
             }
-            Err(err) if accept_is_transient(&err) => {
-                eprintln!("hypermesh-visor: {role} accept: {err}");
-                tokio::time::sleep(pause).await;
-                pause = (pause * 2).min(Duration::from_secs(1));
-            }
-            Err(err) => return Err(err),
         }
     }
 }

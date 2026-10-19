@@ -655,66 +655,73 @@ pub async fn serve(tcp: Option<SocketAddr>, state: Arc<AppState>) -> std::io::Re
         println!("listening {}", listener.local_addr()?);
     }
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    let companion_app = companion_router(Arc::clone(&state));
-    tokio::spawn(async move {
-        if let Err(err) =
-            crate::companion_sock::accept_loop(companion_listener, companion_app, "companion").await
-        {
-            eprintln!("hypermesh-visor: companion socket closed: {err}");
-        }
-    });
-    let control_app = router(Arc::clone(&state));
-    tokio::spawn(async move {
-        if let Err(err) =
-            crate::companion_sock::accept_loop(control_listener, control_app, "control").await
-        {
-            eprintln!("hypermesh-visor: control socket closed: {err}");
-        }
-    });
     spawn_companion_watch(Arc::clone(&state));
     // Older builds wrote this name under the config dir. It is not a credential.
     let _ = std::fs::remove_file(state.mcp_dir.join("companion.token"));
-    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-    let mut server = match (tcp_listener, token) {
-        (Some(listener), Some(token)) => {
-            let app = tcp_router(Arc::clone(&state), token);
-            let mut shutdown_rx = shutdown_rx.clone();
-            Some(tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .with_graceful_shutdown(async move {
-                        let _ = shutdown_rx.wait_for(|stop| *stop).await;
-                    })
-                    .await
-            }))
-        }
-        _ => None,
-    };
-    if let Some(server) = server.as_mut() {
-        tokio::select! {
-            result = server => {
-                return match result {
-                    Ok(server_result) => server_result,
-                    Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
-                };
-            }
-            _ = shutdown_signal() => {}
-        }
-    } else {
-        shutdown_signal().await;
+    // One stop flag for every listener. The first one to finish cancels the
+    // rest, then close_all runs, then the others have the shutdown deadline.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let companion_app = companion_router(Arc::clone(&state));
+    let companion_stop = cancel_rx.clone();
+    let companion = tokio::spawn(async move {
+        crate::companion_sock::accept_loop(
+            companion_listener,
+            companion_app,
+            "companion",
+            companion_stop,
+        )
+        .await
+    });
+    let control_app = router(Arc::clone(&state));
+    let control_stop = cancel_rx.clone();
+    let control = tokio::spawn(async move {
+        crate::companion_sock::accept_loop(control_listener, control_app, "control", control_stop)
+            .await
+    });
+    let mut jobs = vec![companion, control];
+    if let (Some(listener), Some(token)) = (tcp_listener, token) {
+        let app = tcp_router(Arc::clone(&state), token);
+        let mut tcp_stop = cancel_rx.clone();
+        jobs.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = tcp_stop.wait_for(|stop| *stop).await;
+                })
+                .await
+        }));
     }
-    // The deadline starts when the signal arrives, not when the process does.
+    let mut signal_stop = cancel_rx;
+    jobs.push(tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_signal() => Ok(()),
+            _ = signal_stop.wait_for(|stop| *stop) => Ok(()),
+        }
+    }));
+    when_first_stops(&state, jobs, cancel_tx).await
+}
+
+/// The first listener to finish or fail cancels the others. `close_all` then
+/// cancels injection, releases held input, and clears sessions. The remaining
+/// listeners have [`automation::SHUTDOWN_DEADLINE`] to return.
+async fn when_first_stops(
+    state: &AppState,
+    jobs: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    cancel: tokio::sync::watch::Sender<bool>,
+) -> std::io::Result<()> {
+    let (first, rest) = wait_first(jobs).await;
+    let _ = cancel.send(true);
     state.close_all();
-    let _ = shutdown_tx.send(true);
-    let Some(server) = server else {
-        return Ok(());
-    };
-    let outcome = wait_bounded(automation::SHUTDOWN_DEADLINE, server).await;
+    if rest.is_empty() {
+        return first;
+    }
+    let outcome = wait_bounded(automation::SHUTDOWN_DEADLINE, async move {
+        for job in rest {
+            let _ = job.await;
+        }
+    })
+    .await;
     match outcome {
-        ShutdownWait::Finished(Ok(result)) => result,
-        ShutdownWait::Finished(Err(err)) => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            err.to_string(),
-        )),
+        ShutdownWait::Finished(()) => first,
         ShutdownWait::Deadline => {
             // A desktop call stuck in one request never reaches the injection
             // lock. The X server drops this client's grabs when the process
@@ -726,6 +733,51 @@ pub async fn serve(tcp: Option<SocketAddr>, state: Arc<AppState>) -> std::io::Re
             std::process::exit(0);
         }
     }
+}
+
+fn wait_first(
+    jobs: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+) -> impl std::future::Future<
+    Output = (
+        std::io::Result<()>,
+        Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    ),
+> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    let mut slots: Vec<Option<tokio::task::JoinHandle<std::io::Result<()>>>> =
+        jobs.into_iter().map(Some).collect();
+    std::future::poll_fn(move |cx: &mut Context<'_>| {
+        let mut ready = None;
+        for (index, slot) in slots.iter_mut().enumerate() {
+            let Some(job) = slot.as_mut() else {
+                continue;
+            };
+            if let Poll::Ready(result) = Pin::new(job).poll(cx) {
+                ready = Some((index, result));
+                break;
+            }
+        }
+        let Some((index, result)) = ready else {
+            return if slots.iter().all(|slot| slot.is_none()) {
+                Poll::Ready((Ok(()), Vec::new()))
+            } else {
+                Poll::Pending
+            };
+        };
+        slots[index] = None;
+        let rest = slots.iter_mut().filter_map(|slot| slot.take()).collect();
+        let mapped = match result {
+            Ok(result) => result,
+            Err(err) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                err.to_string(),
+            )),
+        };
+        Poll::Ready((mapped, rest))
+    })
 }
 
 enum ShutdownWait<T> {
@@ -2454,10 +2506,16 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, router(tcp_state)).await.unwrap();
         });
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
-            let _ =
-                crate::companion_sock::accept_loop(unix, companion_router(sock_state), "companion")
-                    .await;
+            let _stop_tx = stop_tx;
+            let _ = crate::companion_sock::accept_loop(
+                unix,
+                companion_router(sock_state),
+                "companion",
+                stop_rx,
+            )
+            .await;
         });
         (addr, dir)
     }
@@ -4315,6 +4373,35 @@ while True:
         );
         assert_eq!(lock(&state.automation).phase(), Phase::Off);
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_tcp_exit_still_runs_close_all() {
+        let state = Arc::new(AppState::new(FakeDesktop::new(), Duration::from_millis(20)));
+        lock(&state.automation).pause();
+        assert_eq!(lock(&state.automation).phase(), Phase::Paused);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let tcp = tokio::spawn(async { Ok(()) });
+        let saw_cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&saw_cancel);
+        let mut companion_stop = cancel_rx;
+        let companion = tokio::spawn(async move {
+            let _ = companion_stop.wait_for(|stop| *stop).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        when_first_stops(&state, vec![tcp, companion], cancel_tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            lock(&state.automation).phase(),
+            Phase::Off,
+            "close_all resets the gate after the tcp task ends"
+        );
+        assert!(
+            saw_cancel.load(Ordering::SeqCst),
+            "the other listener was cancelled"
+        );
     }
 
     #[tokio::test]
