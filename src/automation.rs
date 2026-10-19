@@ -132,9 +132,9 @@ enum Deferred {
     Start {
         session: Uuid,
         from_companion: bool,
-        /// Clock captured with the request. Replay uses it, not the clock at
-        /// unwind, so the response and the replay agree.
-        now: Instant,
+        /// Watchdog window captured with the request. Replay measures freshness
+        /// against the clock at unwind, not against the instant the action
+        /// was queued.
         timeout: Duration,
     },
     /// `session` is none when resume had no session to take. That ends a
@@ -142,7 +142,6 @@ enum Deferred {
     Resume {
         session: Option<Uuid>,
         from_companion: bool,
-        now: Instant,
         timeout: Duration,
     },
 }
@@ -377,9 +376,16 @@ impl Gate {
     /// Controls posted during the call are applied in the order they arrived,
     /// and a close applies only to the session generation it named.
     pub fn end_inject(&mut self) {
+        self.finish_inject(Instant::now());
+    }
+
+    /// Unwind an injection as if `now` were the monotonic clock. Production
+    /// calls [`Gate::end_inject`]. Tests pass a later instant so a poll that
+    /// was fresh at queue time can be stale at replay.
+    fn finish_inject(&mut self, now: Instant) {
         self.injecting = false;
         self.last_settled_seq = self.last_settled_seq.max(self.inject_seq);
-        self.replay_queued();
+        self.replay_queued(now);
         self.publish();
     }
 
@@ -647,7 +653,6 @@ impl Gate {
                 self.defer(Deferred::Start {
                     session: id,
                     from_companion,
-                    now,
                     timeout,
                 });
                 Ok(())
@@ -684,7 +689,6 @@ impl Gate {
         self.defer(Deferred::Resume {
             session,
             from_companion,
-            now,
             timeout,
         });
         Ok(())
@@ -703,10 +707,11 @@ impl Gate {
     }
 
     /// Phase after every control already in [`Self::deferred`], using the
-    /// same admission rules as unwind.
+    /// same admission rules as unwind. The scratch clock is the current
+    /// monotonic time, matching a replay that happened now.
     fn phase_after_deferred(&self) -> Phase {
         let mut scratch = self.admission_scratch();
-        scratch.replay_queued();
+        scratch.replay_queued(Instant::now());
         scratch.phase
     }
 
@@ -731,10 +736,10 @@ impl Gate {
         scratch
     }
 
-    fn replay_queued(&mut self) {
+    fn replay_queued(&mut self, now: Instant) {
         let deferred = std::mem::take(&mut self.deferred);
         for (_seq, action) in deferred {
-            self.apply_deferred(action);
+            self.apply_deferred(action, now);
         }
     }
 
@@ -828,7 +833,7 @@ impl Gate {
         self.deferred.push((seq, action));
     }
 
-    fn apply_deferred(&mut self, action: Deferred) {
+    fn apply_deferred(&mut self, action: Deferred, now: Instant) {
         match action {
             Deferred::Stop => {
                 self.reset();
@@ -860,7 +865,6 @@ impl Gate {
             Deferred::Start {
                 session,
                 from_companion,
-                now,
                 timeout,
             } => {
                 if self.reentry_admitted(from_companion, now, timeout) {
@@ -870,7 +874,6 @@ impl Gate {
             Deferred::Resume {
                 session,
                 from_companion,
-                now,
                 timeout,
             } => {
                 // Still running means no earlier control ended the phase.
@@ -899,9 +902,10 @@ impl Gate {
     /// Whether a deferred start or resume may enter `running` after the
     /// predecessors in this sequence have been applied.
     ///
+    /// `now` is the clock at replay, never the instant the action was queued.
     /// The keyboard latch must still be up. A TCP caller also needs a
-    /// companion poll inside the window captured with the action, unless the
-    /// phase is already `running`. The session the action named is the one
+    /// companion poll inside `timeout` of that clock, unless the phase is
+    /// already `running`. The session the action named is the one
     /// [`Gate::enter_running`] takes; a resume with no session does not call
     /// this and only ends a pause.
     fn reentry_admitted(&self, from_companion: bool, now: Instant, timeout: Duration) -> bool {
@@ -1974,7 +1978,6 @@ mod tests {
     #[test]
     fn a_replayed_stale_start_or_resume_does_not_enter_running() {
         let timeout = Duration::from_secs(2);
-        let now = Instant::now();
         for action in [Control::Start, Control::Resume] {
             let mut gate = Gate::default();
             let id = Uuid::new_v4();
@@ -1984,13 +1987,11 @@ mod tests {
                 Control::Start => Deferred::Start {
                     session: id,
                     from_companion: false,
-                    now,
                     timeout,
                 },
                 Control::Resume => Deferred::Resume {
                     session: Some(id),
                     from_companion: false,
-                    now,
                     timeout,
                 },
                 _ => unreachable!(),
@@ -2001,6 +2002,45 @@ mod tests {
             assert_eq!(gate.phase(), Phase::Off, "{action:?}");
             assert!(gate.session().is_none(), "{action:?}");
         }
+    }
+
+    /// A poll that was fresh when the start was queued can expire while the
+    /// desktop call is still blocked. Replay measures that against the unwind
+    /// clock, so the gate stays off and `resume_seq` does not move.
+    #[test]
+    fn a_poll_that_expires_before_unwind_does_not_replay_into_running() {
+        let timeout = Duration::from_millis(100);
+        let polled = Instant::now();
+        for action in [Control::Start, Control::Resume] {
+            let mut gate = Gate::default();
+            let id = Uuid::new_v4();
+            assert!(!gate.note_poll(polled, timeout));
+            gate.begin_inject(id, gate.epoch()).unwrap();
+            gate.apply(None, Control::Stop, false, polled, timeout)
+                .unwrap();
+            gate.apply(Some(id), action, false, polled, timeout)
+                .unwrap();
+            let seq = gate.resume_seq();
+            gate.finish_inject(polled + timeout);
+            assert_eq!(gate.phase(), Phase::Off, "{action:?}");
+            assert_eq!(gate.resume_seq(), seq, "{action:?}");
+            assert!(gate.session().is_none(), "{action:?}");
+        }
+
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        assert!(!gate.note_poll(polled, timeout));
+        gate.begin_inject(id, gate.epoch()).unwrap();
+        gate.apply(None, Control::Stop, false, polled, timeout)
+            .unwrap();
+        gate.apply(Some(id), Control::Start, false, polled, timeout)
+            .unwrap();
+        gate.finish_inject(polled + Duration::from_millis(40));
+        assert_eq!(
+            gate.phase(),
+            Phase::Running,
+            "a poll still inside the window at unwind may enter running"
+        );
     }
 
     #[test]

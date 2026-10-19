@@ -1264,6 +1264,14 @@ fn injection_cancelled(captured: u64, word: u64) -> bool {
     epoch != captured || phase == Phase::Paused
 }
 
+/// A mouse or type request that waited on the injection lock must not open a
+/// new stretch when unwind left the gate `off` and the companion poll has
+/// since expired. A first injection, with no trusted instant yet, is allowed.
+fn stretch_ended(state: &AppState) -> bool {
+    let gate = lock(&state.automation);
+    gate.phase() == Phase::Off && gate.stale_reentry(Instant::now(), state.companion_poll_timeout)
+}
+
 fn gate_word(state: &AppState) -> u64 {
     state.published.load(Ordering::SeqCst)
 }
@@ -1569,7 +1577,7 @@ async fn mouse(
             }
         }
         let cancelled = || injection_cancelled(epoch, gate_word(&state2));
-        if cancelled() {
+        if cancelled() || stretch_ended(&state2) {
             return Err(ApiError::conflict("automation paused"));
         }
         let _injecting = InjectGuard::arm(&state2.automation, id, epoch)?;
@@ -1658,7 +1666,7 @@ async fn type_keys(
             return Err(ApiError::missing());
         }
         let cancelled = || injection_cancelled(epoch, gate_word(&state2));
-        if cancelled() {
+        if cancelled() || stretch_ended(&state2) {
             return Err(ApiError::conflict("automation paused"));
         }
         let _injecting = InjectGuard::arm(&state2.automation, id, epoch)?;
@@ -3607,6 +3615,90 @@ while True:
         desktop.block_type.store(false, Ordering::SeqCst);
         let (status, _, _) = job.await.unwrap();
         assert_eq!(status, 204);
+    }
+
+    #[tokio::test]
+    async fn a_stale_deferred_start_does_not_let_a_waiting_mouse_inject() {
+        let desktop = FakeDesktop::new();
+        desktop.block_type.store(true, Ordering::SeqCst);
+        let timeout = Duration::from_millis(400);
+        let (addr, dir) = spawn_pair_timeout(Arc::clone(&desktop), timeout).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let type_addr = addr;
+        let type_id = id;
+        let typed = tokio::spawn(async move {
+            send(
+                type_addr,
+                "POST",
+                &format!("/session/{type_id}/type"),
+                Some(r#"{"text":"ab"}"#.into()),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (_, _, body) = send(addr, "GET", "/companion", None).await;
+                let live: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if live["automation"]["injecting"] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "type did not take the injection lock");
+        let poll_dir = dir.clone();
+        let polled = tokio::task::spawn_blocking(move || companion_get(&poll_dir))
+            .await
+            .unwrap();
+        assert_eq!(polled["automation"]["phase"], "running");
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"stop"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 204, "{text}");
+        let mouse_addr = addr;
+        let mouse_id = id;
+        let mouse = tokio::spawn(async move {
+            send(
+                mouse_addr,
+                "POST",
+                &format!("/session/{mouse_id}/mouse"),
+                Some(r#"{"action":"move","x":3,"y":4}"#.into()),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(timeout + Duration::from_millis(150)).await;
+        desktop.block_type.store(false, Ordering::SeqCst);
+        let _ = typed.await.unwrap();
+        let (status, _, body) = mouse.await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        assert!(
+            lock(&desktop.mice).is_empty(),
+            "the waiting move must not inject"
+        );
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(snap["automation"]["phase"], "running");
+        assert_eq!(
+            snap["automation"]["resume_seq"], 0,
+            "a start replayed after the poll expired must not enter running"
+        );
+        let _ = dir;
     }
 
     #[tokio::test]
