@@ -34,7 +34,28 @@ jobs:
           # The harness opens /dev/uinput as root and does not change device modes.
 
       - name: Run X11 display scenarios
-        run: bash ci/display/run.sh x11
+        run: |
+          before=$(stat -c '%a %U %G' /dev/uinput)
+          echo "uinput before: $before"
+          mode=${before%% *}
+          other=${mode: -1}
+          if (( other & 2 )); then
+            echo "/dev/uinput is world-writable before the run ($before)" >&2
+            exit 1
+          fi
+          bash ci/display/run.sh x11
+          after=$(stat -c '%a %U %G' /dev/uinput)
+          echo "uinput after: $after"
+          if [[ $before != "$after" ]]; then
+            echo "/dev/uinput changed from $before to $after" >&2
+            exit 1
+          fi
+          mode=${after%% *}
+          other=${mode: -1}
+          if (( other & 2 )); then
+            echo "/dev/uinput is world-writable after the run ($after)" >&2
+            exit 1
+          fi
 
       - name: Upload logs and captures
         if: failure()

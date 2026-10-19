@@ -17,9 +17,11 @@
 # this script creates with mktemp. remove, chmod, and writes go through
 # refuse_outside, which rejects a path outside those directories and
 # display-logs/. Process ids that have to survive a scenario subshell live
-# in the private state directory. Xorg's display comes from -displayfd. The
-# harness does not read or remove /tmp/.X*-lock, and it does not chmod
-# /dev/uinput or the event nodes.
+# in the private state directory. A pid file is removed only after that
+# process is gone. Xorg's display comes from -displayfd. The harness does
+# not read or remove /tmp/.X*-lock, and it does not chmod /dev/uinput or
+# the event nodes. The uinput helper reads commands on stdin. It does not
+# listen on a port.
 set -euo pipefail
 set -m
 
@@ -89,6 +91,7 @@ CONTROL_SOCK=
 TCP_BASE=
 SID=
 UINPUT_FD=
+UINPUT_OUT=
 UINPUT_PID=
 SOCK_FD=
 SOCK_PID=
@@ -227,7 +230,6 @@ load_proc_state() {
   SID=$(read_state session.id)
   VISOR_PID=$(read_state visor.pid)
   COMPANION_WAS_UP=$(read_state companion.was-up)
-  UINPUT_PORT=$(read_state uinput.port)
   UINPUT_POINTER=$(read_state uinput.pointer)
   UINPUT_KEYBOARD=$(read_state uinput.keyboard)
   local disp
@@ -298,6 +300,44 @@ remember_uinput() {
   stat -c '%a %U %G' /dev/uinput >"$PROC/uinput.stamp"
 }
 
+uinput_is_world_writable() {
+  local digit=${1: -1}
+  [[ $digit =~ ^[0-9]$ ]] || return 1
+  (( digit & 2 ))
+}
+
+# Fail when /dev/uinput is world-writable, or when its mode and owner
+# differ from the stamp taken before this run changed anything.
+assert_uinput_mode() {
+  local now stamp mode
+  if [[ ! -e /dev/uinput ]]; then
+    if [[ -f $PROC/uinput.stamp ]] && ! grep -qx 'absent' "$PROC/uinput.stamp"; then
+      echo "self-check: /dev/uinput disappeared (was $(cat "$PROC/uinput.stamp"))" >&2
+      return 1
+    fi
+    return 0
+  fi
+  now=$(stat -c '%a %U %G' /dev/uinput)
+  mode=${now%% *}
+  if uinput_is_world_writable "$mode"; then
+    echo "self-check: /dev/uinput is world-writable ($now)" >&2
+    return 1
+  fi
+  if [[ ! -f $PROC/uinput.stamp ]]; then
+    echo "self-check: /dev/uinput mode was not recorded" >&2
+    return 1
+  fi
+  stamp=$(cat "$PROC/uinput.stamp")
+  if [[ $stamp == absent ]]; then
+    echo "self-check: /dev/uinput exists and its original mode was not recorded" >&2
+    return 1
+  fi
+  if [[ $now != "$stamp" ]]; then
+    echo "self-check: /dev/uinput is $now, originally $stamp" >&2
+    return 1
+  fi
+}
+
 # True when /proc/$pid still belongs to this executable. A recycled pid must
 # not be signalled. `exe` is the inode the process started; cmdline covers a
 # replaced binary whose symlink reads "(deleted)".
@@ -319,12 +359,12 @@ pid_matches_exe() {
 
 # Signal `pid` only when it is still `expected`. A recycled pid is left alone.
 signal_if_exe() {
-  local pid=$1 expected=$2
+  local pid=$1 expected=$2 sig=${3:-TERM}
   if [[ -z $pid ]]; then
     return 1
   fi
   if pid_matches_exe "$pid" "$expected"; then
-    if kill "$pid" 2>/dev/null; then
+    if kill -s "$sig" "$pid" 2>/dev/null; then
       return 0
     fi
     return 2
@@ -336,7 +376,7 @@ signal_if_exe() {
 # sudo kill only for a pid this run recorded, whose cmdline still contains
 # the marker from that launch (the Xorg logfile, or the uinput helper path).
 signal_root_child() {
-  local pid=$1 expected=$2 marker=${3:-} cmd
+  local pid=$1 expected=$2 marker=${3:-} sig=${4:-TERM} cmd
   [[ $pid =~ ^[0-9]+$ && -n $expected && -n $marker ]] || return 1
   pid_matches_exe "$pid" "$expected" || return 1
   started_by_this_run "$pid" || return 1
@@ -345,28 +385,67 @@ signal_root_child() {
     echo "not signalling pid $pid; cmdline does not contain $marker" >&2
     return 1
   fi
-  sudo -n kill "$pid" 2>/dev/null || true
+  sudo -n kill -s "$sig" "$pid" 2>/dev/null || true
 }
 
-# Drop a pid file, then signal the recorded pid and an optional in-memory
-# pid. Both go through the same identity check. Used for companion.pid and
-# visor.pid.
-signal_recorded_pid() {
-  local file=$1 expected=$2 live=${3:-}
-  local pid="" signalled=1
-  if [[ -f $file ]]; then
-    pid=$(cat "$file" 2>/dev/null || true)
-    remove_inside "$file"
+# /proc still belongs to this launch. A recycled pid does not.
+proc_still_ours() {
+  local pid=$1 expected=$2
+  [[ -d /proc/$pid ]] && pid_matches_exe "$pid" "$expected"
+}
+
+# TERM, wait out the visor's 5s drain plus margin, then KILL. The caller
+# removes the pid file only after this returns 0.
+wait_for_exit() {
+  local pid=$1 expected=$2 marker=${3:-} i
+  if ! proc_still_ours "$pid" "$expected"; then
+    return 0
   fi
-  if signal_if_exe "$pid" "$expected"; then
-    signalled=0
+  if ! signal_if_exe "$pid" "$expected" TERM; then
+    signal_root_child "$pid" "$expected" "$marker" TERM || true
   fi
-  if [[ -n $live && $live != "$pid" ]]; then
-    if signal_if_exe "$live" "$expected"; then
-      signalled=0
+  for i in $(seq 1 80); do
+    proc_still_ours "$pid" "$expected" || return 0
+    sleep 0.1
+  done
+  if proc_still_ours "$pid" "$expected"; then
+    if ! signal_if_exe "$pid" "$expected" KILL; then
+      signal_root_child "$pid" "$expected" "$marker" KILL || true
     fi
   fi
-  return "$signalled"
+  for i in $(seq 1 20); do
+    proc_still_ours "$pid" "$expected" || return 0
+    sleep 0.1
+  done
+  if proc_still_ours "$pid" "$expected"; then
+    echo "pid $pid ($expected) is still running after SIGKILL" >&2
+    return 1
+  fi
+}
+
+# Signal the recorded pid and an optional in-memory pid, wait until neither
+# is still that executable, and only then remove the pid file.
+signal_recorded_pid() {
+  local file=$1 expected=$2 live=${3:-}
+  local pid=""
+  if [[ -f $file ]]; then
+    pid=$(tr -d '[:space:]' <"$file" 2>/dev/null || true)
+  fi
+  if [[ $pid =~ ^[0-9]+$ ]]; then
+    wait_for_exit "$pid" "$expected" || return 1
+  fi
+  if [[ -n $live && $live != "$pid" ]]; then
+    wait_for_exit "$live" "$expected" || return 1
+  fi
+  if [[ -n $pid ]] && proc_still_ours "$pid" "$expected"; then
+    return 1
+  fi
+  if [[ -n $live && $live != "$pid" ]] && proc_still_ours "$live" "$expected"; then
+    return 1
+  fi
+  if [[ -f $file ]]; then
+    remove_inside "$file"
+  fi
 }
 
 # `set -m` gives each background request its own process group, so killing
@@ -384,28 +463,55 @@ kill_tracked_requests() {
 MAIN_BASHPID=$BASHPID
 
 stop_recorded() {
-  local name=$1 exe=$2 pid
+  local name=$1 exe=$2 marker=${3:-} pid
   pid=$(read_state "$name")
   [[ $pid =~ ^[0-9]+$ ]] || return 0
-  signal_if_exe "$pid" "$exe" || true
+  if ! wait_for_exit "$pid" "$exe" "$marker"; then
+    echo "leaving $name in place; pid $pid is still running" >&2
+    return 1
+  fi
   clear_state "$name"
 }
 
+# One pass over every process this run started. The pid list stays until
+# each process is gone, so a later start can still see a visor that has
+# not finished exiting.
 stop_started() {
   local pid exe marker i alive
   [[ -f $PROC/started ]] || return 0
   while IFS=$'\t' read -r pid exe marker; do
     [[ $pid =~ ^[0-9]+$ && -n $exe ]] || continue
-    [[ -d /proc/$pid ]] || continue
-    if ! signal_if_exe "$pid" "$exe"; then
-      signal_root_child "$pid" "$exe" "$marker" || true
+    proc_still_ours "$pid" "$exe" || continue
+    if ! signal_if_exe "$pid" "$exe" TERM; then
+      signal_root_child "$pid" "$exe" "$marker" TERM || true
     fi
   done <"$PROC/started"
-  for i in $(seq 1 25); do
+  for i in $(seq 1 80); do
     alive=0
     while IFS=$'\t' read -r pid exe marker; do
       [[ $pid =~ ^[0-9]+$ && -n $exe ]] || continue
-      if [[ -d /proc/$pid ]] && pid_matches_exe "$pid" "$exe"; then
+      if proc_still_ours "$pid" "$exe"; then
+        alive=1
+        break
+      fi
+    done <"$PROC/started"
+    if (( alive == 0 )); then
+      return 0
+    fi
+    sleep 0.1
+  done
+  while IFS=$'\t' read -r pid exe marker; do
+    [[ $pid =~ ^[0-9]+$ && -n $exe ]] || continue
+    proc_still_ours "$pid" "$exe" || continue
+    if ! signal_if_exe "$pid" "$exe" KILL; then
+      signal_root_child "$pid" "$exe" "$marker" KILL || true
+    fi
+  done <"$PROC/started"
+  for i in $(seq 1 20); do
+    alive=0
+    while IFS=$'\t' read -r pid exe marker; do
+      [[ $pid =~ ^[0-9]+$ && -n $exe ]] || continue
+      if proc_still_ours "$pid" "$exe"; then
         alive=1
         break
       fi
@@ -418,24 +524,9 @@ stop_started() {
 }
 
 self_check() {
-  local bad=0 stamp now pid exe mode other
-  if [[ -f $PROC/uinput.stamp ]]; then
-    stamp=$(cat "$PROC/uinput.stamp")
-    if [[ $stamp == absent ]]; then
-      if [[ -e /dev/uinput ]]; then
-        echo "self-check: /dev/uinput exists and its original mode was not recorded" >&2
-        bad=1
-      fi
-    elif [[ ! -e /dev/uinput ]]; then
-      echo "self-check: /dev/uinput disappeared (was $stamp)" >&2
-      bad=1
-    else
-      now=$(stat -c '%a %U %G' /dev/uinput)
-      if [[ $now != "$stamp" ]]; then
-        echo "self-check: /dev/uinput is $now, originally $stamp" >&2
-        bad=1
-      fi
-    fi
+  local bad=0 pid exe mode other
+  if ! assert_uinput_mode; then
+    bad=1
   fi
   local node key node_stamp
   for key in uinput.pointer uinput.keyboard; do
@@ -478,7 +569,11 @@ self_check() {
   if (( bad )); then
     return 1
   fi
-  echo "self-check: /dev/uinput mode and owner unchanged; no harness process left"
+  if [[ -e /dev/uinput ]]; then
+    echo "self-check: /dev/uinput $(stat -c '%a %U:%G' /dev/uinput) unchanged and not world-writable; no harness process left"
+  else
+    echo "self-check: /dev/uinput absent; no harness process left"
+  fi
 }
 
 cleanup() {
@@ -489,12 +584,15 @@ cleanup() {
   fi
   if [[ -n ${UINPUT_FD:-} ]]; then
     printf 'quit\n' >&"$UINPUT_FD" 2>/dev/null || true
+    exec {UINPUT_FD}>&- || true
+    unset UINPUT_FD
   fi
   if [[ -n ${SOCK_FD:-} ]]; then
     printf 'quit\n' >&"$SOCK_FD" 2>/dev/null || true
   fi
+  # The visor pid file stays until stop_visor has seen the process exit.
+  stop_visor || true
   signal_recorded_pid "$COMPANION_PID_FILE" "$COMPANION_BIN" || true
-  signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" || true
   stop_recorded xev.pid "$(command -v xev || true)"
   stop_recorded uinput.launcher "$(command -v sudo || true)"
   stop_recorded sock.pid "$(command -v python3 || true)"
@@ -663,41 +761,80 @@ open_session() {
 recorded_visor_alive() {
   local pid
   pid=$(read_state visor.pid)
-  [[ $pid =~ ^[0-9]+$ ]] || return 1
-  pid_matches_exe "$pid" "$VISOR_BIN" && kill -0 "$pid" 2>/dev/null
+  proc_still_ours "$pid" "$VISOR_BIN"
 }
 
-stop_visor() {
-  local pid
-  pid=$(read_state visor.pid)
-  signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" || true
-  local i
-  for i in $(seq 1 30); do
-    if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null; then
-      break
+count_live_visors() {
+  local pid exe marker n=0 seen=" "
+  [[ -f $PROC/started ]] || {
+    echo 0
+    return 0
+  }
+  while IFS=$'\t' read -r pid exe marker; do
+    [[ $exe == "$VISOR_BIN" ]] || continue
+    [[ $seen == *" $pid "* ]] && continue
+    if proc_still_ours "$pid" "$VISOR_BIN"; then
+      n=$((n + 1))
+      seen+="$pid "
     fi
-    sleep 0.1
-  done
-  VISOR_PID=
+  done <"$PROC/started"
+  echo "$n"
+}
+
+# Signal every recorded visor and keep visor.pid until /proc shows it is gone.
+# companion.lock is not touched here.
+stop_visor() {
+  local pid exe marker failed=0
+  pid=$(read_state visor.pid)
+  if [[ $pid =~ ^[0-9]+$ ]] && proc_still_ours "$pid" "$VISOR_BIN"; then
+    wait_for_exit "$pid" "$VISOR_BIN" || failed=1
+  fi
+  if [[ -f $PROC/started ]]; then
+    while IFS=$'\t' read -r pid exe marker; do
+      [[ $exe == "$VISOR_BIN" ]] || continue
+      if proc_still_ours "$pid" "$VISOR_BIN"; then
+        wait_for_exit "$pid" "$VISOR_BIN" || failed=1
+      fi
+    done <"$PROC/started"
+  fi
+  if (( failed )) || recorded_visor_alive || (( $(count_live_visors) > 0 )); then
+    echo "visor is still running; leaving visor.pid in place" >&2
+    return 1
+  fi
+  clear_state visor.pid
   clear_state control.sock
   clear_state tcp.base
+  VISOR_PID=
 }
 
 # `tcp` also opens the opt-in loopback port. The control socket is always used
 # for the harness requests above. A live recorded visor is left in place unless
-# this call is switching it to TCP, and then it is stopped before any socket
-# or lock file is removed.
+# this call is switching it to TCP. companion.lock is removed only after every
+# recorded visor has exited.
 start_visor() {
-  local tcp=${1:-}
+  local tcp=${1:-} n
   load_proc_state
+  n=$(count_live_visors)
+  if (( n > 1 )); then
+    echo "self-check: $n harness visors are running" >&2
+    return 1
+  fi
   if [[ -z $tcp ]] && recorded_visor_alive; then
+    if (( n != 1 )); then
+      echo "self-check: recorded visor is alive but the started list has $n" >&2
+      return 1
+    fi
     return 0
   fi
-  if recorded_visor_alive; then
-    stop_visor
+  if recorded_visor_alive || (( n > 0 )); then
+    if ! stop_visor; then
+      echo "refusing to unlink companion.lock while a harness visor is still running" >&2
+      return 1
+    fi
   fi
-  if recorded_visor_alive; then
-    echo "refusing to remove visor sockets while pid $(read_state visor.pid) is alive" >&2
+  n=$(count_live_visors)
+  if recorded_visor_alive || (( n > 0 )); then
+    echo "refusing to unlink companion.lock while a harness visor is still running" >&2
     return 1
   fi
   mkdir -p "$RUNTIME" "$CONFIG"
@@ -737,6 +874,11 @@ start_visor() {
           return 1
         fi
         echo "visor $CONTROL_SOCK"
+        n=$(count_live_visors)
+        if (( n != 1 )); then
+          echo "self-check: $n harness visors are running after start" >&2
+          return 1
+        fi
         return 0
       fi
     fi
@@ -876,7 +1018,7 @@ window_origin() {
 uinput_cmd() {
   printf '%s\n' "$*" >&"$UINPUT_FD"
   local ack
-  IFS= read -r -t 2 ack <&"$UINPUT_FD" || die "uinput did not answer: $*"
+  IFS= read -r -t 2 ack <&"$UINPUT_OUT" || die "uinput did not answer: $*"
   if [[ $ack != ok ]]; then
     die "uinput $* -> $ack"
   fi
@@ -1291,37 +1433,33 @@ start_uinput() {
     echo "uinput: /dev/uinput is missing after modprobe. Physical input is not faked with XTEST." >&2
     return 1
   fi
-  # The helper runs as root and only creates devices. /dev/uinput and the
-  # event nodes keep the mode udev gave them.
+  assert_uinput_mode || return 1
+  # The helper runs as root with stdin as the only command channel. It does
+  # not listen, and it does not change device modes.
   local helper=$root/ci/display/uinput.py
-  allow_write "$DISPLAY_LOG_DIR/uinput.ready" "$DISPLAY_LOG_DIR/uinput.err"
-  sudo -n python3 -u "$helper" \
-    >"$DISPLAY_LOG_DIR/uinput.ready" 2>"$DISPLAY_LOG_DIR/uinput.err" &
-  local launcher=$!
+  allow_write "$DISPLAY_LOG_DIR/uinput.err"
+  coproc UINPUT_PROC {
+    sudo -n python3 -u "$helper" 2>"$DISPLAY_LOG_DIR/uinput.err"
+  }
+  UINPUT_OUT=${UINPUT_PROC[0]}
+  UINPUT_FD=${UINPUT_PROC[1]}
+  local launcher=$UINPUT_PROC_PID
   local py_bin
   py_bin=$(command -v python3)
   note_started "$launcher" "$(command -v sudo)"
   write_state uinput.launcher "$launcher"
-  local i line py="" expected
-  for i in $(seq 1 50); do
-    if [[ -s $DISPLAY_LOG_DIR/uinput.ready ]]; then
-      line=$(head -n 1 "$DISPLAY_LOG_DIR/uinput.ready")
-      if [[ $line == ready* ]]; then
-        UINPUT_PORT=$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<<"$line")
-        UINPUT_POINTER=$(sed -n 's/.*pointer=\([^ ]*\).*/\1/p' <<<"$line")
-        UINPUT_KEYBOARD=$(sed -n 's/.*keyboard=\([^ ]*\).*/\1/p' <<<"$line")
-        break
-      fi
-    fi
-    if ! kill -0 "$launcher" 2>/dev/null; then
-      echo "uinput helper exited" >&2
-      cat "$DISPLAY_LOG_DIR/uinput.err" >&2 || true
-      return 1
-    fi
-    sleep 0.1
-  done
-  if [[ -z ${UINPUT_PORT:-} ]]; then
+  local line="" py="" expected
+  if ! IFS= read -r -t 8 line <&"$UINPUT_OUT"; then
     echo "uinput helper did not become ready" >&2
+    cat "$DISPLAY_LOG_DIR/uinput.err" >&2 || true
+    return 1
+  fi
+  if [[ $line == ready\ pointer=* ]]; then
+    UINPUT_POINTER=$(sed -n 's/.*pointer=\([^ ]*\).*/\1/p' <<<"$line")
+    UINPUT_KEYBOARD=$(sed -n 's/.*keyboard=\([^ ]*\).*/\1/p' <<<"$line")
+  fi
+  if [[ -z ${UINPUT_POINTER:-} || -z ${UINPUT_KEYBOARD:-} ]]; then
+    echo "uinput helper did not become ready: $line" >&2
     cat "$DISPLAY_LOG_DIR/uinput.err" >&2 || true
     return 1
   fi
@@ -1338,11 +1476,10 @@ start_uinput() {
     echo "uinput helper is up but its python pid was not identified" >&2
     return 1
   fi
-  write_state uinput.port "$UINPUT_PORT"
   write_state uinput.pointer "$UINPUT_POINTER"
   write_state uinput.keyboard "$UINPUT_KEYBOARD"
   sudo -n udevadm settle 2>/dev/null || true
-  local node key mode
+  local node key mode i
   for key in uinput.pointer uinput.keyboard; do
     node=$(read_state "$key")
     for i in $(seq 1 30); do
@@ -1359,7 +1496,6 @@ start_uinput() {
     fi
     echo "uinput node $node mode $mode (not changed)"
   done
-  exec {UINPUT_FD}<>/dev/tcp/127.0.0.1/"$UINPUT_PORT"
   echo "uinput pointer=$UINPUT_POINTER keyboard=$UINPUT_KEYBOARD"
 }
 
@@ -2070,7 +2206,7 @@ run_x11() {
       continue
     fi
     case $name in
-      uinput-key-pauses-type | held-release | stop-resume-during-type) limit=60 ;;
+      uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
       auto-resume) limit=30 ;;
       key-down-detects) limit=20 ;;
       *) limit=45 ;;
@@ -2260,6 +2396,7 @@ run_wayland() {
     fi
     case $name in
       portal-libei) run_named "$name" 15 scenario_portal_libei_placeholder ;;
+      other-user-cannot-drive) run_named "$name" 60 "scenario_${name//-/_}" ;;
       *) run_named "$name" 45 "scenario_${name//-/_}" ;;
     esac
     ran=$((ran + 1))
@@ -2278,6 +2415,7 @@ usage() {
 
 main() {
   remember_uinput
+  assert_uinput_mode || die "/dev/uinput mode is not the private mode recorded at start"
   local kind=${1:-}
   local only=${2:-}
   case $kind in

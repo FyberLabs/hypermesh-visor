@@ -5,8 +5,8 @@ These are ordinary evdev devices. Xorg (libinput or evdev) reads them as
 slave devices. They are not the XTEST pointer or keyboard, so the companion
 can treat their events as a person at the machine.
 
-The process stays up so the devices stay alive. One TCP client on
-127.0.0.1 sends line commands:
+The process stays up so the devices stay alive. The harness is the only
+writer on stdin. There is no socket. Commands are lines:
 
     rel DX DY
     click
@@ -14,11 +14,13 @@ The process stays up so the devices stay alive. One TCP client on
     up
     key F12|A|LEFTCTRL|LEFTSHIFT
     quit
+
+A closed stdin is the same as quit: the devices are destroyed and the
+process exits.
 """
 
 import ctypes
 import os
-import socket
 import struct
 import sys
 import time
@@ -241,36 +243,31 @@ def main():
             f"uinput: device nodes did not appear (pointer={pointer_node}, keyboard={keyboard_node})",
             file=sys.stderr,
         )
+        destroy(pointer)
+        destroy(keyboard)
         return 1
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", 0))
-    server.listen(1)
-    port = server.getsockname()[1]
     print(
-        f"ready port={port} pointer={pointer_node} keyboard={keyboard_node}",
+        f"ready pointer={pointer_node} keyboard={keyboard_node}",
         flush=True,
     )
-    conn, _addr = server.accept()
-    conn_file = conn.makefile("rwb", buffering=0)
     try:
         while True:
-            raw = conn_file.readline()
-            if not raw:
-                break
+            raw = sys.stdin.readline()
+            if raw == "":
+                return 0
             try:
-                result = handle(pointer, keyboard, raw.decode())
+                result = handle(pointer, keyboard, raw)
             except Exception as err:
                 result = f"err {err}"
             if result == "quit":
-                conn_file.write(b"ok\n")
-                break
-            conn_file.write((result + "\n").encode())
+                sys.stdout.write("ok\n")
+                sys.stdout.flush()
+                return 0
+            sys.stdout.write(result + "\n")
+            sys.stdout.flush()
     finally:
-        conn.close()
         destroy(pointer)
         destroy(keyboard)
-    return 0
 
 
 if __name__ == "__main__":
