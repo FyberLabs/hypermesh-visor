@@ -217,6 +217,12 @@ fn write_value(dir: &Path, key: &str, value: &str) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// File and default resume seconds, with no process override.
+    /// [`automation_resume_secs`] also reads `HYPERMESH_AUTOMATION_RESUME_SECS`.
+    fn resume_secs_on_disk(dir: &Path) -> u64 {
+        resume_secs_from(None, read_u64(dir, RESUME_AFTER, DEFAULT_RESUME_AFTER_SECS))
+    }
+
     #[test]
     fn eyes_follow_defaults_off_and_round_trips() {
         let dir =
@@ -234,11 +240,11 @@ mod tests {
         assert!(bug_cursor(&dir));
         assert!(!eyes_follow_pointer(&dir));
         assert_eq!(sleep_after_secs(&dir), DEFAULT_SLEEP_AFTER_SECS);
-        assert_eq!(automation_resume_secs(&dir), DEFAULT_RESUME_AFTER_SECS);
+        assert_eq!(resume_secs_on_disk(&dir), DEFAULT_RESUME_AFTER_SECS);
         set_sleep_after_secs(&dir, 60).unwrap();
         set_automation_resume_secs(&dir, 30).unwrap();
         assert_eq!(sleep_after_secs(&dir), 60);
-        assert_eq!(automation_resume_secs(&dir), 30);
+        assert_eq!(resume_secs_on_disk(&dir), 30);
         assert!(bug_cursor(&dir));
         assert!(!upgrading_notice(&dir));
         fs::write(dir.join("companion-notice"), "upgrading\n").unwrap();
@@ -258,7 +264,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(sleep_after_secs(&dir), 1_800);
-        assert_eq!(automation_resume_secs(&dir), 600);
+        assert_eq!(resume_secs_on_disk(&dir), 600);
         assert!(bug_cursor(&dir));
         assert_eq!(DEFAULT_RESUME_AFTER_SECS, 120);
         assert_eq!(resume_secs_override(None), None);

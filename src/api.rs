@@ -75,7 +75,8 @@ pub struct AppState {
 }
 
 /// A running automation pauses when the companion socket has not polled
-/// within this long. `HYPERMESH_COMPANION_POLL_MS` overrides it (200–60000).
+/// within this long. The daemon applies `HYPERMESH_COMPANION_POLL_MS`
+/// (200–60000) at startup. Tests use this constant or an explicit duration.
 pub const COMPANION_POLL_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn companion_poll_timeout_from(value: Option<&str>) -> Duration {
@@ -172,10 +173,16 @@ impl AppState {
             focus_refreshing: Arc::new(AtomicBool::new(false)),
             instance: automation::fresh_instance(),
             bindings: Mutex::new(BindingCache::default()),
-            companion_poll_timeout: companion_poll_timeout_from(
-                std::env::var("HYPERMESH_COMPANION_POLL_MS").ok().as_deref(),
-            ),
+            companion_poll_timeout: COMPANION_POLL_TIMEOUT,
         }
+    }
+
+    /// Process boundary for `HYPERMESH_COMPANION_POLL_MS`. Library tests do
+    /// not call this, so a harness value cannot shorten their watchdog window.
+    pub fn apply_companion_poll_env(&mut self) {
+        self.companion_poll_timeout = companion_poll_timeout_from(
+            std::env::var("HYPERMESH_COMPANION_POLL_MS").ok().as_deref(),
+        );
     }
 
     fn close_all(&self) {

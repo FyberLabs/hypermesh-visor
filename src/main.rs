@@ -74,7 +74,10 @@ fn main() -> ExitCode {
         answers: options.answers,
     };
     let state = match AppState::with_orchestrator(desktop, Duration::from_millis(250), config) {
-        Ok(state) => Arc::new(state),
+        Ok(mut state) => {
+            state.apply_companion_poll_env();
+            Arc::new(state)
+        }
         Err(message) => {
             eprintln!("hypermesh-visor: {message}");
             return ExitCode::from(2);
