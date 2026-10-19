@@ -43,6 +43,8 @@ XEV_AT=0
 FAILED=()
 PHYSICAL_DRIVER=
 BASE=
+CONTROL_SOCK=
+TCP_BASE=
 SID=
 UINPUT_FD=
 UINPUT_PID=
@@ -179,13 +181,18 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Control API. The companion socket stays on socket_action.
+curl_visor() {
+  command curl --unix-socket "$CONTROL_SOCK" "$@"
+}
+
 http_code() {
   local out=$1 method=$2 url=$3 body=${4:-}
   if [[ -n $body ]]; then
-    curl --max-time 20 -sS -o "$HTTP_BODY" -w '%{http_code}' -X "$method" "$url" \
+    curl_visor --max-time 20 -sS -o "$HTTP_BODY" -w '%{http_code}' -X "$method" "$url" \
       -H 'content-type: application/json' --data-binary "$body" >"$out"
   else
-    curl --max-time 20 -sS -o "$HTTP_BODY" -w '%{http_code}' -X "$method" "$url" >"$out"
+    curl_visor --max-time 20 -sS -o "$HTTP_BODY" -w '%{http_code}' -X "$method" "$url" >"$out"
   fi
 }
 
@@ -199,12 +206,12 @@ spawn_request() {
 }
 
 phase() {
-  curl --max-time 5 -fsS "$BASE/companion" \
+  curl_visor --max-time 5 -fsS "$BASE/companion" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["automation"]["phase"])'
 }
 
 injecting() {
-  curl --max-time 5 -fsS "$BASE/companion" \
+  curl_visor --max-time 5 -fsS "$BASE/companion" \
     | python3 -c 'import json,sys; print(str(json.load(sys.stdin)["automation"]["injecting"]).lower())'
 }
 
@@ -305,30 +312,62 @@ PY
 
 open_session() {
   local body='{"purpose":"display harness","recipes":[],"agent":{"name":"display","instructions":""},"skills":[]}'
-  SID=$(curl --max-time 10 -fsS -X POST "$BASE/session" \
+  SID=$(curl_visor --max-time 10 -fsS -X POST "$BASE/session" \
     -H 'content-type: application/json' -d "$body" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
   echo "session $SID"
 }
 
+stop_visor() {
+  local pid=${VISOR_PID:-}
+  signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" "$pid" || true
+  local i
+  for i in $(seq 1 30); do
+    if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null; then
+      break
+    fi
+    sleep 0.1
+  done
+  VISOR_PID=
+}
+
+# `tcp` also opens the opt-in loopback port. The control socket is always used
+# for the harness requests above.
 start_visor() {
-  if [[ -n ${VISOR_PID:-} ]] && pid_matches_exe "$VISOR_PID" "$VISOR_BIN" && kill -0 "$VISOR_PID" 2>/dev/null; then
+  local tcp=${1:-}
+  if [[ -z $tcp && -n ${VISOR_PID:-} ]] && pid_matches_exe "$VISOR_PID" "$VISOR_BIN" && kill -0 "$VISOR_PID" 2>/dev/null; then
     return 0
   fi
   mkdir -p "$RUNTIME" "$CONFIG"
   chmod 0700 "$RUNTIME" "$CONFIG"
-  rm -f "$RUNTIME/companion.sock" "$RUNTIME/companion.lock"
-  "$VISOR_BIN" --listen 127.0.0.1:0 \
+  rm -f "$RUNTIME/control.sock" "$RUNTIME/companion.sock" "$RUNTIME/companion.lock" "$RUNTIME/api.token"
+  local -a args=()
+  if [[ $tcp == tcp ]]; then
+    args=(--tcp --listen 127.0.0.1:0)
+  fi
+  "$VISOR_BIN" "${args[@]}" \
     >"$DISPLAY_LOG_DIR/visor.out" 2>"$DISPLAY_LOG_DIR/visor.err" &
   VISOR_PID=$!
   echo "$VISOR_PID" >"$VISOR_PID_FILE"
   disown "$VISOR_PID" 2>/dev/null || true
-  local i
+  local i line
   for i in $(seq 1 50); do
     if [[ -s $DISPLAY_LOG_DIR/visor.out ]]; then
-      BASE=$(awk '/^listening / { print "http://"$2; exit }' "$DISPLAY_LOG_DIR/visor.out")
-      if [[ -n ${BASE:-} ]]; then
-        echo "visor $BASE"
+      line=$(awk '/^control socket / { print substr($0, 16); exit }' "$DISPLAY_LOG_DIR/visor.out")
+      if [[ -n $line && -S $line ]]; then
+        CONTROL_SOCK=$line
+        BASE=http://localhost
+        if [[ $tcp == tcp ]]; then
+          TCP_BASE=$(awk '/^listening / { print "http://"$2; exit }' "$DISPLAY_LOG_DIR/visor.out")
+          if [[ -z $TCP_BASE ]]; then
+            sleep 0.1
+            continue
+          fi
+        elif grep -q '^listening ' "$DISPLAY_LOG_DIR/visor.out"; then
+          echo "TCP opened without --tcp" >&2
+          return 1
+        fi
+        echo "visor $CONTROL_SOCK"
         return 0
       fi
     fi
@@ -1014,7 +1053,7 @@ scenario_tcp_start_without_poll() {
   http_code "$REQ_DIR/tcp-start.code" POST "$BASE/companion/automation" '{"action":"start"}'
   local code
   code=$(cat "$REQ_DIR/tcp-start.code")
-  [[ $code == 503 ]] || die "tcp start returned $code ($(cat "$HTTP_BODY"))"
+  [[ $code == 503 ]] || die "control-socket start returned $code ($(cat "$HTTP_BODY"))"
   grep -q 'no recent companion poll' "$HTTP_BODY" || die "body $(cat "$HTTP_BODY")"
   [[ $(phase) == off ]] || die "phase became $(phase)"
 }
@@ -1293,6 +1332,122 @@ scenario_auto_resume() {
   echo "idle resume returned to running"
 }
 
+# A second account. sudo --chdir is not permitted, so commands run from /tmp.
+as_guest() {
+  ( cd /tmp && sudo -n -u hm-visor-guest "$@" )
+}
+
+ensure_guest() {
+  if ! id -u hm-visor-guest >/dev/null 2>&1; then
+    sudo useradd --system --no-create-home --shell /usr/sbin/nologin hm-visor-guest
+  fi
+}
+
+assert_no_tcp_listen() {
+  python3 - "$1" <<'PY'
+import os, pathlib, sys
+pid = int(sys.argv[1])
+inodes = set()
+for entry in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+    try:
+        target = os.readlink(entry)
+    except OSError:
+        continue
+    if target.startswith("socket:[") and target.endswith("]"):
+        inodes.add(target[8:-1])
+for name in ("tcp", "tcp6"):
+    path = pathlib.Path("/proc/net") / name
+    if not path.exists():
+        continue
+    for line in path.read_text().splitlines()[1:]:
+        parts = line.split()
+        if len(parts) > 9 and parts[3] == "0A" and parts[9] in inodes:
+            sys.stderr.write(line + "\n")
+            raise SystemExit(1)
+PY
+}
+
+guest_unix_denied() {
+  local sock=$1 err=$REQ_DIR/guest-connect.err rc=0
+  as_guest /usr/bin/python3 - "$sock" >"$err" 2>&1 <<'PY' || rc=$?
+import socket, sys
+client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+try:
+    client.connect(sys.argv[1])
+except OSError as exc:
+    sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
+    raise SystemExit(0)
+sys.stderr.write("connected\n")
+raise SystemExit(1)
+PY
+  [[ $rc -eq 0 ]] || die "guest connected to $sock ($(cat "$err"))"
+  grep -q PermissionError "$err" || die "guest connect to $sock was not EACCES ($(cat "$err"))"
+}
+
+# Last in the list: it restarts the visor with the opt-in port.
+scenario_other_user_cannot_drive() {
+  ensure_guest
+  start_visor || die "visor did not listen"
+  [[ -S $CONTROL_SOCK ]] || die "control socket is not up"
+  [[ -S $RUNTIME/companion.sock ]] || die "companion socket is not up"
+  if grep -q '^listening ' "$DISPLAY_LOG_DIR/visor.out"; then
+    die "TCP opened without --tcp"
+  fi
+  assert_no_tcp_listen "$VISOR_PID" || die "the visor is listening on TCP"
+  guest_unix_denied "$CONTROL_SOCK"
+  guest_unix_denied "$RUNTIME/companion.sock"
+  local dir_err=$REQ_DIR/guest-dir.err dir_rc=0
+  as_guest /usr/bin/python3 - "$RUNTIME" >"$dir_err" 2>&1 <<'PY' || dir_rc=$?
+import os, sys
+try:
+    os.listdir(sys.argv[1])
+except PermissionError as exc:
+    sys.stderr.write(f"{type(exc).__name__}: {exc}\n")
+    raise SystemExit(0)
+raise SystemExit(1)
+PY
+  [[ $dir_rc -eq 0 ]] || die "guest listed the runtime directory ($(cat "$dir_err"))"
+
+  stop_visor
+  start_visor tcp || die "visor did not open the opt-in port"
+  local token_file=$RUNTIME/api.token token mode
+  token=$(tr -d '[:space:]' <"$token_file")
+  mode=$(stat -c '%a' "$token_file")
+  [[ $mode == 600 && ${#token} -eq 64 ]] || die "api.token mode=$mode len=${#token}"
+  local token_err=$REQ_DIR/guest-token.err
+  if as_guest /bin/cat "$token_file" >/dev/null 2>"$token_err"; then
+    die "guest read api.token"
+  fi
+  grep -qi 'permission denied' "$token_err" || die "guest token read ($(cat "$token_err"))"
+
+  local path code
+  for path in /session /session/00000000-0000-0000-0000-000000000001/view \
+    /session/00000000-0000-0000-0000-000000000001/mouse \
+    /session/00000000-0000-0000-0000-000000000001/type \
+    /companion/automation /health; do
+    code=$(as_guest /usr/bin/curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+      -X POST "$TCP_BASE$path" -H 'content-type: application/json' -d '{}')
+    [[ $code == 401 ]] || die "guest $path status $code"
+    code=$(as_guest /usr/bin/curl -sS --max-time 5 -o /dev/null -w '%{http_code}' \
+      -X POST "$TCP_BASE$path" -H 'content-type: application/json' \
+      -H 'authorization: Bearer not-the-token' -d '{}')
+    [[ $code == 401 ]] || die "guest $path with a wrong token status $code"
+  done
+  code=$(command curl -sS --max-time 5 -o "$HTTP_BODY" -w '%{http_code}' \
+    -X POST "$TCP_BASE/companion/automation" \
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $token" \
+    -d '{"action":"pause"}')
+  [[ $code == 204 ]] || die "pause with the bearer returned $code ($(cat "$HTTP_BODY"))"
+  code=$(command curl -sS --max-time 5 -o "$HTTP_BODY" -w '%{http_code}' \
+    -X POST "$TCP_BASE/companion/automation" \
+    -H 'content-type: application/json' \
+    -H "authorization: Bearer $token" \
+    -d '{"action":"resume"}')
+  [[ $code == 403 ]] || die "bearer resume returned $code ($(cat "$HTTP_BODY"))"
+  echo "other user cannot drive the control socket, the companion socket, or the opted-in port"
+}
+
 X11_SCENARIOS=(
   key-down-detects
   tcp-start-without-poll
@@ -1306,11 +1461,13 @@ X11_SCENARIOS=(
   watchdog-pauses
   held-release
   auto-resume
+  other-user-cannot-drive
 )
 
 WAYLAND_SCENARIOS=(
   wayland-refuses-automation
   portal-libei
+  other-user-cannot-drive
 )
 
 require_scenario() {
