@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -555,6 +556,35 @@ pub(crate) fn companion_router(state: Arc<AppState>) -> Router {
     routes(state, true)
 }
 
+/// Opt-in TCP router. The bearer check runs before routing, so a missing or
+/// wrong token is 401 on every path, including paths with no handler. The
+/// inner routes are not the companion link: the token cannot lift a pause.
+fn tcp_router(state: Arc<AppState>, token: String) -> Router {
+    let api = router(state).fallback(|| async { StatusCode::NOT_FOUND });
+    let guarded = tower::ServiceBuilder::new()
+        .layer(middleware::from_fn(move |request, next| {
+            let token = token.clone();
+            async move { reject_without_bearer(token, request, next).await }
+        }))
+        .service(api);
+    Router::new().fallback_service(guarded)
+}
+
+async fn reject_without_bearer(token: String, request: Request<Body>, next: Next) -> Response {
+    let header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if !crate::companion_sock::bearer_matches(&token, header) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 #[derive(Clone, Copy)]
 struct CompanionLink(bool);
 
@@ -584,59 +614,100 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()> {
+/// `tcp` is the opt-in loopback listener. `None` does not bind a port.
+/// The control API is always on `control.sock`. The companion socket stays
+/// a separate listener and is the only one that can lift a user pause.
+pub async fn serve(tcp: Option<SocketAddr>, state: Arc<AppState>) -> std::io::Result<()> {
     let runtime = crate::companion_sock::runtime_dir()?;
     crate::companion_sock::prepare_dir(&runtime)?;
-    let socket_path = crate::companion_sock::socket_file(&runtime);
+    let companion_path = crate::companion_sock::socket_file(&runtime);
+    let control_path = crate::companion_sock::control_socket_file(&runtime);
     // Held until this function returns, including across the socket replace
     // below. A second process fails here and does not unlink the live socket.
     let _runtime_lock = crate::companion_sock::lock_runtime(&runtime)?;
-    // A second process must not unlink a live companion socket and then fail
-    // the TCP bind, leaving the running visor unreachable.
-    if crate::companion_sock::unix_socket_listening(&socket_path) {
+    // A second process must not unlink a live socket and then fail the TCP
+    // bind, leaving the running visor unreachable.
+    if crate::companion_sock::unix_socket_listening(&companion_path)
+        || crate::companion_sock::unix_socket_listening(&control_path)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             "visor already running",
         ));
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let listener_sock = crate::companion_sock::bind(&runtime).await?;
-    let local = listener.local_addr()?;
-    println!("listening {local}");
-    println!("companion socket {}", socket_path.display());
+    // Bind TCP before replacing a stale socket file. A failed port bind
+    // leaves the previous sockets in place.
+    let tcp_listener = match tcp {
+        Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
+        None => None,
+    };
+    let companion_listener = crate::companion_sock::bind(&runtime).await?;
+    let control_listener = crate::companion_sock::bind_control(&runtime).await?;
+    let token = if tcp_listener.is_some() {
+        Some(crate::companion_sock::write_api_token(&runtime)?)
+    } else {
+        crate::companion_sock::remove_api_token(&runtime)?;
+        None
+    };
+    println!("control socket {}", control_path.display());
+    println!("companion socket {}", companion_path.display());
+    if let Some(listener) = tcp_listener.as_ref() {
+        println!("listening {}", listener.local_addr()?);
+    }
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    let socket_state = Arc::clone(&state);
+    let companion_app = companion_router(Arc::clone(&state));
     tokio::spawn(async move {
-        if let Err(err) = crate::companion_sock::accept_loop(listener_sock, socket_state).await {
+        if let Err(err) =
+            crate::companion_sock::accept_loop(companion_listener, companion_app, "companion").await
+        {
             eprintln!("hypermesh-visor: companion socket closed: {err}");
         }
     });
-    spawn_companion_watch(Arc::clone(&state));
-    // The bearer file from earlier builds is not a credential anymore.
-    let _ = std::fs::remove_file(state.mcp_dir.join("companion.token"));
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let app = router(Arc::clone(&state));
-    // The task is polled immediately. Waiting for the signal before the
-    // first poll leaves the listen socket open and never accepts.
-    let mut server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                let _ = shutdown_rx.wait_for(|stop| *stop).await;
-            })
-            .await
-    });
-    tokio::select! {
-        result = &mut server => {
-            return match result {
-                Ok(server_result) => server_result,
-                Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
-            };
+    let control_app = router(Arc::clone(&state));
+    tokio::spawn(async move {
+        if let Err(err) =
+            crate::companion_sock::accept_loop(control_listener, control_app, "control").await
+        {
+            eprintln!("hypermesh-visor: control socket closed: {err}");
         }
-        _ = shutdown_signal() => {}
+    });
+    spawn_companion_watch(Arc::clone(&state));
+    // Older builds wrote this name under the config dir. It is not a credential.
+    let _ = std::fs::remove_file(state.mcp_dir.join("companion.token"));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut server = match (tcp_listener, token) {
+        (Some(listener), Some(token)) => {
+            let app = tcp_router(Arc::clone(&state), token);
+            let mut shutdown_rx = shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(async move {
+                        let _ = shutdown_rx.wait_for(|stop| *stop).await;
+                    })
+                    .await
+            }))
+        }
+        _ => None,
+    };
+    if let Some(server) = server.as_mut() {
+        tokio::select! {
+            result = server => {
+                return match result {
+                    Ok(server_result) => server_result,
+                    Err(err) => Err(std::io::Error::new(std::io::ErrorKind::Other, err.to_string())),
+                };
+            }
+            _ = shutdown_signal() => {}
+        }
+    } else {
+        shutdown_signal().await;
     }
     // The deadline starts when the signal arrives, not when the process does.
     state.close_all();
     let _ = shutdown_tx.send(true);
+    let Some(server) = server else {
+        return Ok(());
+    };
     let outcome = wait_bounded(automation::SHUTDOWN_DEADLINE, server).await;
     match outcome {
         ShutdownWait::Finished(Ok(result)) => result,
@@ -2384,7 +2455,9 @@ mod tests {
             axum::serve(listener, router(tcp_state)).await.unwrap();
         });
         tokio::spawn(async move {
-            let _ = crate::companion_sock::accept_loop(unix, sock_state).await;
+            let _ =
+                crate::companion_sock::accept_loop(unix, companion_router(sock_state), "companion")
+                    .await;
         });
         (addr, dir)
     }
@@ -2617,6 +2690,128 @@ mod tests {
         assert_eq!(
             companion_poll_timeout_from(Some(" 60000 ")),
             Duration::from_secs(60)
+        );
+    }
+
+    async fn spawn_with_bearer(token: &str) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        state.companion_poll_timeout = COMPANION_POLL_TIMEOUT;
+        let app = tcp_router(Arc::new(state), token.to_string());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn status_with(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+        authorization: Option<&str>,
+    ) -> u16 {
+        let extra = authorization.map(|value| ("authorization", value));
+        let response = dispatch(addr, method, path, body, extra).await;
+        response.status().as_u16()
+    }
+
+    #[tokio::test]
+    async fn tcp_without_the_bearer_is_401_on_every_route_and_cannot_lift_a_pause() {
+        let token = "a".repeat(64);
+        let addr = spawn_with_bearer(&token).await;
+        let routes = [
+            ("GET", "/health"),
+            ("GET", "/no-such-route"),
+            ("GET", "/companion"),
+            ("POST", "/companion/automation"),
+            ("POST", "/companion/interrupt"),
+            ("POST", "/companion/notice"),
+            ("POST", "/session"),
+            ("DELETE", "/session/00000000-0000-0000-0000-000000000001"),
+            ("POST", "/session/00000000-0000-0000-0000-000000000001/view"),
+            ("GET", "/session/00000000-0000-0000-0000-000000000001/watch"),
+            (
+                "GET",
+                "/session/00000000-0000-0000-0000-000000000001/feed/snapshot",
+            ),
+            ("GET", "/session/00000000-0000-0000-0000-000000000001/feed"),
+            (
+                "GET",
+                "/session/00000000-0000-0000-0000-000000000001/listen",
+            ),
+            (
+                "POST",
+                "/session/00000000-0000-0000-0000-000000000001/mouse",
+            ),
+            ("POST", "/session/00000000-0000-0000-0000-000000000001/type"),
+            ("POST", "/prompt"),
+            ("GET", "/audit"),
+            ("GET", "/mcp-audit"),
+            (
+                "POST",
+                "/session/00000000-0000-0000-0000-000000000001/stream",
+            ),
+            ("GET", "/session/00000000-0000-0000-0000-000000000001/inbox"),
+            ("GET", "/session/00000000-0000-0000-0000-000000000001/mcp"),
+            (
+                "POST",
+                "/session/00000000-0000-0000-0000-000000000001/mcp/call",
+            ),
+        ];
+        for (method, path) in routes {
+            let missing = status_with(addr, method, path, Some("{}".into()), None).await;
+            assert_eq!(missing, 401, "{method} {path} without a token");
+            let wrong = status_with(
+                addr,
+                method,
+                path,
+                Some("{}".into()),
+                Some("Bearer not-the-token"),
+            )
+            .await;
+            assert_eq!(wrong, 401, "{method} {path} with the wrong token");
+        }
+
+        let bearer = format!("Bearer {token}");
+        let (status, body) = {
+            let response = dispatch(
+                addr,
+                "POST",
+                "/session",
+                Some(open_body(serde_json::json!([]))),
+                Some(("authorization", bearer.as_str())),
+            )
+            .await;
+            let status = response.status().as_u16();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, bytes)
+        };
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 201, "{text}");
+        let paused = status_with(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"pause"}"#.into()),
+            Some(bearer.as_str()),
+        )
+        .await;
+        assert_eq!(paused, 204, "pause stays available with the token");
+        let resumed = status_with(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"resume"}"#.into()),
+            Some(bearer.as_str()),
+        )
+        .await;
+        assert_eq!(resumed, 403, "the bearer must not lift a user pause");
+        let health = status_with(addr, "GET", "/health", None, Some(bearer.as_str())).await;
+        assert_eq!(
+            health, 404,
+            "an unknown path with the token is not a handler"
         );
     }
 

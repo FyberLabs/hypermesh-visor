@@ -485,6 +485,16 @@ pub fn runtime_dir_from(
     Ok(dir)
 }
 
+pub fn control_socket_path() -> Result<PathBuf, &'static str> {
+    let dir = runtime_dir_from(
+        std::env::var("HYPERMESH_RUNTIME_DIR").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )?;
+    Ok(dir.join("control.sock"))
+}
+
 fn socket_path() -> Option<PathBuf> {
     match runtime_dir_from(
         std::env::var("HYPERMESH_RUNTIME_DIR").ok().as_deref(),

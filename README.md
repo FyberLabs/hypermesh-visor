@@ -6,7 +6,7 @@ Purpose, recipes, agent, skills, and secrets are sent when the session opens. On
 
 Optional `mcp_profile` on `POST /session` attaches local MCP *tool* servers from `~/.config/hypermesh/mcp.json` and `mcp-profiles.json` (same files as `hypermesh mcp`). Stdio and HTTP/SSE servers are attached (`tools/list` on connect). Closing the session kills stdio children and drops HTTP clients. Project-local `.hypermesh/mcp.json` or `.cursor/mcp.json` (cwd walk, or `HYPERMESH_MCP_PROJECT`) is merged under user config. A profile with `gateway: true` attaches only `docker-gateway`. `GET /session/{id}/mcp` returns the attached profile, servers (with `healthy`), and tools. `GET /companion` includes prefer-MCP fields: `mode` (`mcp:<id>` when a healthy binding matches the focused app, else the desktop verb), `mcp`, `prefer_mcp`, and `focused`. Focused-app detection uses X11 `WM_CLASS` and best-effort Wayland probes (Hyprland `hyprctl`, Sway `swaymsg`, KWin `qdbus`). Bindings live in `mcp-bindings.json`. `POST /session/{id}/mcp/call` invokes a tool with `approve`/`deny`; `GET /mcp-audit` lists server, tool, decision, and outcome only (never env or arguments). Vault locator is `server/tool` in `mcp.json` (role B — separate from session tool attach).
 
-`hypermesh-desktop-mcp` is an inverse stdio MCP that wraps visor view/mouse/type for external agents (`HYPERMESH_VISOR_URL`, `HYPERMESH_SESSION_ID`).
+`hypermesh-desktop-mcp` is an inverse stdio MCP that wraps visor view/mouse/type for external agents. It uses the control socket by default. `HYPERMESH_VISOR_URL` selects the opt-in TCP listener, and `HYPERMESH_SESSION_ID` names the session.
 
 ## Linux build and tests
 
@@ -15,10 +15,10 @@ Stable Rust. Tests do not need a display server.
 ```bash
 cargo test
 cargo build --release
-./target/release/hypermesh-visor --listen 127.0.0.1:9847
+./target/release/hypermesh-visor
 ```
 
-`--listen` must be a loopback address. Run the daemon as the logged-in user, not as root. It prints `listening 127.0.0.1:9847` when the socket is up.
+Run the daemon as the logged-in user, not as root. It prints `control socket` and `companion socket` when those sockets are up. TCP stays closed unless `--tcp` or `HYPERMESH_TCP=1` is set. `--listen` then sets that loopback port (default `127.0.0.1:9847`).
 
 ## Release packages
 
@@ -101,7 +101,7 @@ While paused, clicking the companion bug asks whether to continue. The click tha
 | Stop during an injection | The epoch bumps and the phase stays until the call ends. A later pause stays paused. A stop posted after that pause ends `off`. A start or resume during the call is in that same sequence, so the newest control remains. |
 | Session close during an injection | The poll does not reset the gate. The close is applied when the call ends, and only to the session it named. |
 | Late companion poll | A gap that already exceeded the timeout pauses, and that poll is not stored as a new heartbeat. |
-| New running stretch | A companion-socket transition from off or paused into running grants one grace window. A TCP transition does not. A TCP start while already running does not move that clock. Only a companion-socket poll extends it. |
+| New running stretch | A companion-socket transition from off or paused into running grants one grace window. A control-socket or TCP transition does not. A control-socket or TCP start while already running does not move that clock. Only a companion-socket poll extends it. |
 | Physical input, then an off poll | Queued XInput is judged against the phase already on screen. A pause from that input is still posted when the new snapshot is off. |
 | Physical input before the first running snapshot | That queued event is also judged against the incoming phase. An off-to-running transition in the same frame still pauses. |
 | Physical input, then a newer running snapshot | The same event is classified again when the snapshot is running, including when that snapshot lifted the pause in this frame. The companion pauses that stretch instead of showing running until the pause post returns. |
@@ -110,17 +110,21 @@ Phase, epoch, the inject marker, the quiet-poll clock, and the driving session l
 
 | From | To | What happens | Who |
 | --- | --- | --- | --- |
-| off | running | `start` on TCP needs a companion-socket poll inside the watchdog window, or it returns 503 `no recent companion poll` and does not grant a grace. A companion-socket start grants one grace. `begin-inject` arms one window when none is recorded | companion socket, or TCP after a fresh companion poll when the gate is not paused; mouse and type are the TCP session |
+| off | running | `start` on the control socket or on opted-in TCP needs a companion-socket poll inside the watchdog window, or it returns 503 `no recent companion poll` and does not grant a grace. A companion-socket start grants one grace. `begin-inject` arms one window when none is recorded | companion socket, or the control socket / opted-in TCP after a fresh companion poll when the gate is not paused |
 | off | paused | pause latches | companion socket |
 | running | paused | pause, a late companion poll, the watchdog, or a missing keyboard | companion socket, or the watchdog |
-| running | off | stop when nothing is injecting, or the driving session closes | companion socket, TCP session, or close |
-| running | off, after the call | stop or session close during an injection, replayed in the order they arrived. A newer stop ends off. A newer pause stays paused. A close applies only to the session and generation it named. A missing-keyboard report pauses only a running phase, so it does not turn that off back into paused | TCP session, companion socket, or close |
-| running or paused, during an injection | running, after the call | `start` or `resume` joins that sequence before any phase no-op. Admitted against the phase earlier controls would leave, a companion start or resume after a stop stays running, and a resume after a pause stays running. A TCP start or resume that would enter `running` needs a companion poll inside the window, or it returns 503 and is not queued. A missing keyboard still ends paused | companion socket, or TCP after a fresh companion poll |
+| running | off | stop when nothing is injecting, or the driving session closes | companion socket, control socket, opted-in TCP, or close |
+| running | off, after the call | stop or session close during an injection, replayed in the order they arrived. A newer stop ends off. A newer pause stays paused. A close applies only to the session and generation it named. A missing-keyboard report pauses only a running phase, so it does not turn that off back into paused | control socket, opted-in TCP, companion socket, or close |
+| running or paused, during an injection | running, after the call | `start` or `resume` joins that sequence before any phase no-op. Admitted against the phase earlier controls would leave, a companion start or resume after a stop stays running, and a resume after a pause stays running. A control-socket or TCP start or resume that would enter `running` needs a companion poll inside the window, or it returns 503 and is not queued. A missing keyboard still ends paused | companion socket, or the control socket / opted-in TCP after a fresh companion poll |
 | paused | running | resume or start | companion socket |
 | paused | off | stop, or resume with no session left | companion socket |
 | any | off | shutdown bumps the epoch, waits about 2 seconds for the injection lock, and the process exits within about 5 seconds | close |
 
-Lifting a pause is reserved for the companion process running as the same user. The visor listens on `$XDG_RUNTIME_DIR/hypermesh/companion.sock` (directory mode 0700, socket mode 0600). `HYPERMESH_RUNTIME_DIR` overrides that directory. When `XDG_RUNTIME_DIR` is unset, both sides use `$XDG_STATE_HOME/hypermesh/run`, or `~/.local/state/hypermesh/run`. The directory is created mode 0700 and the owner is checked. A path that does not fit in `sun_path` is refused. A second visor leaves a live socket in place and exits with `visor already running`. The visor holds an exclusive lock on `companion.lock` in that directory for its lifetime, so a second process cannot replace the socket. It binds the TCP port before it replaces a stale socket file. The companion polls and posts there, and both ends check `SO_PEERCRED` before any request bytes are written or read. A peer uid that is not the current user is dropped. A transient accept error, such as too many open files, is retried with backoff. A dead listener still stops the loop. `resume`, and `start` or `stop` while the gate is paused, are accepted only on that socket. The same actions on the loopback TCP port are refused, including with a header, and deleting the driving session does not clear the pause. Pause itself stays on TCP. `start` while the gate is off stays on TCP when a companion-socket poll is inside the watchdog window, and returns 503 `no recent companion poll` otherwise. Session tools (`view`, `mouse`, `type`, and the desktop MCP tools) stay on TCP and cannot lift a pause. A different OS user cannot connect. A process running as the same user can, because it is the same user; there is no separate bearer token to steal from a listener on the TCP port. Windows and macOS need the same boundary with a named-pipe ACL and an XPC or peer audit token, tracked in issue #18. `companion.toml` is TOML: `sleep_after_secs = 1_800` and `automation_resume_secs = 600 # ten minutes` are read as written. A write replaces the root key in the parsed table and saves it, so a trailing table keeps its own keys. An invalid value logs a warning and that setting stays at its default.
+Lifting a pause is reserved for the companion process running as the same user. Two sockets share one runtime directory, mode 0700: `$XDG_RUNTIME_DIR/hypermesh` (`HYPERMESH_RUNTIME_DIR`, or `$XDG_STATE_HOME/hypermesh/run`, or `~/.local/state/hypermesh/run`). Each socket is mode 0600. A path that does not fit in `sun_path` is refused. The owner is checked. A second visor leaves a live socket in place and exits with `visor already running`. The visor holds an exclusive lock on `companion.lock` for its lifetime.
+
+`control.sock` is the control API: sessions, view, watch, listen, mouse, type, and start/stop/resume. The visor accepts a connection only when `SO_PEERCRED` uid equals its own uid, and then drops the connection before reading a request. That socket cannot lift a user pause. `companion.sock` is separate. The companion polls and posts there, with the same uid check. `resume`, and `start` or `stop` while the gate is paused, are accepted only on the companion socket. The same actions on the control socket are refused, including with a header, and deleting the driving session does not clear the pause. Pause itself is allowed on the control socket. `start` while the gate is off needs a companion-socket poll inside the watchdog window, and returns 503 `no recent companion poll` otherwise. A transient accept error is retried with backoff. A dead listener still stops the loop.
+
+TCP is off unless `--tcp` or `HYPERMESH_TCP=1` is set. The port is loopback only (`--listen`, default `127.0.0.1:9847`). When TCP is enabled, the visor binds that port before it replaces a stale socket file, writes a new random bearer to `api.token` (mode 0600) in the runtime directory, and rejects every request that does not present it with 401 before any handler runs, including `/health` and unknown paths. The compare does not stop at the first mismatched byte. The bearer has the same privileges as the control socket: it cannot lift a user pause. When TCP is off, that token file is removed. Another OS user cannot connect to either socket and cannot read the token. Loopback alone does not keep that user out, which is why the port is closed unless this opt-in is set. `hypermesh-desktop-mcp`, the `hypermesh` CLI prompt, and `ci/verbs.sh` use the control socket unless `HYPERMESH_VISOR_URL` (or `--visor`) names the TCP base. Windows and macOS need the same boundary with a named-pipe ACL and an XPC or peer audit token, tracked in issue #18. `companion.toml` is TOML: `sleep_after_secs = 1_800` and `automation_resume_secs = 600 # ten minutes` are read as written. A write replaces the root key in the parsed table and saves it, so a trailing table keeps its own keys. An invalid value logs a warning and that setting stays at its default.
 
 Away from an automation the bug cursor stays off unless `bug_cursor` is true.
 
@@ -145,14 +149,15 @@ The public Keycloak client is `hypermesh-native` in realm `controlplane` at `htt
 The window uses X11, including XWayland. It needs `DISPLAY`.
 
 ```bash
-curl -s -X POST http://127.0.0.1:9847/session \
+curl --unix-socket "${XDG_RUNTIME_DIR}/hypermesh/control.sock" \
+  -s -X POST http://localhost/session \
   -H 'content-type: application/json' \
   -d '{"purpose":"look at the desktop","recipes":[],"agent":{"name":"local","instructions":""},"skills":[]}'
 ```
 
 ## Verb checks
 
-`ci/verbs.sh` starts the daemon with `--fixture` and calls view, watch, listen, mouse, and type with fixed HTTP bodies. View and watch must return the frame in `tests/fixtures/view.png.b64`. Listen must return the audio in `tests/fixtures/listen.pcm.b64`. Mouse and type checks read the coordinates, buttons, and keystrokes written by the input path. GitHub Actions runs that script. It does not call a model.
+`ci/verbs.sh` starts the daemon with `--fixture` and calls view, watch, listen, mouse, and type on the control socket. `ci/cross-user.sh` checks that TCP stays closed and that another Linux user cannot drive the desktop. The bodies are the same fixed HTTP requests. View and watch must return the frame in `tests/fixtures/view.png.b64`. Listen must return the audio in `tests/fixtures/listen.pcm.b64`. Mouse and type checks read the coordinates, buttons, and keystrokes written by the input path. GitHub Actions runs that script. It does not call a model.
 
 `GET /session/{id}/feed` is the renter document for that session. It carries the latest desktop snapshot as a handle (`mime`, `seq`) and the terminal or IDE activity the visor already saw: focused app, typed text, named keys, mouse action, MCP server and tool, stream prompts, file names, and secret names. `GET /session/{id}/feed/snapshot` returns the PNG already captured by view or watch. It does not take another screenshot. Secret values and file bytes are not on the feed. The handle and the activity are what s3r.ch stores and shows. The PNG is not written into Gun.
 

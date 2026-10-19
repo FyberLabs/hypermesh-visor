@@ -341,16 +341,38 @@ func (c *Client) PostVisorPrompt(visorBase, sessionID, prompt, model string) ([]
 	if prompt == "" {
 		return nil, fmt.Errorf("prompt is required")
 	}
-	u, err := VisorStreamURL(visorBase, sessionID)
-	if err != nil {
-		return nil, err
-	}
 	payload := visorPromptBody{Kind: "prompt", Prompt: prompt, Model: strings.TrimSpace(model)}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
 	b = append(b, '\n')
+	if strings.TrimSpace(visorBase) == "" {
+		socket, err := ControlSocket()
+		if err != nil {
+			return nil, err
+		}
+		u, err := VisorStreamURL("http://localhost", sessionID)
+		if err != nil {
+			return nil, err
+		}
+		req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-ndjson")
+		req.Header.Set("Accept", "application/x-ndjson")
+		req.Header.Set(HeaderAPIKey, strings.TrimSpace(c.APIKey))
+		client := unixClient(socket)
+		client.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		return finishVisorPrompt(c, client, req)
+	}
+	u, err := VisorStreamURL(visorBase, sessionID)
+	if err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequest(http.MethodPost, u, bytes.NewReader(b))
 	if err != nil {
 		return nil, err
@@ -358,6 +380,9 @@ func (c *Client) PostVisorPrompt(visorBase, sessionID, prompt, model string) ([]
 	req.Header.Set("Content-Type", "application/x-ndjson")
 	req.Header.Set("Accept", "application/x-ndjson")
 	req.Header.Set(HeaderAPIKey, strings.TrimSpace(c.APIKey))
+	if token := VisorToken(); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	httpClient := c.HTTP
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -366,7 +391,11 @@ func (c *Client) PostVisorPrompt(visorBase, sessionID, prompt, model string) ([]
 	local.CheckRedirect = func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-	resp, err := local.Do(req)
+	return finishVisorPrompt(c, &local, req)
+}
+
+func finishVisorPrompt(c *Client, httpClient *http.Client, req *http.Request) ([]byte, error) {
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("visor stream request failed")
 	}

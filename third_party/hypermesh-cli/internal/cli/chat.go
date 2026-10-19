@@ -79,7 +79,7 @@ func newPromptCmd(r *run) *cobra.Command {
 	}
 	addChatFlags(cmd, &leaseID, &model, &message, &system, &script)
 	cmd.Flags().StringVar(&sessionID, "session", "", "open visor session that receives this prompt")
-	cmd.Flags().StringVar(&visor, "visor", "", "visor base URL (default http://127.0.0.1:9847 or HYPERMESH_VISOR_URL)")
+	cmd.Flags().StringVar(&visor, "visor", "", "opt-in TCP base URL (default is the control socket; also HYPERMESH_VISOR_URL)")
 	return cmd
 }
 
@@ -132,9 +132,6 @@ func runVisorPrompt(r *run, cmd *cobra.Command, opt visorPromptOpts) error {
 	visor := strings.TrimSpace(opt.Visor)
 	if visor == "" {
 		visor = strings.TrimSpace(os.Getenv("HYPERMESH_VISOR_URL"))
-	}
-	if visor == "" {
-		visor = api.DefaultVisorBase
 	}
 	model := ""
 	if opt.ModelSet {

@@ -25,16 +25,26 @@ fn fixture_needs_a_log_path() {
 
 #[test]
 fn rejects_a_non_loopback_listen_address() {
-    let output = bin().args(["--listen", "0.0.0.0:9"]).output().unwrap();
+    let output = bin()
+        .args(["--tcp", "--listen", "0.0.0.0:9"])
+        .output()
+        .unwrap();
     assert!(!output.status.success());
     let err = String::from_utf8(output.stderr).unwrap();
     assert!(err.contains("loopback"));
 }
 
 #[test]
-fn listens_on_loopback() {
+fn listens_on_the_control_socket_and_not_tcp() {
+    let runtime = std::env::temp_dir().join(format!(
+        "hypermesh-cli-listen-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&runtime);
+    std::fs::create_dir_all(&runtime).unwrap();
     let mut child = bin()
-        .args(["--listen", "127.0.0.1:0"])
+        .env("HYPERMESH_RUNTIME_DIR", &runtime)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -49,11 +59,18 @@ fn listens_on_loopback() {
     });
     let line = rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("listen line");
+        .expect("control socket line");
+    let listening = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "python3 -c 'import os,pathlib,sys\npid=int(sys.argv[1])\ninodes=set()\nfor entry in pathlib.Path(f\"/proc/{{pid}}/fd\").iterdir():\n    target=os.readlink(entry)\n    if target.startswith(\"socket:[\"): inodes.add(target[8:-1])\nfor name in (\"tcp\",\"tcp6\"):\n  path=pathlib.Path(\"/proc/net\")/name\n  if not path.exists(): continue\n  for line in path.read_text().splitlines()[1:]:\n    parts=line.split()\n    if len(parts)>9 and parts[3]==\"0A\" and parts[9] in inodes:\n      raise SystemExit(1)\n' {}",
+            child.id()
+        ))
+        .status()
+        .unwrap();
     let _ = child.kill();
     let _ = child.wait();
-    assert!(
-        line.starts_with("listening 127.0.0.1:"),
-        "stdout was {line:?}"
-    );
+    let _ = std::fs::remove_dir_all(&runtime);
+    assert!(line.starts_with("control socket "), "stdout was {line:?}");
+    assert!(listening.success(), "the daemon opened a TCP listener");
 }

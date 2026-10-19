@@ -29,32 +29,43 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$bin" --listen 127.0.0.1:0 --fixture --fixture-log "$tmpdir/events.jsonl" \
+export HYPERMESH_RUNTIME_DIR="$tmpdir/run"
+mkdir -p "$HYPERMESH_RUNTIME_DIR"
+chmod 700 "$HYPERMESH_RUNTIME_DIR"
+
+"$bin" --fixture --fixture-log "$tmpdir/events.jsonl" \
   >"$tmpdir/stdout" 2>"$tmpdir/stderr" &
 pid=$!
 
-addr=""
+sock=""
 for _ in $(seq 1 50); do
   if [[ -s "$tmpdir/stdout" ]]; then
-    addr=$(awk '/^listening / { print $2; exit }' "$tmpdir/stdout")
-    if [[ -n "$addr" ]]; then
+    sock=$(awk '/^control socket / { print substr($0, 16); exit }' "$tmpdir/stdout")
+    if [[ -n "$sock" && -S "$sock" ]]; then
       break
     fi
   fi
   if ! kill -0 "$pid" 2>/dev/null; then
-    echo "daemon exited before listen" >&2
+    echo "daemon exited before the control socket" >&2
     cat "$tmpdir/stderr" >&2 || true
     exit 1
   fi
   sleep 0.1
 done
-if [[ -z "$addr" ]]; then
-  echo "daemon did not print a listen line" >&2
+if [[ -z "$sock" ]]; then
+  echo "daemon did not print a control socket" >&2
   cat "$tmpdir/stdout" "$tmpdir/stderr" >&2 || true
   exit 1
 fi
+if grep -q '^listening ' "$tmpdir/stdout"; then
+  echo "TCP opened without --tcp" >&2
+  exit 1
+fi
 
-base="http://${addr}"
+base="http://localhost"
+curl() {
+  command curl --unix-socket "$sock" "$@"
+}
 session=$(curl -fsS -X POST "$base/session" \
   -H 'content-type: application/json' \
   -d '{"purpose":"check the five verbs","recipes":[],"agent":{"name":"fixture","instructions":""},"skills":[]}')

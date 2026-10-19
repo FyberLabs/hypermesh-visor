@@ -13,3 +13,5 @@ jobs:
       - name: Check embedded includes
         run: bash ci/check-includes.sh
       - run: cargo test --locked --workspace
+      - name: Another Linux user cannot drive the desktop
+        run: bash ci/cross-user.sh

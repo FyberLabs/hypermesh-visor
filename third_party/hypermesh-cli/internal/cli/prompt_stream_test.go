@@ -43,6 +43,8 @@ func TestPromptStreamSendsOnePromptAndHidesTheKey(t *testing.T) {
 	cmd := exec.Command(testBinary(t), "prompt", "--visor", srv.URL, "--session", sessionID, "count the sheep")
 	cmd.Env = append(os.Environ(),
 		"HYPERMESH_CONFIG_DIR="+dir,
+		"HYPERMESH_RUNTIME_DIR="+dir,
+		"HYPERMESH_VISOR_TOKEN=",
 		"HYPERMESH_API_KEY="+key,
 		"HYPERMESH_TENANT_ID=ten",
 		"HYPERMESH_LEASE_ID=lease_should_not_be_sent",

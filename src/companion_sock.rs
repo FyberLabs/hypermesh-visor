@@ -5,15 +5,15 @@
 //! When `XDG_RUNTIME_DIR` is unset the directory is
 //! `$XDG_STATE_HOME/hypermesh/run`, or `$HOME/.local/state/hypermesh/run`.
 //! Both ends check `SO_PEERCRED` and continue only when the peer uid is this
-//! user. The loopback TCP API cannot lift a user pause. The companion copy of
-//! the path choice in `hypermesh-companion` must stay the same.
+//! user. `control.sock` in the same directory serves the control API and does
+//! not lift a user pause. The companion copy of the path choice in
+//! `hypermesh-companion` must stay the same.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -23,9 +23,12 @@ use hyper_util::server::conn::auto::Builder;
 use tokio::net::{UnixListener, UnixStream};
 use tower::ServiceExt;
 
-use crate::api::{companion_router, AppState};
-
 pub const SOCKET_NAME: &str = "companion.sock";
+/// Full control API for the same user. It does not carry the companion's
+/// pause-lift privilege.
+pub const CONTROL_SOCKET_NAME: &str = "control.sock";
+/// Per-launch bearer for the opt-in TCP listener. Mode 0600.
+pub const API_TOKEN_NAME: &str = "api.token";
 
 /// `sun_path` holds 108 bytes including the trailing NUL.
 const SUN_PATH_MAX: usize = 108;
@@ -77,6 +80,89 @@ pub fn socket_file(dir: &Path) -> PathBuf {
     dir.join(SOCKET_NAME)
 }
 
+pub fn control_socket_file(dir: &Path) -> PathBuf {
+    dir.join(CONTROL_SOCKET_NAME)
+}
+
+pub fn api_token_file(dir: &Path) -> PathBuf {
+    dir.join(API_TOKEN_NAME)
+}
+
+/// True when `Authorization` is `Bearer` plus the expected token.
+/// The byte compare does not stop at the first mismatch. An empty expected
+/// token never matches.
+pub fn bearer_matches(expected: &str, header: Option<&str>) -> bool {
+    let presented = match header.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(value) => value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .unwrap_or(""),
+        None => "",
+    };
+    constant_time_eq(expected.as_bytes(), presented.as_bytes()) && !expected.is_empty()
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let n = left.len().max(right.len());
+    let mut index = 0;
+    while index < n {
+        let a = if index < left.len() { left[index] } else { 0 };
+        let b = if index < right.len() { right[index] } else { 0 };
+        diff |= usize::from(a ^ b);
+        index += 1;
+    }
+    diff == 0
+}
+
+/// 32 bytes from `/dev/urandom`, hex encoded. Written mode 0600.
+pub fn write_api_token(dir: &Path) -> io::Result<String> {
+    let mut bytes = [0u8; 32];
+    fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    let token = hex_encode(&bytes);
+    let path = api_token_file(dir);
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
+    enforce_private(&path, 0o600)?;
+    Ok(token)
+}
+
+pub fn read_api_token(dir: &Path) -> io::Result<String> {
+    let text = fs::read_to_string(api_token_file(dir))?;
+    let token = text.trim();
+    if token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "api token is empty",
+        ));
+    }
+    Ok(token.to_string())
+}
+
+pub fn remove_api_token(dir: &Path) -> io::Result<()> {
+    match fs::remove_file(api_token_file(dir)) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 /// Owner is this user and group/other have no bits.
 pub fn access_is_private(owner: u32, ours: u32, mode: u32) -> bool {
     owner == ours && mode & 0o077 == 0
@@ -105,10 +191,7 @@ pub fn peer_uid(fd: &impl AsRawFd) -> io::Result<u32> {
 }
 
 pub fn peer_is_current_user(fd: &impl AsRawFd) -> bool {
-    match peer_uid(fd) {
-        Ok(uid) => uid == current_uid(),
-        Err(_) => false,
-    }
+    admit(peer_uid(fd).ok(), current_uid())
 }
 
 /// A peer that is not this user is dropped before any request bytes are read.
@@ -161,7 +244,15 @@ pub fn lock_runtime(dir: &Path) -> io::Result<RuntimeLock> {
 }
 
 pub async fn bind(dir: &Path) -> io::Result<UnixListener> {
-    let path = socket_file(dir);
+    bind_named(dir, SOCKET_NAME).await
+}
+
+pub async fn bind_control(dir: &Path) -> io::Result<UnixListener> {
+    bind_named(dir, CONTROL_SOCKET_NAME).await
+}
+
+pub async fn bind_named(dir: &Path, name: &str) -> io::Result<UnixListener> {
+    let path = dir.join(name);
     if unix_socket_listening(&path) {
         return Err(io::Error::new(
             io::ErrorKind::AddrInUse,
@@ -205,16 +296,21 @@ pub fn accept_is_transient(err: &io::Error) -> bool {
     )
 }
 
-pub async fn accept_loop(listener: UnixListener, state: Arc<AppState>) -> io::Result<()> {
-    let app = companion_router(state);
+/// Accept on a private socket. `role` is only the log label (`companion` or
+/// `control`). Both roles drop a peer whose uid is not this process.
+pub async fn accept_loop(
+    listener: UnixListener,
+    app: axum::Router,
+    role: &'static str,
+) -> io::Result<()> {
     let mut pause = Duration::from_millis(10);
     loop {
         match listener.accept().await {
             Ok((stream, _)) => {
                 pause = Duration::from_millis(10);
-                if !admit(peer_uid(&stream).ok(), current_uid()) {
+                if !peer_is_current_user(&stream) {
                     eprintln!(
-                        "hypermesh-visor: refused a companion socket peer that is not this user"
+                        "hypermesh-visor: refused a {role} socket peer that is not this user"
                     );
                     continue;
                 }
@@ -224,7 +320,7 @@ pub async fn accept_loop(listener: UnixListener, state: Arc<AppState>) -> io::Re
                 });
             }
             Err(err) if accept_is_transient(&err) => {
-                eprintln!("hypermesh-visor: companion accept: {err}");
+                eprintln!("hypermesh-visor: {role} accept: {err}");
                 tokio::time::sleep(pause).await;
                 pause = (pause * 2).min(Duration::from_secs(1));
             }
@@ -418,6 +514,56 @@ mod tests {
         drop(first);
         let second = lock_runtime(&dir).unwrap();
         drop(second);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_peer_with_a_different_uid_is_rejected() {
+        assert!(admit(Some(10), 10));
+        assert!(!admit(Some(11), 10));
+        assert!(!admit(Some(0), 10));
+        assert!(!admit(None, 10));
+    }
+
+    #[test]
+    fn bearer_compare_rejects_a_missing_or_wrong_token() {
+        let token = "a".repeat(64);
+        assert!(bearer_matches(&token, Some(&format!("Bearer {token}"))));
+        assert!(bearer_matches(&token, Some(&format!("bearer {token}"))));
+        assert!(!bearer_matches(&token, None));
+        assert!(!bearer_matches(&token, Some("")));
+        assert!(!bearer_matches(&token, Some("Basic abc")));
+        assert!(!bearer_matches(&token, Some("Bearer wrong")));
+        assert!(!bearer_matches(&token, Some(&format!("Bearer {token}x"))));
+        assert!(!bearer_matches("", Some("Bearer ")));
+        let mut flipped = token.clone();
+        flipped.replace_range(63..64, "b");
+        assert!(!bearer_matches(&token, Some(&format!("Bearer {flipped}"))));
+    }
+
+    #[test]
+    fn the_api_token_file_is_private_and_one_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "hypermesh-api-token-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        prepare_dir(&dir).unwrap();
+        let token = write_api_token(&dir).unwrap();
+        assert_eq!(token.len(), 64);
+        assert_eq!(read_api_token(&dir).unwrap(), token);
+        let mode = fs::metadata(api_token_file(&dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let again = write_api_token(&dir).unwrap();
+        assert_ne!(again, token);
+        remove_api_token(&dir).unwrap();
+        assert!(read_api_token(&dir).is_err());
+        remove_api_token(&dir).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 }

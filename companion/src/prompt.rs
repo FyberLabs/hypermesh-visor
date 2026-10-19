@@ -5,6 +5,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 const FORBIDDEN_RENTER_PREFIXES: &[&str] = &["hm_dev_", "hm_rtr_", "hm_site_"];
@@ -51,27 +52,60 @@ pub fn prompt_line(prompt: &str, model: Option<&str>) -> Result<String, String> 
 }
 
 pub fn stream_request(call: &PromptCall, api_key: &str) -> Result<(String, String), String> {
+    stream_request_bearer(call, api_key, None)
+}
+
+fn stream_request_bearer(
+    call: &PromptCall,
+    api_key: &str,
+    bearer: Option<&str>,
+) -> Result<(String, String), String> {
     let api_key = validate_key(api_key)?;
     let (host, path) = stream_target(&call.visor, &call.session)?;
     let body = prompt_line(&call.prompt, call.model.as_deref())?;
+    let authorization = match bearer.map(str::trim).filter(|token| !token.is_empty()) {
+        Some(token) => format!("authorization: Bearer {token}\r\n"),
+        None => String::new(),
+    };
     let request = format!(
-        "POST {path} HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/x-ndjson\r\naccept: application/x-ndjson\r\nx-api-key: {api_key}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nhost: {host}\r\ncontent-type: application/x-ndjson\r\naccept: application/x-ndjson\r\nx-api-key: {api_key}\r\n{authorization}content-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     );
     Ok((host, request))
 }
 
-/// Sends one prompt. A rejected key returns before any connection.
+/// Sends one prompt. An empty visor uses the control socket. An http URL is
+/// the opt-in TCP listener and sends the bearer when one is configured.
+/// A rejected key returns before any connection.
 pub fn send_prompt(call: &PromptCall, api_key: &str) -> Result<String, String> {
     let api_key = validate_key(api_key)?.to_string();
-    let (host, request) = stream_request(call, &api_key)?;
+    if call.visor.trim().is_empty() {
+        let socket = crate::visor::control_socket_path().map_err(|err| err.to_string())?;
+        let local = PromptCall {
+            visor: "http://localhost".into(),
+            session: call.session.clone(),
+            prompt: call.prompt.clone(),
+            model: call.model.clone(),
+        };
+        let (_, request) = stream_request(&local, &api_key)?;
+        let stream =
+            UnixStream::connect(socket).map_err(|_| "visor stream request failed".to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .map_err(|_| "visor stream request failed".to_string())?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .map_err(|_| "visor stream request failed".to_string())?;
+        return finish_exchange(stream, &request, &api_key);
+    }
+    let (host, request) = stream_request_bearer(call, &api_key, tcp_bearer().as_deref())?;
     let mut addr = host
         .to_socket_addrs()
         .map_err(|_| "visor stream request failed".to_string())?;
     let Some(addr) = addr.next() else {
         return Err("visor stream request failed".into());
     };
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|_| "visor stream request failed".to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -79,6 +113,37 @@ pub fn send_prompt(call: &PromptCall, api_key: &str) -> Result<String, String> {
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|_| "visor stream request failed".to_string())?;
+    finish_exchange(stream, &request, &api_key)
+}
+
+fn tcp_bearer() -> Option<String> {
+    if let Ok(token) = std::env::var("HYPERMESH_VISOR_TOKEN") {
+        let token = token.trim();
+        if !token.is_empty() {
+            return Some(token.to_string());
+        }
+    }
+    let dir = crate::visor::runtime_dir_from(
+        std::env::var("HYPERMESH_RUNTIME_DIR").ok().as_deref(),
+        std::env::var("XDG_RUNTIME_DIR").ok().as_deref(),
+        std::env::var("XDG_STATE_HOME").ok().as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+    )
+    .ok()?;
+    let text = std::fs::read_to_string(dir.join("api.token")).ok()?;
+    let token = text.trim();
+    if token.is_empty() {
+        None
+    } else {
+        Some(token.to_string())
+    }
+}
+
+fn finish_exchange(
+    mut stream: impl Read + Write,
+    request: &str,
+    api_key: &str,
+) -> Result<String, String> {
     stream
         .write_all(request.as_bytes())
         .map_err(|_| "visor stream request failed".to_string())?;
@@ -88,7 +153,7 @@ pub fn send_prompt(call: &PromptCall, api_key: &str) -> Result<String, String> {
         .read_to_end(&mut buf)
         .map_err(|_| "visor stream request failed".to_string())?;
     let text = String::from_utf8_lossy(&buf);
-    let text = redact(&text, &api_key);
+    let text = redact(&text, api_key);
     let (status, body) = split_response(&text);
     if !(200..300).contains(&status) {
         let message = if body.is_empty() {
@@ -96,7 +161,7 @@ pub fn send_prompt(call: &PromptCall, api_key: &str) -> Result<String, String> {
         } else {
             format!("visor stream HTTP {status}: {body}")
         };
-        return Err(redact(&message, &api_key));
+        return Err(redact(&message, api_key));
     }
     Ok(body)
 }

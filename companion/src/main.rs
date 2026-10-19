@@ -19,10 +19,11 @@ mod window;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+/// Empty means the control socket. `HYPERMESH_VISOR_URL` is the opt-in TCP base.
 fn visor_base() -> String {
     match std::env::var("HYPERMESH_VISOR_URL") {
         Ok(value) if !value.trim().is_empty() => value,
-        _ => "http://127.0.0.1:9847".into(),
+        _ => String::new(),
     }
 }
 
