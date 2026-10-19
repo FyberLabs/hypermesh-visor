@@ -115,10 +115,11 @@ pub enum ControlReject {
 }
 
 /// A control that arrived while an injection held the desktop. Replayed in
-/// sequence order when the call unwinds, and only for the owner it named.
-/// Every control joins this sequence before a phase no-op, so a resume still
-/// runs after a stop that has not published `off` yet. A missing keyboard
-/// still beats a later start or resume.
+/// sequence order when the call unwinds. Every control joins this sequence
+/// before a phase no-op, so a resume still runs after a stop that has not
+/// published `off` yet. A missing keyboard is a level, not a control: at most
+/// one entry for the edge from available to unavailable, and replaying it
+/// pauses only a running phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Deferred {
     Stop,
@@ -131,12 +132,18 @@ enum Deferred {
     Start {
         session: Uuid,
         from_companion: bool,
+        /// Clock captured with the request. Replay uses it, not the clock at
+        /// unwind, so the response and the replay agree.
+        now: Instant,
+        timeout: Duration,
     },
     /// `session` is none when resume had no session to take. That ends a
     /// pause on unwind. It does not reset the gate while the call is in flight.
     Resume {
         session: Option<Uuid>,
         from_companion: bool,
+        now: Instant,
+        timeout: Duration,
     },
 }
 
@@ -304,9 +311,11 @@ impl Gate {
     }
 
     /// The companion reports that X11 cannot see key presses. `false` stays
-    /// until the process exits. A repeated report while the gate is already
-    /// paused does not bump the epoch again. An active phase pauses, and an
-    /// in-flight injection is cancelled at its next chunk.
+    /// until the process exits. The report is a level: only the change from
+    /// available to unavailable is queued, and a repeat does not bump the
+    /// epoch again. An active phase pauses, and an in-flight injection is
+    /// cancelled at its next chunk. Replaying that one entry pauses a running
+    /// phase and does not turn `off` back into `paused`.
     pub fn set_keyboard_interrupt(&mut self, available: bool) {
         if available {
             return;
@@ -314,16 +323,21 @@ impl Gate {
         let fresh = self.keyboard_interrupt;
         self.keyboard_interrupt = false;
         if self.injecting {
-            // Queue before the phase check. A repeat while already paused
-            // does not bump the epoch again, but it still joins the sequence
-            // so a control posted around it keeps its order.
-            if fresh || self.phase != Phase::Paused {
+            if fresh {
                 self.bump_epoch();
                 self.phase = Phase::Paused;
+                self.touch();
+                self.defer(Deferred::KeyboardUnavailable);
+                self.publish();
+                return;
             }
-            self.touch();
-            self.defer(Deferred::KeyboardUnavailable);
-            self.publish();
+            // Already latched. Pause a phase this injection left running, but
+            // do not append another copy of the same level.
+            if self.phase != Phase::Paused {
+                self.bump_epoch();
+                self.phase = Phase::Paused;
+                self.publish();
+            }
             return;
         }
         if self.phase == Phase::Running {
@@ -365,10 +379,7 @@ impl Gate {
     pub fn end_inject(&mut self) {
         self.injecting = false;
         self.last_settled_seq = self.last_settled_seq.max(self.inject_seq);
-        let deferred = std::mem::take(&mut self.deferred);
-        for (_seq, action) in deferred {
-            self.apply_deferred(action);
-        }
+        self.replay_queued();
         self.publish();
     }
 
@@ -612,9 +623,10 @@ impl Gate {
     }
 
     /// Queue one control while [`Gate::injecting`] is set. Refusals
-    /// (`NeedsSession`, `StalePoll`) still return before the queue. Phase
-    /// no-ops do not: those are decided when the sequence is replayed, after
-    /// every earlier control has been applied.
+    /// (`NeedsSession`, `StalePoll`) still return before the queue. The
+    /// freshness check uses the phase queued predecessors would leave, not
+    /// the phase still published as `running`. Phase no-ops do not refuse:
+    /// those are decided when the sequence is replayed.
     fn defer_control(
         &mut self,
         session: Option<Uuid>,
@@ -628,14 +640,15 @@ impl Gate {
                 let Some(id) = session else {
                     return Err(ControlReject::NeedsSession);
                 };
-                if self.phase != Phase::Running && !from_companion && !self.poll_fresh(now, timeout)
-                {
+                if self.reentry_is_stale(from_companion, now, timeout) {
                     return Err(ControlReject::StalePoll);
                 }
                 self.touch();
                 self.defer(Deferred::Start {
                     session: id,
                     from_companion,
+                    now,
+                    timeout,
                 });
                 Ok(())
             }
@@ -653,7 +666,8 @@ impl Gate {
 
     /// Resume joins the deferred sequence even when the published phase is
     /// not paused. A stop already queued has not moved that phase yet.
-    /// The paused-phase poll and session rules are unchanged.
+    /// A TCP resume that would enter `running` after those predecessors is
+    /// refused up front when the poll is stale, so the response matches replay.
     fn queue_resume(
         &mut self,
         session: Option<Uuid>,
@@ -661,31 +675,67 @@ impl Gate {
         now: Instant,
         timeout: Duration,
     ) -> Result<(), ControlReject> {
-        if self.phase == Phase::Paused {
-            let Some(id) = session else {
-                self.touch();
-                self.defer(Deferred::Resume {
-                    session: None,
-                    from_companion,
-                });
-                return Ok(());
-            };
-            if !from_companion && !self.poll_fresh(now, timeout) {
-                return Err(ControlReject::StalePoll);
-            }
-            self.touch();
-            self.defer(Deferred::Resume {
-                session: Some(id),
-                from_companion,
-            });
-            return Ok(());
+        // No session ends a pause. It does not enter `running`, so it does
+        // not need a poll. A session does, once predecessors leave `running`.
+        if session.is_some() && self.reentry_is_stale(from_companion, now, timeout) {
+            return Err(ControlReject::StalePoll);
         }
         self.touch();
         self.defer(Deferred::Resume {
             session,
             from_companion,
+            now,
+            timeout,
         });
         Ok(())
+    }
+
+    /// True when a TCP start or resume would enter `running` only after the
+    /// queued predecessors run, and no companion poll is inside the window.
+    /// The check is a scratch replay: it does not publish and does not touch
+    /// this gate's queue.
+    fn reentry_is_stale(&self, from_companion: bool, now: Instant, timeout: Duration) -> bool {
+        if from_companion {
+            return false;
+        }
+        let phase = self.phase_after_deferred();
+        phase != Phase::Running && !self.poll_fresh(now, timeout)
+    }
+
+    /// Phase after every control already in [`Self::deferred`], using the
+    /// same admission rules as unwind.
+    fn phase_after_deferred(&self) -> Phase {
+        let mut scratch = self.admission_scratch();
+        scratch.replay_queued();
+        scratch.phase
+    }
+
+    /// Copy of the fields a deferred replay reads or keeps across `reset`.
+    /// The scratch has its own published word, so the simulation cannot
+    /// publish over the live gate.
+    fn admission_scratch(&self) -> Self {
+        let mut scratch = Self::default();
+        scratch.session = self.session;
+        scratch.phase = self.phase;
+        scratch.notice = self.notice;
+        scratch.generation = self.generation;
+        scratch.resume_seq = self.resume_seq;
+        scratch.inject_seq = self.inject_seq;
+        scratch.last_settled_seq = self.last_settled_seq;
+        scratch.epoch = self.epoch;
+        scratch.trusted_at = self.trusted_at;
+        scratch.last_poll = self.last_poll;
+        scratch.keyboard_interrupt = self.keyboard_interrupt;
+        scratch.control_seq = self.control_seq;
+        scratch.deferred = self.deferred.clone();
+        scratch
+    }
+
+    fn replay_queued(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred);
+        for (_seq, action) in deferred {
+            self.apply_deferred(action);
+        }
     }
 
     /// While an injection is in flight, stop only cancels it. The phase stays
@@ -791,48 +841,74 @@ impl Gate {
                 session,
                 generation,
             } => {
+                // Session ownership: only the session and generation captured
+                // when the close was queued. A start that already took a new
+                // generation is left alone.
                 if self.session == Some(session) && self.generation == generation {
                     self.clear_session(session);
                 }
             }
             Deferred::KeyboardUnavailable => {
                 self.keyboard_interrupt = false;
-                self.phase = Phase::Paused;
-                self.publish();
+                // Level, not a control. Pausing `off` would undo a stop that
+                // already ran earlier in this sequence.
+                if self.phase == Phase::Running {
+                    self.phase = Phase::Paused;
+                    self.publish();
+                }
             }
             Deferred::Start {
                 session,
                 from_companion,
+                now,
+                timeout,
             } => {
-                // A missing keyboard stays paused. Replaying a start must
-                // not lift that latch.
-                if !self.keyboard_interrupt {
-                    return;
+                if self.reentry_admitted(from_companion, now, timeout) {
+                    self.enter_running(session, from_companion);
                 }
-                self.enter_running(session, from_companion);
             }
             Deferred::Resume {
                 session,
                 from_companion,
+                now,
+                timeout,
             } => {
-                if !self.keyboard_interrupt {
-                    return;
-                }
                 // Still running means no earlier control ended the phase.
                 // A stop or pause earlier in this sequence already moved it.
                 if self.phase == Phase::Running {
                     return;
                 }
                 match session {
-                    Some(id) => self.enter_running(id, from_companion),
+                    Some(id) => {
+                        if self.reentry_admitted(from_companion, now, timeout) {
+                            self.enter_running(id, from_companion);
+                        }
+                    }
                     None => {
-                        if self.phase == Phase::Paused {
+                        // A missing keyboard stays paused. Resetting it would
+                        // publish `off` and let the next injection start.
+                        if self.phase == Phase::Paused && self.keyboard_interrupt {
                             self.reset();
                         }
                     }
                 }
             }
         }
+    }
+
+    /// Whether a deferred start or resume may enter `running` after the
+    /// predecessors in this sequence have been applied.
+    ///
+    /// The keyboard latch must still be up. A TCP caller also needs a
+    /// companion poll inside the window captured with the action, unless the
+    /// phase is already `running`. The session the action named is the one
+    /// [`Gate::enter_running`] takes; a resume with no session does not call
+    /// this and only ends a pause.
+    fn reentry_admitted(&self, from_companion: bool, now: Instant, timeout: Duration) -> bool {
+        if !self.keyboard_interrupt {
+            return false;
+        }
+        self.phase == Phase::Running || from_companion || self.poll_fresh(now, timeout)
     }
 
     fn enter_running(&mut self, session: Uuid, grant_grace: bool) {
@@ -1616,9 +1692,12 @@ mod tests {
         gate.set_keyboard_interrupt(false);
         assert!(!gate.keyboard_interrupt());
         gate.end_inject();
-        assert_eq!(gate.phase(), Phase::Paused);
+        // The start does not enter: the keyboard latch is already down.
+        // The stop published off, and the keyboard report must not turn it
+        // back into paused.
+        assert_eq!(gate.phase(), Phase::Off);
+        assert!(gate.session().is_none());
         assert!(!gate.keyboard_interrupt());
-        assert!(gate.begin_inject(id, gate.epoch()).is_err());
     }
 
     #[test]
@@ -1721,8 +1800,10 @@ mod tests {
     }
 
     /// Newest control wins for every ordered pair posted during an injection.
-    /// A missing keyboard still beats a later start or resume. Close names the
-    /// session the injection captured.
+    /// A missing keyboard still beats a later start or resume. Replaying that
+    /// report does not turn a stop's `off` back into `paused`. Close names the
+    /// session the injection captured. TCP start and resume are also checked
+    /// against a stale poll and against a fresh one.
     #[test]
     fn every_ordered_pair_of_controls_during_injection_keeps_newest_wins() {
         // first, second, phase, driving session kept, keyboard still available
@@ -1732,7 +1813,7 @@ mod tests {
             ("stop", "pause", Phase::Paused, false, true),
             ("stop", "resume", Phase::Running, true, true),
             ("stop", "close", Phase::Off, false, true),
-            ("stop", "keyboard", Phase::Paused, false, false),
+            ("stop", "keyboard", Phase::Off, false, false),
             ("start", "stop", Phase::Off, false, true),
             ("start", "start", Phase::Running, true, true),
             ("start", "pause", Phase::Paused, true, true),
@@ -1784,6 +1865,196 @@ mod tests {
             assert_eq!(gate.keyboard_interrupt(), keyboard, "{first} then {second}");
             assert!(!gate.injecting(), "{first} then {second}");
         }
+
+        // TCP start/resume with no companion poll. The predecessor is the
+        // companion path. The second action is refused when replay would
+        // leave `running`, and it is not queued.
+        let stale = [
+            ("stop", "start", Phase::Off, false),
+            ("stop", "resume", Phase::Off, false),
+            ("pause", "start", Phase::Paused, true),
+            ("pause", "resume", Phase::Paused, true),
+            ("close", "start", Phase::Off, false),
+            ("close", "resume", Phase::Off, false),
+            ("keyboard", "start", Phase::Paused, true),
+            ("keyboard", "resume", Phase::Paused, true),
+        ];
+        let timeout = Duration::from_secs(2);
+        for (first, second, phase, keeps_session) in stale {
+            let mut gate = Gate::default();
+            let id = Uuid::new_v4();
+            let now = Instant::now();
+            gate.begin_inject(id, gate.epoch()).unwrap();
+            post_inject_op(&mut gate, id, first);
+            let queued = gate.deferred.len();
+            let err = tcp_during_inject(&mut gate, id, second, now, timeout);
+            assert_eq!(
+                err,
+                Err(ControlReject::StalePoll),
+                "{first} then TCP {second} with a stale poll"
+            );
+            assert_eq!(
+                gate.deferred.len(),
+                queued,
+                "{first} then TCP {second} must not be queued"
+            );
+            gate.end_inject();
+            assert_eq!(gate.phase(), phase, "{first} then TCP {second}");
+            assert_eq!(
+                gate.session() == Some(id),
+                keeps_session,
+                "{first} then TCP {second}"
+            );
+        }
+
+        // Already running after the predecessor: a TCP start or resume does
+        // not need a poll. Resume while that phase stays running is a no-op.
+        for (first, second) in [
+            ("start", "start"),
+            ("start", "resume"),
+            ("resume", "start"),
+            ("resume", "resume"),
+        ] {
+            let mut gate = Gate::default();
+            let id = Uuid::new_v4();
+            let now = Instant::now();
+            gate.begin_inject(id, gate.epoch()).unwrap();
+            post_inject_op(&mut gate, id, first);
+            tcp_during_inject(&mut gate, id, second, now, timeout)
+                .unwrap_or_else(|_| panic!("{first} then TCP {second} while running"));
+            gate.end_inject();
+            assert_eq!(gate.phase(), Phase::Running, "{first} then TCP {second}");
+            assert_eq!(gate.session(), Some(id), "{first} then TCP {second}");
+        }
+
+        // A poll inside the window lets the same stale predecessors re-enter.
+        for (first, second) in [
+            ("stop", "start"),
+            ("stop", "resume"),
+            ("pause", "start"),
+            ("pause", "resume"),
+            ("close", "start"),
+            ("close", "resume"),
+        ] {
+            let mut gate = Gate::default();
+            let id = Uuid::new_v4();
+            let now = Instant::now();
+            assert!(!gate.note_poll(now, timeout));
+            gate.begin_inject(id, gate.epoch()).unwrap();
+            post_inject_op(&mut gate, id, first);
+            tcp_during_inject(&mut gate, id, second, now, timeout)
+                .unwrap_or_else(|_| panic!("{first} then TCP {second} after a poll"));
+            gate.end_inject();
+            assert_eq!(
+                gate.phase(),
+                Phase::Running,
+                "{first} then TCP {second} after a poll"
+            );
+            assert_eq!(gate.session(), Some(id));
+        }
+
+        // Fresh poll, but the keyboard latch still refuses the re-entry.
+        for second in ["start", "resume"] {
+            let mut gate = Gate::default();
+            let id = Uuid::new_v4();
+            let now = Instant::now();
+            assert!(!gate.note_poll(now, timeout));
+            gate.begin_inject(id, gate.epoch()).unwrap();
+            post_inject_op(&mut gate, id, "keyboard");
+            tcp_during_inject(&mut gate, id, second, now, timeout)
+                .unwrap_or_else(|_| panic!("keyboard then TCP {second} after a poll"));
+            gate.end_inject();
+            assert_eq!(gate.phase(), Phase::Paused, "keyboard then TCP {second}");
+            assert!(!gate.keyboard_interrupt());
+        }
+    }
+
+    /// A start queued behind a stop must not enter `running` when its own
+    /// poll is stale, even if something pushed it onto the queue.
+    #[test]
+    fn a_replayed_stale_start_or_resume_does_not_enter_running() {
+        let timeout = Duration::from_secs(2);
+        let now = Instant::now();
+        for action in [Control::Start, Control::Resume] {
+            let mut gate = Gate::default();
+            let id = Uuid::new_v4();
+            gate.begin_inject(id, gate.epoch()).unwrap();
+            gate.control(None, Control::Stop).unwrap();
+            let deferred = match action {
+                Control::Start => Deferred::Start {
+                    session: id,
+                    from_companion: false,
+                    now,
+                    timeout,
+                },
+                Control::Resume => Deferred::Resume {
+                    session: Some(id),
+                    from_companion: false,
+                    now,
+                    timeout,
+                },
+                _ => unreachable!(),
+            };
+            gate.touch();
+            gate.defer(deferred);
+            gate.end_inject();
+            assert_eq!(gate.phase(), Phase::Off, "{action:?}");
+            assert!(gate.session().is_none(), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn a_keyboard_poll_flood_during_injection_stays_bounded_after_stop() {
+        let mut gate = Gate::default();
+        let id = Uuid::new_v4();
+        let epoch = gate.epoch();
+        gate.begin_inject(id, epoch).unwrap();
+        for _ in 0..100 {
+            gate.set_keyboard_interrupt(false);
+            assert!(
+                gate.deferred.len() <= 1,
+                "a missing keyboard is one level, got {}",
+                gate.deferred.len()
+            );
+        }
+        assert_eq!(gate.deferred.len(), 1);
+        assert_eq!(gate.epoch(), epoch + 1, "repeats must not bump the epoch");
+        gate.control(None, Control::Stop).unwrap();
+        let after_stop = gate.epoch();
+        for _ in 0..100 {
+            gate.set_keyboard_interrupt(false);
+            assert!(
+                gate.deferred.len() <= 2,
+                "stop plus one keyboard edge, got {}",
+                gate.deferred.len()
+            );
+        }
+        assert_eq!(gate.deferred.len(), 2);
+        assert_eq!(after_stop, epoch + 2);
+        assert_eq!(gate.epoch(), after_stop);
+        gate.end_inject();
+        assert_eq!(gate.phase(), Phase::Off);
+        assert!(!gate.keyboard_interrupt());
+        assert!(gate.deferred.is_empty());
+        assert!(
+            gate.begin_inject(id, gate.epoch()).is_ok(),
+            "off must not stay paused after the flood and the stop"
+        );
+    }
+
+    fn tcp_during_inject(
+        gate: &mut Gate,
+        id: Uuid,
+        name: &str,
+        now: Instant,
+        timeout: Duration,
+    ) -> Result<(), ControlReject> {
+        let action = match name {
+            "start" => Control::Start,
+            "resume" => Control::Resume,
+            other => panic!("not a TCP re-entry: {other}"),
+        };
+        gate.apply(Some(id), action, false, now, timeout)
     }
 
     fn post_inject_op(gate: &mut Gate, id: Uuid, name: &str) {
