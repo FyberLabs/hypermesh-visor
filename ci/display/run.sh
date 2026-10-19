@@ -1296,6 +1296,10 @@ PY
 scenario_uinput_move_pauses() {
   ensure_companion
   ensure_running
+  # The visor reports running as soon as resume lands. The companion learns
+  # that on its next poll. A move before that poll is input while the bug
+  # still shows paused, and it does not pause the new stretch.
+  sleep 0.5
   uinput_cmd "rel 30 12"
   wait_phase paused 40
   http_code "$REQ_DIR/mouse.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":12,"y":12}'
