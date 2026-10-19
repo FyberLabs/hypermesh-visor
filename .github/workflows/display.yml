@@ -29,7 +29,8 @@ jobs:
             x11-xserver-utils \
             xinput \
             xdotool \
-            python3
+            python3 \
+            iproute2
           sudo modprobe uinput
           # The harness opens /dev/uinput as root and does not change device modes.
 
@@ -43,6 +44,8 @@ jobs:
             echo "/dev/uinput is world-writable before the run ($before)" >&2
             exit 1
           fi
+          # The harness polls ss -ltnp and fails if a process it started is
+          # listening on TCP. The visor is allowed only when launched with --tcp.
           bash ci/display/run.sh x11
           after=$(stat -c '%a %U %G' /dev/uinput)
           echo "uinput after: $after"
@@ -86,10 +89,14 @@ jobs:
             xwayland \
             x11-utils \
             x11-apps \
-            python3
+            python3 \
+            iproute2
 
       - name: Run Wayland display scenarios
-        run: bash ci/display/run.sh wayland
+        run: |
+          # The harness polls ss -ltnp and fails if a process it started is
+          # listening on TCP. The visor is allowed only when launched with --tcp.
+          bash ci/display/run.sh wayland
 
       - name: Upload logs and captures
         if: failure()

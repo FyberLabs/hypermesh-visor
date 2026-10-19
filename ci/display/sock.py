@@ -2,8 +2,11 @@
 """Fast companion-socket client for the display harness.
 
 Python startup is too slow to pause a drag between pointer batches. This
-process stays up. Each line is one action (start, pause, resume, stop) and
-opens its own HTTP/1.1 connection to the visor socket.
+process stays up. The harness is the only writer on stdin. There is no
+listener. Each line is one action (start, pause, resume, stop) and opens
+its own HTTP/1.1 connection on the companion Unix socket.
+
+A closed stdin is the same as quit.
 """
 
 import socket
@@ -48,32 +51,22 @@ def post(path, action):
 
 def main():
     path = sys.argv[1]
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", 0))
-    server.listen(1)
-    print("ready port=%d" % server.getsockname()[1], flush=True)
-    conn, _addr = server.accept()
-    conn_file = conn.makefile("rwb", buffering=0)
-    try:
-        while True:
-            raw = conn_file.readline()
-            if not raw:
-                break
-            action = raw.decode(errors="replace").strip()
-            if action == "quit":
-                conn_file.write(b"ok\n")
-                break
-            if action not in ACTIONS:
-                conn_file.write(b"err unknown\n")
-                continue
-            code, detail = post(path, action)
-            if code == 204:
-                conn_file.write(b"ok 204\n")
-            else:
-                conn_file.write(("err %s %s\n" % (code, detail)).encode())
-    finally:
-        conn.close()
+    print("ready", flush=True)
+    for raw in sys.stdin:
+        action = raw.strip()
+        if not action:
+            continue
+        if action == "quit":
+            print("ok", flush=True)
+            return 0
+        if action not in ACTIONS:
+            print("err unknown", flush=True)
+            continue
+        code, detail = post(path, action)
+        if code == 204:
+            print("ok 204", flush=True)
+        else:
+            print("err %s %s" % (code, detail), flush=True)
     return 0
 
 

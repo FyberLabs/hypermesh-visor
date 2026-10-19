@@ -20,11 +20,14 @@
 # in the private state directory. A pid file is removed only after that
 # process is gone. Xorg's display comes from -displayfd. The harness does
 # not read or remove /tmp/.X*-lock, and it does not chmod /dev/uinput or
-# the event nodes. The uinput helper reads commands on stdin. The coproc
-# ends are duplicated onto ordinary fds before any scenario starts, because
-# bash closes coproc fds in a subshell. Commands take a flock in the private
-# state directory. A write error, a read error, or a missing ack fails the
-# scenario. The helper does not listen on a port.
+# the event nodes. The uinput helper and the companion-socket helper read
+# commands on stdin. Coproc ends are duplicated onto ordinary fds before any
+# scenario starts, because bash closes coproc fds in a subshell. Commands
+# take a flock in the private state directory. A write error, a read error,
+# or a missing ack fails the scenario. Neither helper listens. Around every
+# scenario, ss -ltnp must show no listening TCP socket for a process this
+# run started. The visor is the exception only when its command line
+# contains --tcp.
 set -euo pipefail
 set -m
 
@@ -96,8 +99,10 @@ SID=
 UINPUT_IN=
 UINPUT_OUT=
 UINPUT_PID=
-SOCK_FD=
+SOCK_IN=
+SOCK_OUT=
 SOCK_PID=
+TCP_WATCH_PID=
 XORG_PID=
 XEV_PID=
 VISOR_PID=
@@ -598,8 +603,22 @@ cleanup() {
     exec {UINPUT_OUT}<&- || true
     unset UINPUT_OUT
   fi
-  if [[ -n ${SOCK_FD:-} ]]; then
-    printf 'quit\n' >&"$SOCK_FD" 2>/dev/null || true
+  if ! assert_harness_no_tcp_listen cleanup; then
+    status=1
+  fi
+  if ! stop_tcp_watch; then
+    status=1
+  fi
+  if [[ -n ${SOCK_IN:-} ]]; then
+    trap '' PIPE
+    printf 'quit\n' >&"$SOCK_IN" 2>/dev/null || true
+    trap - PIPE
+    exec {SOCK_IN}>&- || true
+    unset SOCK_IN
+  fi
+  if [[ -n ${SOCK_OUT:-} ]]; then
+    exec {SOCK_OUT}<&- || true
+    unset SOCK_OUT
   fi
   # The visor pid file stays until stop_visor has seen the process exit.
   stop_visor || true
@@ -678,17 +697,7 @@ wait_phase() {
   return 1
 }
 
-socket_action() {
-  if [[ -n ${SOCK_FD:-} ]]; then
-    printf '%s\n' "$1" >&"$SOCK_FD"
-    local ack
-    IFS= read -r -t 2 ack <&"$SOCK_FD" || die "socket helper did not answer: $1"
-    if [[ $ack != ok* ]]; then
-      echo "socket $1 -> $ack" >&2
-      return 1
-    fi
-    return 0
-  fi
+socket_action_direct() {
   python3 - "$RUNTIME/companion.sock" "$1" <<'PY'
 import socket, sys
 path, action = sys.argv[1], sys.argv[2]
@@ -717,6 +726,48 @@ if not line.startswith("HTTP/1.1 204"):
     sys.stderr.write(text)
     sys.exit(1)
 PY
+}
+
+# The helper is a long-lived stdin client so a drag can be paused between
+# pointer batches. Its pipe ends are ordinary fds, inherited by scenario
+# subshells. A broken channel fails the scenario. An explicit err ack is the
+# companion refusing the action, and callers may retry that.
+socket_action() {
+  local action=$1
+  if [[ -z ${SOCK_IN:-} && -z ${SOCK_OUT:-} ]]; then
+    socket_action_direct "$action"
+    return
+  fi
+  local ack lockfd kind
+  [[ ${SOCK_IN:-} =~ ^[0-9]+$ && ${SOCK_OUT:-} =~ ^[0-9]+$ ]] || die "socket helper command channel is not open"
+  for kind in "$SOCK_IN" "$SOCK_OUT"; do
+    if [[ ! -e /proc/${BASHPID:-$$}/fd/$kind ]] || [[ $(readlink "/proc/${BASHPID:-$$}/fd/$kind" 2>/dev/null || true) != pipe:* ]]; then
+      die "socket helper command channel is not open"
+    fi
+  done
+  allow_write "$PROC/sock.cmd.lock"
+  exec {lockfd}>>"$PROC/sock.cmd.lock" || die "socket helper lock open failed"
+  if ! flock -x "$lockfd"; then
+    exec {lockfd}>&- || true
+    die "socket helper lock failed"
+  fi
+  if ! printf '%s\n' "$action" >&"$SOCK_IN"; then
+    exec {lockfd}>&- || true
+    die "socket helper write failed: $action"
+  fi
+  if ! IFS= read -r -t 2 ack <&"$SOCK_OUT"; then
+    exec {lockfd}>&- || true
+    die "socket helper did not answer: $action"
+  fi
+  exec {lockfd}>&- || true
+  if [[ -z ${ack:-} ]]; then
+    die "socket helper $action -> missing ack"
+  fi
+  if [[ $ack == ok* ]]; then
+    return 0
+  fi
+  echo "socket $action -> $ack" >&2
+  return 1
 }
 
 # HTTP body "error" field. Empty and non-JSON bodies yield an empty string.
@@ -1154,9 +1205,112 @@ capture_shot() {
   fi
 }
 
+# ss -ltnp, limited to processes this run started. A visor launched with
+# --tcp is the opt-in token listener and is the only allowed match.
+# command -v python3 is often a symlink to python3.N. Resolve both sides.
+harness_same_exe() {
+  local pid=$1 expected=$2 exe resolved
+  pid_matches_exe "$pid" "$expected" && return 0
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  resolved=$(readlink -f "$expected" 2>/dev/null || true)
+  [[ -n $exe && -n $resolved && $exe == "$resolved" ]]
+}
+
+harness_tcp_allowed() {
+  local pid=$1 cmd
+  harness_same_exe "$pid" "$VISOR_BIN" || return 1
+  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+  [[ $cmd == *"--tcp"* ]]
+}
+
+assert_harness_no_tcp_listen() {
+  local label=${1:-run}
+  command -v ss >/dev/null || die "ss is required to check harness listeners"
+  local -A exe_of=()
+  local pid exe line bad=0 ss_out seen_pid
+  if [[ -f ${PROC:-}/started ]]; then
+    while IFS=$'\t' read -r pid exe _marker; do
+      [[ $pid =~ ^[0-9]+$ && -n $exe ]] || continue
+      exe_of[$pid]=$exe
+    done <"$PROC/started"
+  fi
+  if ! ss_out=$(sudo -n ss -H -ltnp 2>/dev/null); then
+    ss_out=$(ss -H -ltnp 2>/dev/null || true)
+  fi
+  while IFS= read -r line; do
+    [[ $line == LISTEN* ]] || continue
+    for seen_pid in $(grep -oE 'pid=[0-9]+' <<<"$line" | cut -d= -f2); do
+      [[ -n ${exe_of[$seen_pid]:-} ]] || continue
+      harness_same_exe "$seen_pid" "${exe_of[$seen_pid]}" || continue
+      if harness_tcp_allowed "$seen_pid"; then
+        continue
+      fi
+      echo "harness pid $seen_pid (${exe_of[$seen_pid]}) is listening: $line" >&2
+      bad=1
+    done
+  done <<<"$ss_out"
+  if (( bad )); then
+    return 1
+  fi
+  if [[ $label != quiet ]]; then
+    echo "harness listeners ($label): ss -ltnp has no harness TCP socket"
+  fi
+}
+
+start_tcp_watch() {
+  [[ -z ${TCP_WATCH_PID:-} ]] || return 0
+  command -v ss >/dev/null || die "ss is required to check harness listeners"
+  allow_write "$PROC/tcp-watch.fail" "$PROC/tcp-watch.stop" "$DISPLAY_LOG_DIR/tcp-watch.err"
+  remove_inside "$PROC/tcp-watch.fail" "$PROC/tcp-watch.stop"
+  (
+    set -euo pipefail
+    trap - EXIT
+    while [[ ! -f $PROC/tcp-watch.stop ]]; do
+      if ! assert_harness_no_tcp_listen quiet >"$DISPLAY_LOG_DIR/tcp-watch.err" 2>&1; then
+        allow_write "$PROC/tcp-watch.fail"
+        cp "$DISPLAY_LOG_DIR/tcp-watch.err" "$PROC/tcp-watch.fail"
+        exit 1
+      fi
+      sleep 0.5
+    done
+  ) &
+  TCP_WATCH_PID=$!
+  note_started "$TCP_WATCH_PID" "$(command -v bash)" "tcp-watch"
+}
+
+stop_tcp_watch() {
+  local status=0
+  if [[ -n ${PROC:-} ]]; then
+    allow_write "$PROC/tcp-watch.stop"
+    : >"$PROC/tcp-watch.stop"
+  fi
+  if [[ -n ${TCP_WATCH_PID:-} ]]; then
+    wait "$TCP_WATCH_PID" 2>/dev/null || true
+    TCP_WATCH_PID=
+  fi
+  if [[ -n ${PROC:-} && -s $PROC/tcp-watch.fail ]]; then
+    echo "harness process listened on TCP during the run" >&2
+    cat "$PROC/tcp-watch.fail" >&2 || true
+    status=1
+  fi
+  return "$status"
+}
+
+require_harness_no_tcp_listen() {
+  local label=$1
+  if ! assert_harness_no_tcp_listen "$label"; then
+    die "harness process is listening on TCP"
+  fi
+  if [[ -s ${PROC:-}/tcp-watch.fail ]]; then
+    cat "$PROC/tcp-watch.fail" >&2 || true
+    die "harness process listened on TCP during the run"
+  fi
+}
+
 run_named() {
   local name=$1 limit=$2
   shift 2
+  require_harness_no_tcp_listen "$name"
   echo "=== $name ==="
   local flag="$DISPLAY_LOG_DIR/$name.running"
   local req=$DISPLAY_LOG_DIR/scenarios/$name
@@ -1204,6 +1358,7 @@ run_named() {
   kill_tracked_requests "$req/bg.pids"
   kill "$timer" 2>/dev/null || true
   wait "$timer" 2>/dev/null || true
+  require_harness_no_tcp_listen "$name"
   if [[ $status -eq 0 ]]; then
     echo "PASS $name"
     return 0
@@ -1565,35 +1720,35 @@ build_bins() {
 }
 
 start_socket_helper() {
-  allow_write "$DISPLAY_LOG_DIR/sock.ready" "$DISPLAY_LOG_DIR/sock.err"
-  python3 -u "$root/ci/display/sock.py" "$RUNTIME/companion.sock" \
-    >"$DISPLAY_LOG_DIR/sock.ready" 2>"$DISPLAY_LOG_DIR/sock.err" &
-  SOCK_PID=$!
-  note_started "$SOCK_PID" "$(command -v python3)" "$root/ci/display/sock.py"
-  write_state sock.pid "$SOCK_PID"
-  local i line port
-  for i in $(seq 1 50); do
-    if [[ -s $DISPLAY_LOG_DIR/sock.ready ]]; then
-      line=$(head -n 1 "$DISPLAY_LOG_DIR/sock.ready")
-      if [[ $line == ready* ]]; then
-        port=$(sed -n 's/.*port=\([0-9]*\).*/\1/p' <<<"$line")
-        break
-      fi
-    fi
-    if ! kill -0 "$SOCK_PID" 2>/dev/null; then
-      echo "socket helper exited" >&2
-      cat "$DISPLAY_LOG_DIR/sock.err" >&2 || true
-      return 1
-    fi
-    sleep 0.05
-  done
-  if [[ -z ${port:-} ]]; then
+  # Stdin is the only command channel. Coproc fds are closed in scenario
+  # subshells, so the ends are duplicated onto ordinary fds and the coproc
+  # originals are closed. There is no listener and no port file.
+  allow_write "$DISPLAY_LOG_DIR/sock.err" "$PROC/sock.cmd.lock"
+  local helper=$root/ci/display/sock.py
+  coproc SOCK_PROC {
+    python3 -u "$helper" "$RUNTIME/companion.sock" 2>"$DISPLAY_LOG_DIR/sock.err"
+  }
+  local launcher=$SOCK_PROC_PID
+  local coproc_out=${SOCK_PROC[0]}
+  local coproc_in=${SOCK_PROC[1]}
+  exec {SOCK_IN}>&"${SOCK_PROC[1]}" {SOCK_OUT}<&"${SOCK_PROC[0]}"
+  exec {coproc_out}<&- {coproc_in}>&-
+  note_started "$launcher" "$(command -v python3)" "$helper"
+  write_state sock.pid "$launcher"
+  SOCK_PID=$launcher
+  local line=""
+  if ! IFS= read -r -t 2 line <&"$SOCK_OUT"; then
     echo "socket helper did not become ready" >&2
     cat "$DISPLAY_LOG_DIR/sock.err" >&2 || true
     return 1
   fi
-  exec {SOCK_FD}<>/dev/tcp/127.0.0.1/"$port"
-  echo "socket helper port=$port"
+  if [[ $line != ready ]]; then
+    echo "socket helper did not become ready: $line" >&2
+    cat "$DISPLAY_LOG_DIR/sock.err" >&2 || true
+    return 1
+  fi
+  echo "socket helper ready"
+  assert_harness_no_tcp_listen "socket-helper" || return 1
 }
 
 capture_core_devices() {
@@ -2472,6 +2627,7 @@ usage() {
 }
 
 main() {
+  start_tcp_watch
   remember_uinput
   assert_uinput_mode || die "/dev/uinput mode is not the private mode recorded at start"
   local kind=${1:-}
