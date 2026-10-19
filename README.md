@@ -22,7 +22,7 @@ Run the daemon as the logged-in user, not as root. It prints `control socket` an
 
 ### Display harness
 
-`ci/display/run.sh` drives the visor and the companion on a real display. GitHub Actions runs the same script as `display-x11` and `display-wayland`. Each scenario has its own timeout. A failure leaves logs and a capture (`xwd` on X11, `grim` on Wayland) in `display-logs/`.
+`ci/display/run.sh` drives the visor and the companion on a real display. GitHub Actions runs the same script as `display-x11` and `display-wayland`. Each scenario has its own timeout. A failure leaves logs and a capture (`xwd` on X11, `grim` on Wayland) in `display-logs/`. The harness ignores `HYPERMESH_RUNTIME_DIR` and creates a private temporary runtime directory; it does not delete sockets or lock files from a directory the caller provided. `companion.pid` and `visor.pid` are removed on cleanup, and a pid is signalled only when `/proc` still shows that binary. A scenario timeout also stops that scenario's background HTTP jobs. Each scenario writes `http.body` and its status files under `display-logs/scenarios/<name>/`.
 
 X11 uses Xorg with the dummy video driver. Injected mouse and type go through XTEST, and a small `xev` window checks that those events landed. Physical input is separate: the harness creates a pointer and a keyboard with `/dev/uinput` (`sudo modprobe uinput`). libinput attaches those nodes as slave devices. If libinput does not attach them, the same nodes are handed to the evdev driver. They are not the XTEST pointer or keyboard, and the harness does not pretend that XTEST input is physical. The companion's XTEST classification is what the pause and click scenarios exercise.
 

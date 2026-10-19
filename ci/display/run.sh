@@ -12,7 +12,9 @@
 # with XTEST.
 #
 # Each scenario runs in its own process group with a hard timeout. Logs and
-# failure captures go to display-logs/.
+# failure captures go to display-logs/. The runtime directory is always one
+# this script creates. A caller-provided HYPERMESH_RUNTIME_DIR is ignored so
+# the harness never unlinks a live visor's socket or lock.
 set -euo pipefail
 set -m
 
@@ -21,8 +23,17 @@ cd "$root"
 
 DISPLAY_LOG_DIR=$root/display-logs
 mkdir -p "$DISPLAY_LOG_DIR"
-HTTP_BODY=$DISPLAY_LOG_DIR/http.body
-RUNTIME=${HYPERMESH_RUNTIME_DIR:-/tmp/hm-run}
+# Request bodies for code that runs outside a scenario. run_named points
+# each scenario at its own directory.
+REQ_DIR=$DISPLAY_LOG_DIR
+HTTP_BODY=$REQ_DIR/http.body
+SCENARIO_BG=
+if [[ -n ${HYPERMESH_RUNTIME_DIR:-} ]]; then
+  echo "ignoring HYPERMESH_RUNTIME_DIR ($HYPERMESH_RUNTIME_DIR): the display harness uses a private temporary runtime directory and does not remove files from a directory it did not create" >&2
+  unset HYPERMESH_RUNTIME_DIR
+fi
+RUNTIME=$(mktemp -d "${TMPDIR:-/tmp}/hm-display.XXXXXX")
+HARNESS_RUNTIME_DIR=$RUNTIME
 CONFIG=${HYPERMESH_CONFIG_DIR:-/tmp/hm-config}
 VISOR_BIN=$root/target/debug/hypermesh-visor
 COMPANION_BIN=$root/target/debug/hypermesh-companion
@@ -79,6 +90,53 @@ pid_matches_exe() {
   [[ $cmd == "$expected" || $cmd == "$expected "* ]]
 }
 
+# Signal `pid` only when it is still `expected`. A recycled pid is left alone.
+signal_if_exe() {
+  local pid=$1 expected=$2
+  if [[ -z $pid ]]; then
+    return 1
+  fi
+  if pid_matches_exe "$pid" "$expected"; then
+    kill "$pid" 2>/dev/null || true
+    return 0
+  fi
+  echo "not signalling pid $pid; it is not $expected" >&2
+  return 1
+}
+
+# Drop a pid file, then signal the recorded pid and an optional in-memory
+# pid. Both go through the same identity check. Used for companion.pid and
+# visor.pid.
+signal_recorded_pid() {
+  local file=$1 expected=$2 live=${3:-}
+  local pid="" signalled=1
+  if [[ -f $file ]]; then
+    pid=$(cat "$file" 2>/dev/null || true)
+    rm -f "$file"
+  fi
+  if signal_if_exe "$pid" "$expected"; then
+    signalled=0
+  fi
+  if [[ -n $live && $live != "$pid" ]]; then
+    if signal_if_exe "$live" "$expected"; then
+      signalled=0
+    fi
+  fi
+  return "$signalled"
+}
+
+# `set -m` gives each background request its own process group, so killing
+# the scenario group leaves the curl running. The pid list is how a timeout
+# reaches those jobs. The companion is not recorded here.
+kill_tracked_requests() {
+  local file=$1 bg
+  [[ -f $file ]] || return 0
+  while read -r bg; do
+    [[ $bg =~ ^[0-9]+$ ]] || continue
+    kill -TERM -- -"$bg" 2>/dev/null || kill -TERM "$bg" 2>/dev/null || true
+  done <"$file" || true
+}
+
 MAIN_BASHPID=$BASHPID
 
 cleanup() {
@@ -93,21 +151,10 @@ cleanup() {
   if [[ -n ${XEV_PID:-} ]]; then
     kill "$XEV_PID" 2>/dev/null || true
   fi
-  if [[ -f $COMPANION_PID_FILE ]]; then
-    local cpid
-    cpid=$(cat "$COMPANION_PID_FILE" 2>/dev/null || true)
-    rm -f "$COMPANION_PID_FILE"
-    if pid_matches_exe "$cpid" "$COMPANION_BIN"; then
-      kill "$cpid" 2>/dev/null || true
-    elif [[ -n $cpid ]]; then
-      echo "not signalling pid $cpid; it is not $COMPANION_BIN" >&2
-    fi
-  fi
-  if [[ -n ${VISOR_PID:-} ]]; then
-    kill "$VISOR_PID" 2>/dev/null || true
-  fi
-  if [[ -f $VISOR_PID_FILE ]]; then
-    kill "$(cat "$VISOR_PID_FILE")" 2>/dev/null || true
+  signal_recorded_pid "$COMPANION_PID_FILE" "$COMPANION_BIN" || true
+  signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" "${VISOR_PID:-}" || true
+  if [[ -n ${HARNESS_RUNTIME_DIR:-} && -d $HARNESS_RUNTIME_DIR ]]; then
+    rm -rf "$HARNESS_RUNTIME_DIR"
   fi
   if [[ -n ${SOCK_FD:-} ]]; then
     printf 'quit\n' >&"$SOCK_FD" 2>/dev/null || true
@@ -139,6 +186,15 @@ http_code() {
       -H 'content-type: application/json' --data-binary "$body" >"$out"
   else
     curl --max-time 20 -sS -o "$HTTP_BODY" -w '%{http_code}' -X "$method" "$url" >"$out"
+  fi
+}
+
+# Background a request and remember its pid for the scenario timeout.
+spawn_request() {
+  "$@" &
+  SPAWN_PID=$!
+  if [[ -n ${SCENARIO_BG:-} ]]; then
+    echo "$SPAWN_PID" >>"$SCENARIO_BG"
   fi
 }
 
@@ -256,7 +312,7 @@ open_session() {
 }
 
 start_visor() {
-  if [[ -n ${VISOR_PID:-} ]] && kill -0 "$VISOR_PID" 2>/dev/null; then
+  if [[ -n ${VISOR_PID:-} ]] && pid_matches_exe "$VISOR_PID" "$VISOR_BIN" && kill -0 "$VISOR_PID" 2>/dev/null; then
     return 0
   fi
   mkdir -p "$RUNTIME" "$CONFIG"
@@ -288,17 +344,8 @@ start_visor() {
 }
 
 stop_companion() {
-  if [[ ! -f $COMPANION_PID_FILE ]]; then
-    return 0
-  fi
-  local pid
-  pid=$(cat "$COMPANION_PID_FILE" 2>/dev/null || true)
-  rm -f "$COMPANION_PID_FILE"
-  if pid_matches_exe "$pid" "$COMPANION_BIN"; then
-    kill "$pid" 2>/dev/null || true
+  if signal_recorded_pid "$COMPANION_PID_FILE" "$COMPANION_BIN"; then
     sleep 0.2
-  elif [[ -n $pid ]]; then
-    echo "not signalling pid $pid; it is not $COMPANION_BIN" >&2
   fi
 }
 
@@ -348,8 +395,8 @@ start_companion() {
   # because that is when a missing poll is a 503.
   socket_action stop || true
   for i in $(seq 1 50); do
-    http_code "$DISPLAY_LOG_DIR/ready.code" POST "$BASE/companion/automation" '{"action":"start"}'
-    code=$(cat "$DISPLAY_LOG_DIR/ready.code")
+    http_code "$REQ_DIR/ready.code" POST "$BASE/companion/automation" '{"action":"start"}'
+    code=$(cat "$REQ_DIR/ready.code")
     if [[ $code == 204 ]]; then
       socket_action stop
       wait_phase off
@@ -521,14 +568,20 @@ run_named() {
   shift 2
   echo "=== $name ==="
   local flag="$DISPLAY_LOG_DIR/$name.running"
+  local req=$DISPLAY_LOG_DIR/scenarios/$name
+  mkdir -p "$req"
+  : >"$req/bg.pids"
   touch "$flag"
   (
     sleep "$limit"
     if [[ -f $flag && -f $DISPLAY_LOG_DIR/$name.pid ]]; then
       echo "TIMEOUT $name after ${limit}s" >>"$DISPLAY_LOG_DIR/$name.log"
-      local pid
+      # Not a function: `local` would abort this subshell before the kill.
       pid=$(cat "$DISPLAY_LOG_DIR/$name.pid")
+      # The scenario shell is one process group. Background requests are
+      # another, because monitor mode is on, so they are killed from bg.pids.
       kill -TERM -- -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      kill_tracked_requests "$req/bg.pids"
     fi
   ) &
   local timer=$!
@@ -536,8 +589,13 @@ run_named() {
   (
     # The parent cleared -e so `wait` can collect the status. Turn it back
     # on here, or a failed companion start still looks like a pass.
+    # Monitor mode stays on so the companion can be disowned out of this
+    # group. Request jobs are recorded in bg.pids instead.
     set -euo pipefail
     trap - EXIT
+    REQ_DIR=$req
+    HTTP_BODY=$req/http.body
+    SCENARIO_BG=$req/bg.pids
     "$@"
   ) >"$DISPLAY_LOG_DIR/$name.log" 2>&1 &
   local test_pid=$!
@@ -546,6 +604,9 @@ run_named() {
   local status=$?
   set -e
   rm -f "$flag" "$DISPLAY_LOG_DIR/$name.pid"
+  # A request that outlived the scenario must not keep injecting, and its
+  # files live under this scenario's directory either way.
+  kill_tracked_requests "$req/bg.pids"
   kill "$timer" 2>/dev/null || true
   wait "$timer" 2>/dev/null || true
   if [[ $status -eq 0 ]]; then
@@ -853,15 +914,15 @@ scenario_key_down_detects() {
 
 scenario_stop_resume_during_type() {
   ensure_companion
-  python3 - <<'PY' >"$DISPLAY_LOG_DIR/stop-resume-type.json"
+  python3 - <<'PY' >"$REQ_DIR/stop-resume-type.json"
 import json
 print(json.dumps({"text": "q" * 2000}))
 PY
   local attempt code
   for attempt in 1 2 3; do
     ensure_running
-    http_code "$DISPLAY_LOG_DIR/type.code" POST "$BASE/session/$SID/type" @"$DISPLAY_LOG_DIR/stop-resume-type.json" &
-    local curl_pid=$!
+    spawn_request http_code "$REQ_DIR/type.code" POST "$BASE/session/$SID/type" @"$REQ_DIR/stop-resume-type.json"
+    local curl_pid=$SPAWN_PID
     local i saw=0
     for i in $(seq 1 50); do
       if ! kill -0 "$curl_pid" 2>/dev/null; then
@@ -881,16 +942,16 @@ PY
     socket_action stop
     socket_action resume
     wait "$curl_pid" || true
-    code=$(cat "$DISPLAY_LOG_DIR/type.code")
+    code=$(cat "$REQ_DIR/type.code")
     echo "attempt $attempt type status $code $(error_text "$HTTP_BODY")"
     if [[ $code != 409 ]]; then
       echo "stop did not cancel the type"
       continue
     fi
     if wait_phase running 40; then
-      http_code "$DISPLAY_LOG_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":40,"y":40}'
-      [[ $(cat "$DISPLAY_LOG_DIR/last.code") == 204 ]] \
-        || die "move after resume returned $(cat "$DISPLAY_LOG_DIR/last.code") $(cat "$HTTP_BODY")"
+      http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":40,"y":40}'
+      [[ $(cat "$REQ_DIR/last.code") == 204 ]] \
+        || die "move after resume returned $(cat "$REQ_DIR/last.code") $(cat "$HTTP_BODY")"
       [[ $(phase) == running ]] || die "move after resume left $(phase)"
       echo "stop then resume during injection left running"
       return 0
@@ -950,9 +1011,9 @@ scenario_tcp_start_without_poll() {
   if [[ -n $COMPANION_WAS_UP ]]; then
     sleep 2.2
   fi
-  http_code "$DISPLAY_LOG_DIR/tcp-start.code" POST "$BASE/companion/automation" '{"action":"start"}'
+  http_code "$REQ_DIR/tcp-start.code" POST "$BASE/companion/automation" '{"action":"start"}'
   local code
-  code=$(cat "$DISPLAY_LOG_DIR/tcp-start.code")
+  code=$(cat "$REQ_DIR/tcp-start.code")
   [[ $code == 503 ]] || die "tcp start returned $code ($(cat "$HTTP_BODY"))"
   grep -q 'no recent companion poll' "$HTTP_BODY" || die "body $(cat "$HTTP_BODY")"
   [[ $(phase) == off ]] || die "phase became $(phase)"
@@ -963,14 +1024,14 @@ scenario_inject_lands() {
   ensure_running
   focus_xev
   xev_mark
-  http_code "$DISPLAY_LOG_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":80,"y":90}'
-  [[ $(cat "$DISPLAY_LOG_DIR/last.code") == 204 ]] || die "move $(cat "$DISPLAY_LOG_DIR/last.code") $(cat "$HTTP_BODY")"
-  http_code "$DISPLAY_LOG_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"click","x":100,"y":120,"button":"left"}'
-  [[ $(cat "$DISPLAY_LOG_DIR/last.code") == 204 ]] || die "click $(cat "$DISPLAY_LOG_DIR/last.code")"
-  http_code "$DISPLAY_LOG_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"drag","x":60,"y":70,"to_x":180,"to_y":200,"button":"left"}'
-  [[ $(cat "$DISPLAY_LOG_DIR/last.code") == 204 ]] || die "drag $(cat "$DISPLAY_LOG_DIR/last.code")"
-  http_code "$DISPLAY_LOG_DIR/last.code" POST "$BASE/session/$SID/type" '{"text":"Hi","keys":[{"key":"return","action":"tap"}]}'
-  [[ $(cat "$DISPLAY_LOG_DIR/last.code") == 204 ]] || die "type $(cat "$DISPLAY_LOG_DIR/last.code") $(cat "$HTTP_BODY")"
+  http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":80,"y":90}'
+  [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "move $(cat "$REQ_DIR/last.code") $(cat "$HTTP_BODY")"
+  http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"click","x":100,"y":120,"button":"left"}'
+  [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "click $(cat "$REQ_DIR/last.code")"
+  http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"drag","x":60,"y":70,"to_x":180,"to_y":200,"button":"left"}'
+  [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "drag $(cat "$REQ_DIR/last.code")"
+  http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/type" '{"text":"Hi","keys":[{"key":"return","action":"tap"}]}'
+  [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "type $(cat "$REQ_DIR/last.code") $(cat "$HTTP_BODY")"
   sleep 0.4
   local log presses
   log=$(xev_since)
@@ -986,7 +1047,7 @@ scenario_inject_lands() {
 scenario_uinput_key_pauses_type() {
   ensure_companion
   focus_xev
-  python3 - <<'PY' >"$DISPLAY_LOG_DIR/long-type.json"
+  python3 - <<'PY' >"$REQ_DIR/long-type.json"
 import json
 print(json.dumps({"text": "q" * 2000}))
 PY
@@ -994,8 +1055,8 @@ PY
   for attempt in 1 2 3; do
     ensure_running
     xev_mark
-    http_code "$DISPLAY_LOG_DIR/type.code" POST "$BASE/session/$SID/type" @"$DISPLAY_LOG_DIR/long-type.json" &
-    local curl_pid=$!
+    spawn_request http_code "$REQ_DIR/type.code" POST "$BASE/session/$SID/type" @"$REQ_DIR/long-type.json"
+    local curl_pid=$SPAWN_PID
     sleep 0.05
     local spins=0
     while kill -0 "$curl_pid" 2>/dev/null; do
@@ -1007,7 +1068,7 @@ PY
       sleep 0.02
     done
     wait "$curl_pid" || true
-    code=$(cat "$DISPLAY_LOG_DIR/type.code")
+    code=$(cat "$REQ_DIR/type.code")
     n=$(sent_after keystrokes)
     echo "attempt $attempt status $code sent ${n:-none}"
     if [[ $code == 409 && -n $n && $n -gt 0 && $n -lt 4000 ]]; then
@@ -1036,8 +1097,8 @@ scenario_uinput_move_pauses() {
   ensure_running
   uinput_cmd "rel 30 12"
   wait_phase paused 40
-  http_code "$DISPLAY_LOG_DIR/mouse.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":12,"y":12}'
-  [[ $(cat "$DISPLAY_LOG_DIR/mouse.code") == 409 ]] || die "mouse returned $(cat "$DISPLAY_LOG_DIR/mouse.code")"
+  http_code "$REQ_DIR/mouse.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":12,"y":12}'
+  [[ $(cat "$REQ_DIR/mouse.code") == 409 ]] || die "mouse returned $(cat "$REQ_DIR/mouse.code")"
   grep -q 'automation paused' "$HTTP_BODY" || die "body $(cat "$HTTP_BODY")"
 }
 
@@ -1122,9 +1183,9 @@ scenario_watchdog_pauses() {
 scenario_held_release() {
   ensure_companion
   ensure_running
-  http_code "$DISPLAY_LOG_DIR/last.code" POST "$BASE/session/$SID/type" \
+  http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/type" \
     '{"keys":[{"key":"control","action":"down"},{"key":"a","action":"down"}]}'
-  [[ $(cat "$DISPLAY_LOG_DIR/last.code") == 204 ]] || die "held type $(cat "$DISPLAY_LOG_DIR/last.code") $(cat "$HTTP_BODY")"
+  [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "held type $(cat "$REQ_DIR/last.code") $(cat "$HTTP_BODY")"
   local control a
   control=$(keycode_for Control_L)
   a=$(keycode_for a)
@@ -1134,7 +1195,7 @@ scenario_held_release() {
     die "finished type left a key down"
   fi
 
-  python3 - <<'PY' >"$DISPLAY_LOG_DIR/held-type.json"
+  python3 - <<'PY' >"$REQ_DIR/held-type.json"
 import json
 keys = [{"key": "control", "action": "down"}]
 keys += [{"key": "b", "action": "tap"} for _ in range(1500)]
@@ -1143,8 +1204,8 @@ PY
   local attempt code n
   for attempt in 1 2 3; do
     ensure_running
-    http_code "$DISPLAY_LOG_DIR/type.code" POST "$BASE/session/$SID/type" @"$DISPLAY_LOG_DIR/held-type.json" &
-    local curl_pid=$!
+    spawn_request http_code "$REQ_DIR/type.code" POST "$BASE/session/$SID/type" @"$REQ_DIR/held-type.json"
+    local curl_pid=$SPAWN_PID
     local i
     sleep 0.02
     for i in $(seq 1 400); do
@@ -1154,7 +1215,7 @@ PY
       socket_action pause || true
     done
     wait "$curl_pid" || true
-    code=$(cat "$DISPLAY_LOG_DIR/type.code")
+    code=$(cat "$REQ_DIR/type.code")
     n=$(sent_after keystrokes)
     echo "key cancel attempt $attempt status $code sent ${n:-none}"
     if [[ $code == 409 && -n $n && $n -gt 0 ]]; then
@@ -1187,9 +1248,9 @@ PY
       *) delay=0 ;;
     esac
     ensure_running
-    http_code "$DISPLAY_LOG_DIR/drag.code" POST "$BASE/session/$SID/mouse" \
-      "{\"action\":\"drag\",\"x\":0,\"y\":0,\"to_x\":$to_x,\"to_y\":$to_y,\"button\":\"left\"}" &
-    curl_pid=$!
+    spawn_request http_code "$REQ_DIR/drag.code" POST "$BASE/session/$SID/mouse" \
+      "{\"action\":\"drag\",\"x\":0,\"y\":0,\"to_x\":$to_x,\"to_y\":$to_y,\"button\":\"left\"}"
+    curl_pid=$SPAWN_PID
     sleep "$delay"
     for i in $(seq 1 400); do
       if ! kill -0 "$curl_pid" 2>/dev/null; then
@@ -1198,7 +1259,7 @@ PY
       socket_action pause || true
     done
     wait "$curl_pid" || true
-    code=$(cat "$DISPLAY_LOG_DIR/drag.code")
+    code=$(cat "$REQ_DIR/drag.code")
     n=$(sent_after "pointer steps")
     echo "drag cancel attempt $attempt status $code sent ${n:-none} total $total $(error_text "$HTTP_BODY")"
     if button_is_down; then
@@ -1410,16 +1471,16 @@ scenario_wayland_refuses_automation() {
   start_companion "" wayland
   local action code
   for action in start resume; do
-    http_code "$DISPLAY_LOG_DIR/wl.code" POST "$BASE/companion/automation" "{\"action\":\"$action\"}"
-    code=$(cat "$DISPLAY_LOG_DIR/wl.code")
+    http_code "$REQ_DIR/wl.code" POST "$BASE/companion/automation" "{\"action\":\"$action\"}"
+    code=$(cat "$REQ_DIR/wl.code")
     [[ $code == 501 ]] || die "$action returned $code ($(cat "$HTTP_BODY"))"
     grep -q '#17' "$HTTP_BODY" || die "$action body $(cat "$HTTP_BODY")"
   done
-  http_code "$DISPLAY_LOG_DIR/wl.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":1,"y":1}'
-  [[ $(cat "$DISPLAY_LOG_DIR/wl.code") == 501 ]] || die "mouse returned $(cat "$DISPLAY_LOG_DIR/wl.code")"
+  http_code "$REQ_DIR/wl.code" POST "$BASE/session/$SID/mouse" '{"action":"move","x":1,"y":1}'
+  [[ $(cat "$REQ_DIR/wl.code") == 501 ]] || die "mouse returned $(cat "$REQ_DIR/wl.code")"
   grep -q '#17' "$HTTP_BODY" || die "mouse body $(cat "$HTTP_BODY")"
-  http_code "$DISPLAY_LOG_DIR/wl.code" POST "$BASE/session/$SID/type" '{"text":"no"}'
-  [[ $(cat "$DISPLAY_LOG_DIR/wl.code") == 501 ]] || die "type returned $(cat "$DISPLAY_LOG_DIR/wl.code")"
+  http_code "$REQ_DIR/wl.code" POST "$BASE/session/$SID/type" '{"text":"no"}'
+  [[ $(cat "$REQ_DIR/wl.code") == 501 ]] || die "type returned $(cat "$REQ_DIR/wl.code")"
   grep -q '#17' "$HTTP_BODY" || die "type body $(cat "$HTTP_BODY")"
   local i
   for i in $(seq 1 30); do
