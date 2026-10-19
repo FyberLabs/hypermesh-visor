@@ -16,8 +16,10 @@
 # paths are ignored. Runtime, config, state, and data directories are ones
 # this script creates with mktemp. remove, chmod, and writes go through
 # refuse_outside, which rejects a path outside those directories and
-# display-logs/. The X11 :99 lock files and the uinput nodes this script
-# creates are the only other paths it may remove or chmod.
+# display-logs/. Process ids that have to survive a scenario subshell live
+# in the private state directory. Xorg's display comes from -displayfd. The
+# harness does not read or remove /tmp/.X*-lock, and it does not chmod
+# /dev/uinput or the event nodes.
 set -euo pipefail
 set -m
 
@@ -73,7 +75,11 @@ if [[ -z ${XDG_RUNTIME_DIR:-} ]]; then
 fi
 VISOR_BIN=$root/target/debug/hypermesh-visor
 COMPANION_BIN=$root/target/debug/hypermesh-companion
-COMPANION_PID_FILE=$DISPLAY_LOG_DIR/companion.pid
+# Cross-scenario process state. Scenario bodies run in subshells, so a shell
+# variable set there never reaches the parent or the next scenario.
+PROC=$STATE/procs
+mkdir -p "$PROC"
+COMPANION_PID_FILE=$PROC/companion.pid
 XEV_LOG=$DISPLAY_LOG_DIR/xev.log
 XEV_AT=0
 FAILED=()
@@ -89,7 +95,7 @@ SOCK_PID=
 XORG_PID=
 XEV_PID=
 VISOR_PID=
-VISOR_PID_FILE=$DISPLAY_LOG_DIR/visor.pid
+VISOR_PID_FILE=$PROC/visor.pid
 COMPOSITOR_PID=
 COMPANION_WAS_UP=
 CORE_POINTER_ID=
@@ -130,28 +136,12 @@ path_inside_roots() {
   return 1
 }
 
-# Paths this script creates that cannot live under the temp dirs: the Xorg
-# :99 lock, and the uinput nodes start_uinput recorded.
-path_is_display_artifact() {
-  local path=$1 recorded
-  case $path in
-    /tmp/.X99-lock|/tmp/.X11-unix/X99) return 0 ;;
-  esac
-  [[ $path == "$(owned_path /dev/uinput)" ]] && return 0
-  if [[ $path =~ ^/dev/input/event[0-9]+$ ]]; then
-    for recorded in "${UINPUT_POINTER:-}" "${UINPUT_KEYBOARD:-}"; do
-      [[ -n $recorded && $path == "$(owned_path "$recorded")" ]] && return 0
-    done
-  fi
-  return 1
-}
-
 # Refuse rm, chmod, or a write outside the harness temp dirs and display-logs.
 refuse_outside() {
   local path
   [[ -n ${1:-} ]] || die "refusing an empty path"
   path=$(owned_path "$1")
-  if path_inside_roots "$path" || path_is_display_artifact "$path"; then
+  if path_inside_roots "$path"; then
     return 0
   fi
   die "refusing to remove, chmod, or write $path: outside the harness temp dirs and display-logs"
@@ -192,20 +182,120 @@ chmod_inside() {
   chmod "$mode" -- "$@"
 }
 
-chmod_device() {
-  local mode=$1
-  shift
-  local path
-  for path in "$@"; do
-    refuse_outside "$path"
-  done
-  sudo chmod "$mode" -- "$@"
+read_state() {
+  local file=$PROC/$1
+  [[ -f $file ]] || return 0
+  tr -d '\n' <"$file"
 }
 
-remove_x11_locks() {
-  refuse_outside /tmp/.X99-lock
-  refuse_outside /tmp/.X11-unix/X99
-  sudo rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
+write_state() {
+  local file=$PROC/$1
+  allow_write "$file"
+  printf '%s\n' "$2" >"$file"
+}
+
+clear_state() {
+  local file=$PROC/$1
+  [[ -e $file ]] || return 0
+  remove_inside "$file"
+}
+
+# Every process this run starts. Cleanup signals the list; the self-check
+# fails if one is still the same executable afterwards.
+# `marker` is a cmdline substring unique to this launch. Cleanup may sudo
+# kill only when that substring is still there.
+note_started() {
+  local pid=$1 exe=$2 marker=${3:-}
+  [[ $pid =~ ^[0-9]+$ && -n $exe ]] || return 0
+  allow_write "$PROC/started"
+  printf '%s\t%s\t%s\n' "$pid" "$exe" "$marker" >>"$PROC/started"
+  disown "$pid" 2>/dev/null || true
+}
+
+started_by_this_run() {
+  local pid=$1 line_pid line_exe
+  [[ -f $PROC/started ]] || return 1
+  while IFS=$'\t' read -r line_pid line_exe; do
+    [[ $line_pid == "$pid" ]] && return 0
+  done <"$PROC/started"
+  return 1
+}
+
+load_proc_state() {
+  CONTROL_SOCK=$(read_state control.sock)
+  TCP_BASE=$(read_state tcp.base)
+  SID=$(read_state session.id)
+  VISOR_PID=$(read_state visor.pid)
+  COMPANION_WAS_UP=$(read_state companion.was-up)
+  UINPUT_PORT=$(read_state uinput.port)
+  UINPUT_POINTER=$(read_state uinput.pointer)
+  UINPUT_KEYBOARD=$(read_state uinput.keyboard)
+  local disp
+  disp=$(read_state xorg.display)
+  if [[ $disp =~ ^[0-9]+$ ]]; then
+    export DISPLAY=:$disp
+  fi
+}
+
+exe_is_xorg() {
+  local pid=$1 exe base
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  base=$(basename "$exe")
+  [[ $base == Xorg || $base == Xorg.bin ]]
+}
+
+# The only place that may change a device node. The harness does not call it.
+# A caller that opts in gets the original mode, owner, group, and ACL restored
+# from the exit trap.
+change_device_perms() {
+  local path=$1 new_mode=$2 mode owner group
+  [[ -e $path ]] || die "no such device $path"
+  read -r mode owner group < <(stat -c '%a %U %G' "$path")
+  echo "device permission change: $path mode $mode owner ${owner}:${group} -> mode $new_mode" >&2
+  if [[ ${HYPERMESH_DISPLAY_DEVICE_PERMS:-} != 1 ]]; then
+    die "refusing to change $path; set HYPERMESH_DISPLAY_DEVICE_PERMS=1 to opt in"
+  fi
+  allow_write "$PROC/device-perms.log"
+  printf '%s\t%s\t%s\t%s\n' "$path" "$mode" "$owner" "$group" >>"$PROC/device-perms.log"
+  if command -v getfacl >/dev/null 2>&1; then
+    local acl=$PROC/acl-$(basename "$path")
+    allow_write "$acl"
+    getfacl -p "$path" >"$acl"
+  fi
+  sudo -n chmod "$new_mode" -- "$path"
+}
+
+restore_device_perms() {
+  local log=$PROC/device-perms.log
+  [[ -f $log ]] || return 0
+  local path mode owner group acl
+  while IFS=$'\t' read -r path mode owner group; do
+    [[ -n $path && -e $path ]] || continue
+    echo "restoring $path to mode $mode owner ${owner}:${group}" >&2
+    sudo -n chown "$owner:$group" -- "$path" 2>/dev/null || true
+    sudo -n chmod "$mode" -- "$path" 2>/dev/null || true
+    acl=$PROC/acl-$(basename "$path")
+    if [[ -f $acl ]] && command -v setfacl >/dev/null 2>&1; then
+      sudo -n setfacl --restore=- <"$acl" 2>/dev/null || true
+    fi
+  done <"$log"
+  remove_inside "$log"
+}
+
+remember_uinput() {
+  [[ -e /dev/uinput ]] || {
+    if [[ ! -f $PROC/uinput.stamp ]]; then
+      allow_write "$PROC/uinput.stamp"
+      printf 'absent\n' >"$PROC/uinput.stamp"
+    fi
+    return 0
+  }
+  if [[ -f $PROC/uinput.stamp ]] && ! grep -qx 'absent' "$PROC/uinput.stamp"; then
+    return 0
+  fi
+  allow_write "$PROC/uinput.stamp"
+  stat -c '%a %U %G' /dev/uinput >"$PROC/uinput.stamp"
 }
 
 # True when /proc/$pid still belongs to this executable. A recycled pid must
@@ -234,11 +324,28 @@ signal_if_exe() {
     return 1
   fi
   if pid_matches_exe "$pid" "$expected"; then
-    kill "$pid" 2>/dev/null || true
-    return 0
+    if kill "$pid" 2>/dev/null; then
+      return 0
+    fi
+    return 2
   fi
   echo "not signalling pid $pid; it is not $expected" >&2
   return 1
+}
+
+# sudo kill only for a pid this run recorded, whose cmdline still contains
+# the marker from that launch (the Xorg logfile, or the uinput helper path).
+signal_root_child() {
+  local pid=$1 expected=$2 marker=${3:-} cmd
+  [[ $pid =~ ^[0-9]+$ && -n $expected && -n $marker ]] || return 1
+  pid_matches_exe "$pid" "$expected" || return 1
+  started_by_this_run "$pid" || return 1
+  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+  if [[ $cmd != *"$marker"* ]]; then
+    echo "not signalling pid $pid; cmdline does not contain $marker" >&2
+    return 1
+  fi
+  sudo -n kill "$pid" 2>/dev/null || true
 }
 
 # Drop a pid file, then signal the recorded pid and an optional in-memory
@@ -276,6 +383,104 @@ kill_tracked_requests() {
 
 MAIN_BASHPID=$BASHPID
 
+stop_recorded() {
+  local name=$1 exe=$2 pid
+  pid=$(read_state "$name")
+  [[ $pid =~ ^[0-9]+$ ]] || return 0
+  signal_if_exe "$pid" "$exe" || true
+  clear_state "$name"
+}
+
+stop_started() {
+  local pid exe marker i alive
+  [[ -f $PROC/started ]] || return 0
+  while IFS=$'\t' read -r pid exe marker; do
+    [[ $pid =~ ^[0-9]+$ && -n $exe ]] || continue
+    [[ -d /proc/$pid ]] || continue
+    if ! signal_if_exe "$pid" "$exe"; then
+      signal_root_child "$pid" "$exe" "$marker" || true
+    fi
+  done <"$PROC/started"
+  for i in $(seq 1 25); do
+    alive=0
+    while IFS=$'\t' read -r pid exe marker; do
+      [[ $pid =~ ^[0-9]+$ && -n $exe ]] || continue
+      if [[ -d /proc/$pid ]] && pid_matches_exe "$pid" "$exe"; then
+        alive=1
+        break
+      fi
+    done <"$PROC/started"
+    if (( alive == 0 )); then
+      return 0
+    fi
+    sleep 0.1
+  done
+}
+
+self_check() {
+  local bad=0 stamp now pid exe mode other
+  if [[ -f $PROC/uinput.stamp ]]; then
+    stamp=$(cat "$PROC/uinput.stamp")
+    if [[ $stamp == absent ]]; then
+      if [[ -e /dev/uinput ]]; then
+        echo "self-check: /dev/uinput exists and its original mode was not recorded" >&2
+        bad=1
+      fi
+    elif [[ ! -e /dev/uinput ]]; then
+      echo "self-check: /dev/uinput disappeared (was $stamp)" >&2
+      bad=1
+    else
+      now=$(stat -c '%a %U %G' /dev/uinput)
+      if [[ $now != "$stamp" ]]; then
+        echo "self-check: /dev/uinput is $now, originally $stamp" >&2
+        bad=1
+      fi
+    fi
+  fi
+  local node key node_stamp
+  for key in uinput.pointer uinput.keyboard; do
+    node=$(read_state "$key")
+    [[ -n $node && -e $node ]] || continue
+    node_stamp=$(read_state "$key.mode")
+    mode=$(stat -c '%a %U %G' "$node")
+    if [[ -z $node_stamp ]]; then
+      echo "self-check: $node mode was not recorded" >&2
+      bad=1
+    elif [[ $mode != "$node_stamp" ]]; then
+      echo "self-check: $node is $mode, originally $node_stamp" >&2
+      bad=1
+    fi
+    other=${mode%% *}
+    other=${other: -1}
+    local recorded=${node_stamp%% *}
+    # A node udev created world-writable is unchanged when the stamp matches.
+    # Becoming world-writable after that stamp is a permission change.
+    if [[ $other =~ ^[0-9]$ && $recorded =~ [0-9]$ ]]; then
+      local recorded_other=${recorded: -1}
+      if (( (other & 2) != 0 && (recorded_other & 2) == 0 )); then
+        echo "self-check: $node is world-writable (mode $mode)" >&2
+        bad=1
+      fi
+    elif [[ $other =~ ^[0-9]$ ]] && (( other & 2 )); then
+      echo "self-check: $node is world-writable (mode $mode)" >&2
+      bad=1
+    fi
+  done
+  if [[ -f $PROC/started ]]; then
+    while IFS=$'\t' read -r pid exe marker; do
+      [[ $pid =~ ^[0-9]+$ && -n $exe ]] || continue
+      if [[ -d /proc/$pid ]] && pid_matches_exe "$pid" "$exe"; then
+        echo "self-check: $exe pid $pid is still running" >&2
+        bad=1
+      fi
+    done <"$PROC/started"
+  fi
+  if (( bad )); then
+    return 1
+  fi
+  echo "self-check: /dev/uinput mode and owner unchanged; no harness process left"
+}
+
 cleanup() {
   local status=$?
   # Subshells inherit this trap. Only the top-level shell tears the displays down.
@@ -285,11 +490,25 @@ cleanup() {
   if [[ -n ${UINPUT_FD:-} ]]; then
     printf 'quit\n' >&"$UINPUT_FD" 2>/dev/null || true
   fi
-  if [[ -n ${XEV_PID:-} ]]; then
-    kill "$XEV_PID" 2>/dev/null || true
+  if [[ -n ${SOCK_FD:-} ]]; then
+    printf 'quit\n' >&"$SOCK_FD" 2>/dev/null || true
   fi
   signal_recorded_pid "$COMPANION_PID_FILE" "$COMPANION_BIN" || true
-  signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" "${VISOR_PID:-}" || true
+  signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" || true
+  stop_recorded xev.pid "$(command -v xev || true)"
+  stop_recorded uinput.launcher "$(command -v sudo || true)"
+  stop_recorded sock.pid "$(command -v python3 || true)"
+  local comp_exe
+  comp_exe=$(read_state compositor.exe)
+  if [[ -n $comp_exe ]]; then
+    stop_recorded compositor.pid "$comp_exe"
+  fi
+  kill_recorded_xorg || true
+  stop_started
+  restore_device_perms || true
+  if ! self_check; then
+    status=1
+  fi
   remove_tree \
     "${HARNESS_RUNTIME_DIR:-}" \
     "${HARNESS_CONFIG_DIR:-}" \
@@ -297,25 +516,6 @@ cleanup() {
     "${HARNESS_DATA_DIR:-}" \
     "${HARNESS_MCP_DIR:-}" \
     "${HARNESS_XDG:-}"
-  if [[ -n ${SOCK_FD:-} ]]; then
-    printf 'quit\n' >&"$SOCK_FD" 2>/dev/null || true
-  fi
-  if [[ -n ${UINPUT_PID:-} ]]; then
-    kill "$UINPUT_PID" 2>/dev/null || true
-  fi
-  if [[ -n ${SOCK_PID:-} ]]; then
-    kill "$SOCK_PID" 2>/dev/null || true
-  fi
-  if [[ -n ${COMPOSITOR_PID:-} ]]; then
-    kill "$COMPOSITOR_PID" 2>/dev/null || true
-  fi
-  if [[ -f /tmp/.X99-lock ]]; then
-    sudo kill "$(head -n 1 /tmp/.X99-lock)" 2>/dev/null || true
-    remove_x11_locks
-  fi
-  if [[ -n ${XORG_PID:-} ]]; then
-    kill "$XORG_PID" 2>/dev/null || sudo kill "$XORG_PID" 2>/dev/null || true
-  fi
   exit "$status"
 }
 trap cleanup EXIT
@@ -456,12 +656,21 @@ open_session() {
   SID=$(curl_visor --max-time 10 -fsS -X POST "$BASE/session" \
     -H 'content-type: application/json' -d "$body" \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+  write_state session.id "$SID"
   echo "session $SID"
 }
 
+recorded_visor_alive() {
+  local pid
+  pid=$(read_state visor.pid)
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  pid_matches_exe "$pid" "$VISOR_BIN" && kill -0 "$pid" 2>/dev/null
+}
+
 stop_visor() {
-  local pid=${VISOR_PID:-}
-  signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" "$pid" || true
+  local pid
+  pid=$(read_state visor.pid)
+  signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" || true
   local i
   for i in $(seq 1 30); do
     if [[ -z $pid ]] || ! kill -0 "$pid" 2>/dev/null; then
@@ -470,14 +679,26 @@ stop_visor() {
     sleep 0.1
   done
   VISOR_PID=
+  clear_state control.sock
+  clear_state tcp.base
 }
 
 # `tcp` also opens the opt-in loopback port. The control socket is always used
-# for the harness requests above.
+# for the harness requests above. A live recorded visor is left in place unless
+# this call is switching it to TCP, and then it is stopped before any socket
+# or lock file is removed.
 start_visor() {
   local tcp=${1:-}
-  if [[ -z $tcp && -n ${VISOR_PID:-} ]] && pid_matches_exe "$VISOR_PID" "$VISOR_BIN" && kill -0 "$VISOR_PID" 2>/dev/null; then
+  load_proc_state
+  if [[ -z $tcp ]] && recorded_visor_alive; then
     return 0
+  fi
+  if recorded_visor_alive; then
+    stop_visor
+  fi
+  if recorded_visor_alive; then
+    echo "refusing to remove visor sockets while pid $(read_state visor.pid) is alive" >&2
+    return 1
   fi
   mkdir -p "$RUNTIME" "$CONFIG"
   chmod_inside 0700 "$RUNTIME" "$CONFIG"
@@ -494,8 +715,8 @@ start_visor() {
   "$VISOR_BIN" "${args[@]}" \
     >"$DISPLAY_LOG_DIR/visor.out" 2>"$DISPLAY_LOG_DIR/visor.err" &
   VISOR_PID=$!
-  echo "$VISOR_PID" >"$VISOR_PID_FILE"
-  disown "$VISOR_PID" 2>/dev/null || true
+  note_started "$VISOR_PID" "$VISOR_BIN"
+  write_state visor.pid "$VISOR_PID"
   local i line
   for i in $(seq 1 50); do
     if [[ -s $DISPLAY_LOG_DIR/visor.out ]]; then
@@ -503,12 +724,14 @@ start_visor() {
       if [[ -n $line && -S $line ]]; then
         CONTROL_SOCK=$line
         BASE=http://localhost
+        write_state control.sock "$CONTROL_SOCK"
         if [[ $tcp == tcp ]]; then
           TCP_BASE=$(awk '/^listening / { print "http://"$2; exit }' "$DISPLAY_LOG_DIR/visor.out")
           if [[ -z $TCP_BASE ]]; then
             sleep 0.1
             continue
           fi
+          write_state tcp.base "$TCP_BASE"
         elif grep -q '^listening ' "$DISPLAY_LOG_DIR/visor.out"; then
           echo "TCP opened without --tcp" >&2
           return 1
@@ -552,7 +775,9 @@ start_companion() {
   # The companion treats SIGHUP as a stop. Disown it so a scenario
   # subshell can exit without taking the process down.
   disown "$pid" 2>/dev/null || true
-  echo "$pid" >"$COMPANION_PID_FILE"
+  note_started "$pid" "$COMPANION_BIN"
+  write_state companion.pid "$pid"
+  write_state companion.was-up 1
   COMPANION_WAS_UP=1
   local i
   for i in $(seq 1 50); do
@@ -790,6 +1015,8 @@ run_named() {
     REQ_DIR=$req
     HTTP_BODY=$req/http.body
     SCENARIO_BG=$req/bg.pids
+    # Shell variables from the parent are a copy. Process ids live in $PROC.
+    load_proc_state
     "$@"
   ) >"$DISPLAY_LOG_DIR/$name.log" 2>&1 &
   local test_pid=$!
@@ -813,22 +1040,72 @@ run_named() {
   FAILED+=("$name")
 }
 
-stop_xorg() {
-  if [[ -f /tmp/.X99-lock ]]; then
-    sudo kill "$(head -n 1 /tmp/.X99-lock)" 2>/dev/null || true
-    sleep 0.2
-    remove_x11_locks
+xorg_is_ours() {
+  local pid=$1 cmd log ppid launcher
+  exe_is_xorg "$pid" || return 1
+  started_by_this_run "$pid" || return 1
+  log=$(read_state xorg.log)
+  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+  if [[ -n $log && $cmd == *"$log"* ]]; then
+    return 0
   fi
-  if [[ -n ${XORG_PID:-} ]]; then
-    kill "$XORG_PID" 2>/dev/null || sudo kill "$XORG_PID" 2>/dev/null || true
+  launcher=$(read_state xorg.launcher)
+  ppid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+  [[ -n $launcher && $ppid == "$launcher" ]] && started_by_this_run "$launcher"
+}
+
+resolve_xorg_pid() {
+  local launcher=$1 child grand
+  if exe_is_xorg "$launcher"; then
+    printf '%s\n' "$launcher"
+    return 0
   fi
+  for child in $(ps -o pid= --ppid "$launcher" 2>/dev/null || true); do
+    if exe_is_xorg "$child"; then
+      printf '%s\n' "$child"
+      return 0
+    fi
+    for grand in $(ps -o pid= --ppid "$child" 2>/dev/null || true); do
+      if exe_is_xorg "$grand"; then
+        printf '%s\n' "$grand"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# sudo kill only after /proc says this pid is the Xorg this run launched.
+kill_recorded_xorg() {
+  local pid launcher
+  pid=$(read_state xorg.pid)
+  if [[ $pid =~ ^[0-9]+$ ]]; then
+    if xorg_is_ours "$pid"; then
+      sudo -n kill "$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
+    else
+      echo "not signalling pid $pid; it is not the Xorg this run started" >&2
+    fi
+  fi
+  launcher=$(read_state xorg.launcher)
+  if [[ $launcher =~ ^[0-9]+$ && $launcher != "$pid" ]]; then
+    signal_if_exe "$launcher" "$(command -v sudo || true)" || \
+      signal_if_exe "$launcher" "$(command -v Xorg || true)" || true
+  fi
+  if [[ -n ${XORG_DISP_FD:-} ]]; then
+    exec {XORG_DISP_FD}>&- || true
+    unset XORG_DISP_FD
+  fi
+  clear_state xorg.pid
+  clear_state xorg.launcher
+  clear_state xorg.display
   XORG_PID=
 }
 
 wait_for_display() {
   local i
+  [[ ${DISPLAY:-} == :* ]] || return 1
   for i in $(seq 1 40); do
-    if DISPLAY=:99 xdpyinfo >/dev/null 2>&1; then
+    if xdpyinfo >/dev/null 2>&1; then
       return 0
     fi
     sleep 0.15
@@ -836,26 +1113,78 @@ wait_for_display() {
   return 1
 }
 
+# -displayfd picks a free display. The lock file under /tmp is never read.
+launch_xorg() {
+  local conf=$1 log=$2 as_root=${3:-}
+  local disp_file=$PROC/xorg.display.num number="" i xpid xexe
+  allow_write "$log" "$disp_file"
+  : >"$disp_file"
+  write_state xorg.log "$log"
+  if [[ $as_root == root ]]; then
+    sudo -n bash -c 'exec 3>"$1"; shift; exec Xorg -displayfd 3 "$@"' \
+      bash "$disp_file" \
+      -ac -noreset -novtswitch -sharevts -nolisten tcp \
+      -config "$conf" -logfile "$log" >/dev/null 2>&1 &
+    local launcher=$!
+    note_started "$launcher" "$(command -v sudo)"
+    write_state xorg.launcher "$launcher"
+  else
+    if [[ -n ${XORG_DISP_FD:-} ]]; then
+      exec {XORG_DISP_FD}>&- || true
+      unset XORG_DISP_FD
+    fi
+    exec {XORG_DISP_FD}>"$disp_file"
+    Xorg -displayfd "$XORG_DISP_FD" \
+      -ac -noreset -novtswitch -sharevts -nolisten tcp \
+      -config "$conf" -logfile "$log" >/dev/null 2>&1 &
+    local launcher=$!
+    note_started "$launcher" "$(command -v Xorg)"
+    write_state xorg.launcher "$launcher"
+  fi
+  for i in $(seq 1 40); do
+    number=$(tr -dc '0-9' <"$disp_file" || true)
+    if [[ $number =~ ^[0-9]+$ ]]; then
+      break
+    fi
+    kill -0 "$launcher" 2>/dev/null || return 1
+    sleep 0.15
+  done
+  [[ $number =~ ^[0-9]+$ ]] || return 1
+  write_state xorg.display "$number"
+  export DISPLAY=:$number
+  xpid=
+  for i in $(seq 1 20); do
+    xpid=$(resolve_xorg_pid "$launcher" || true)
+    [[ -n $xpid ]] && break
+    sleep 0.1
+  done
+  [[ -n $xpid ]] || return 1
+  exe_is_xorg "$xpid" || return 1
+  xexe=$(readlink -f "/proc/$xpid/exe")
+  note_started "$xpid" "$xexe" "$log"
+  write_state xorg.pid "$xpid"
+  XORG_PID=$xpid
+}
+
 start_xorg() {
-  local conf=$1 log=$2
+  local conf=$1 log=$2 as_root=""
   allow_write "$log"
-  stop_xorg
-  Xorg :99 -ac -noreset -novtswitch -sharevts -nolisten tcp \
-    -config "$conf" -logfile "$log" >/dev/null 2>&1 &
-  XORG_PID=$!
-  if wait_for_display; then
+  kill_recorded_xorg
+  if [[ -n ${UINPUT_POINTER:-} && ! -r $UINPUT_POINTER ]]; then
+    echo "uinput event nodes are not readable by ${USER:-this user}; starting Xorg as root. Device modes are not changed." >&2
+    as_root=root
+  fi
+  if launch_xorg "$conf" "$log" "$as_root" && wait_for_display; then
     return 0
   fi
-  stop_xorg
-  sudo Xorg :99 -ac -noreset -novtswitch -sharevts -nolisten tcp \
-    -config "$conf" -logfile "$log" >/dev/null 2>&1 &
-  XORG_PID=$!
-  wait_for_display
+  kill_recorded_xorg
+  echo "retrying Xorg as root" >&2
+  launch_xorg "$conf" "$log" root && wait_for_display
 }
 
 have_physical() {
   local list
-  list=$(DISPLAY=:99 xinput list)
+  list=$(xinput list)
   grep -q 'hypermesh-display-pointer' <<<"$list" \
     && grep -q 'hypermesh-display-keyboard' <<<"$list"
 }
@@ -925,18 +1254,55 @@ EndSection
 EOF
 }
 
+# A descendant of `launcher` whose /proc identity matches `expected`.
+resolve_child_pid() {
+  local launcher=$1 expected=$2
+  local -a current=("$launcher") next=()
+  local depth=0 pid child
+  while (( depth < 4 && ${#current[@]} )); do
+    next=()
+    for pid in "${current[@]}"; do
+      if (( depth > 0 )) && pid_matches_exe "$pid" "$expected"; then
+        printf '%s\n' "$pid"
+        return 0
+      fi
+      for child in $(ps -o pid= --ppid "$pid" 2>/dev/null || true); do
+        next+=("$child")
+      done
+    done
+    current=()
+    if ((${#next[@]})); then
+      current=("${next[@]}")
+    fi
+    depth=$((depth + 1))
+  done
+  if pid_matches_exe "$launcher" "$expected"; then
+    printf '%s\n' "$launcher"
+    return 0
+  fi
+  return 1
+}
+
 start_uinput() {
-  sudo modprobe uinput 2>/dev/null || true
+  remember_uinput
+  sudo -n modprobe uinput 2>/dev/null || true
+  remember_uinput
   if [[ ! -e /dev/uinput ]]; then
     echo "uinput: /dev/uinput is missing after modprobe. Physical input is not faked with XTEST." >&2
     return 1
   fi
-  chmod_device 0666 /dev/uinput || true
+  # The helper runs as root and only creates devices. /dev/uinput and the
+  # event nodes keep the mode udev gave them.
+  local helper=$root/ci/display/uinput.py
   allow_write "$DISPLAY_LOG_DIR/uinput.ready" "$DISPLAY_LOG_DIR/uinput.err"
-  python3 -u "$root/ci/display/uinput.py" \
+  sudo -n python3 -u "$helper" \
     >"$DISPLAY_LOG_DIR/uinput.ready" 2>"$DISPLAY_LOG_DIR/uinput.err" &
-  UINPUT_PID=$!
-  local i line
+  local launcher=$!
+  local py_bin
+  py_bin=$(command -v python3)
+  note_started "$launcher" "$(command -v sudo)"
+  write_state uinput.launcher "$launcher"
+  local i line py="" expected
   for i in $(seq 1 50); do
     if [[ -s $DISPLAY_LOG_DIR/uinput.ready ]]; then
       line=$(head -n 1 "$DISPLAY_LOG_DIR/uinput.ready")
@@ -947,7 +1313,7 @@ start_uinput() {
         break
       fi
     fi
-    if ! kill -0 "$UINPUT_PID" 2>/dev/null; then
+    if ! kill -0 "$launcher" 2>/dev/null; then
       echo "uinput helper exited" >&2
       cat "$DISPLAY_LOG_DIR/uinput.err" >&2 || true
       return 1
@@ -959,14 +1325,45 @@ start_uinput() {
     cat "$DISPLAY_LOG_DIR/uinput.err" >&2 || true
     return 1
   fi
-  sudo udevadm settle 2>/dev/null || true
-  chmod_device 0666 "$UINPUT_POINTER" "$UINPUT_KEYBOARD" || true
+  for expected in "$py_bin" python3; do
+    py=$(resolve_child_pid "$launcher" "$expected" || true)
+    if [[ -n $py ]]; then
+      note_started "$py" "$expected" "$helper"
+      write_state uinput.pid "$py"
+      UINPUT_PID=$py
+      break
+    fi
+  done
+  if [[ -z $py ]]; then
+    echo "uinput helper is up but its python pid was not identified" >&2
+    return 1
+  fi
+  write_state uinput.port "$UINPUT_PORT"
+  write_state uinput.pointer "$UINPUT_POINTER"
+  write_state uinput.keyboard "$UINPUT_KEYBOARD"
+  sudo -n udevadm settle 2>/dev/null || true
+  local node key mode
+  for key in uinput.pointer uinput.keyboard; do
+    node=$(read_state "$key")
+    for i in $(seq 1 30); do
+      [[ -e $node ]] && break
+      sleep 0.1
+    done
+    if [[ ! -e $node ]]; then
+      echo "uinput: $node did not appear" >&2
+      return 1
+    fi
+    mode=$(stat -c '%a %U %G' "$node")
+    if [[ -z $(read_state "$key.mode") ]]; then
+      write_state "$key.mode" "$mode"
+    fi
+    echo "uinput node $node mode $mode (not changed)"
+  done
   exec {UINPUT_FD}<>/dev/tcp/127.0.0.1/"$UINPUT_PORT"
   echo "uinput pointer=$UINPUT_POINTER keyboard=$UINPUT_KEYBOARD"
 }
 
 probe_physical_move() {
-  export DISPLAY=:99
   xset s off -dpms || true
   xset m 1 1 || true
   local id before after
@@ -998,6 +1395,8 @@ start_socket_helper() {
   python3 -u "$root/ci/display/sock.py" "$RUNTIME/companion.sock" \
     >"$DISPLAY_LOG_DIR/sock.ready" 2>"$DISPLAY_LOG_DIR/sock.err" &
   SOCK_PID=$!
+  note_started "$SOCK_PID" "$(command -v python3)" "$root/ci/display/sock.py"
+  write_state sock.pid "$SOCK_PID"
   local i line port
   for i in $(seq 1 50); do
     if [[ -s $DISPLAY_LOG_DIR/sock.ready ]]; then
@@ -1049,7 +1448,7 @@ setup_x11() {
     PHYSICAL_DRIVER=libinput
   else
     echo "libinput did not attach the uinput nodes; retrying with evdev on the same nodes" >&2
-    DISPLAY=:99 xinput list >&2 || true
+    xinput list >&2 || true
     write_evdev_conf
     if ! start_xorg "$DISPLAY_LOG_DIR/xorg-evdev.conf" "$DISPLAY_LOG_DIR/xorg-evdev.log"; then
       echo "Xorg did not start" >&2
@@ -1058,17 +1457,18 @@ setup_x11() {
     fi
     if ! have_physical; then
       echo "uinput nodes are not slave devices. Physical input was not faked with XTEST." >&2
-      DISPLAY=:99 xinput list >&2 || true
+      xinput list >&2 || true
       cat "$DISPLAY_LOG_DIR/xorg-evdev.log" >&2 || true
       return 1
     fi
     PHYSICAL_DRIVER=evdev
   fi
-  export DISPLAY=:99
   probe_physical_move
   allow_write "$XEV_LOG"
   xev -geometry 500x400+40+40 >"$XEV_LOG" 2>&1 &
   XEV_PID=$!
+  note_started "$XEV_PID" "$(command -v xev)"
+  write_state xev.pid "$XEV_PID"
   local i
   for i in $(seq 1 50); do
     if xdotool search --name "Event Tester" >/dev/null 2>&1; then
@@ -1751,6 +2151,12 @@ start_compositor() {
   allow_write "$DISPLAY_LOG_DIR/compositor.log"
   "$@" >"$DISPLAY_LOG_DIR/compositor.log" 2>&1 &
   COMPOSITOR_PID=$!
+  local bin
+  bin=$(command -v "$1" || true)
+  [[ -n $bin ]] || bin=$1
+  note_started "$COMPOSITOR_PID" "$bin"
+  write_state compositor.pid "$COMPOSITOR_PID"
+  write_state compositor.exe "$bin"
   wait_for_new_display "$before_x11" "$socket_mode" "$1"
 }
 
@@ -1781,8 +2187,10 @@ EOF
   echo "sway did not provide Xwayland; trying weston headless" >&2
   cat "$DISPLAY_LOG_DIR/compositor.log" >&2 || true
   if [[ -n ${COMPOSITOR_PID:-} ]]; then
-    kill "$COMPOSITOR_PID" 2>/dev/null || true
+    signal_if_exe "$COMPOSITOR_PID" "$(read_state compositor.exe)" || true
     COMPOSITOR_PID=
+    clear_state compositor.pid
+    clear_state compositor.exe
   fi
   unset WAYLAND_DISPLAY || true
   before=$(x11_sockets)
@@ -1869,6 +2277,7 @@ usage() {
 }
 
 main() {
+  remember_uinput
   local kind=${1:-}
   local only=${2:-}
   case $kind in

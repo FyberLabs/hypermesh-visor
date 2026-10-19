@@ -31,7 +31,7 @@ jobs:
             xdotool \
             python3
           sudo modprobe uinput
-          sudo chmod 0666 /dev/uinput || true
+          # The harness opens /dev/uinput as root and does not change device modes.
 
       - name: Run X11 display scenarios
         run: bash ci/display/run.sh x11
