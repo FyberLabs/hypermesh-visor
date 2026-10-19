@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -555,6 +556,35 @@ pub(crate) fn companion_router(state: Arc<AppState>) -> Router {
     routes(state, true)
 }
 
+/// Opt-in TCP router. The bearer check runs before routing, so a missing or
+/// wrong token is 401 on every path, including paths with no handler. The
+/// inner routes are not the companion link: the token cannot lift a pause.
+fn tcp_router(state: Arc<AppState>, token: String) -> Router {
+    let api = router(state).fallback(|| async { StatusCode::NOT_FOUND });
+    let guarded = tower::ServiceBuilder::new()
+        .layer(middleware::from_fn(move |request, next| {
+            let token = token.clone();
+            async move { reject_without_bearer(token, request, next).await }
+        }))
+        .service(api);
+    Router::new().fallback_service(guarded)
+}
+
+async fn reject_without_bearer(token: String, request: Request<Body>, next: Next) -> Response {
+    let header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if !crate::companion_sock::bearer_matches(&token, header) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "unauthorized"})),
+        )
+            .into_response();
+    }
+    next.run(request).await
+}
+
 #[derive(Clone, Copy)]
 struct CompanionLink(bool);
 
@@ -584,50 +614,114 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()> {
+/// `tcp` is the opt-in loopback listener. `None` does not bind a port.
+/// The control API is always on `control.sock`. The companion socket stays
+/// a separate listener and is the only one that can lift a user pause.
+pub async fn serve(tcp: Option<SocketAddr>, state: Arc<AppState>) -> std::io::Result<()> {
     let runtime = crate::companion_sock::runtime_dir()?;
     crate::companion_sock::prepare_dir(&runtime)?;
-    let socket_path = crate::companion_sock::socket_file(&runtime);
+    let companion_path = crate::companion_sock::socket_file(&runtime);
+    let control_path = crate::companion_sock::control_socket_file(&runtime);
     // Held until this function returns, including across the socket replace
     // below. A second process fails here and does not unlink the live socket.
     let _runtime_lock = crate::companion_sock::lock_runtime(&runtime)?;
-    // A second process must not unlink a live companion socket and then fail
-    // the TCP bind, leaving the running visor unreachable.
-    if crate::companion_sock::unix_socket_listening(&socket_path) {
+    // A second process must not unlink a live socket and then fail the TCP
+    // bind, leaving the running visor unreachable.
+    if crate::companion_sock::unix_socket_listening(&companion_path)
+        || crate::companion_sock::unix_socket_listening(&control_path)
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             "visor already running",
         ));
     }
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    let listener_sock = crate::companion_sock::bind(&runtime).await?;
-    let local = listener.local_addr()?;
-    println!("listening {local}");
-    println!("companion socket {}", socket_path.display());
+    // Bind TCP before replacing a stale socket file. A failed port bind
+    // leaves the previous sockets in place.
+    let tcp_listener = match tcp {
+        Some(addr) => Some(tokio::net::TcpListener::bind(addr).await?),
+        None => None,
+    };
+    let companion_listener = crate::companion_sock::bind(&runtime).await?;
+    let control_listener = crate::companion_sock::bind_control(&runtime).await?;
+    let token = if tcp_listener.is_some() {
+        Some(crate::companion_sock::write_api_token(&runtime)?)
+    } else {
+        crate::companion_sock::remove_api_token(&runtime)?;
+        None
+    };
+    println!("control socket {}", control_path.display());
+    println!("companion socket {}", companion_path.display());
+    if let Some(listener) = tcp_listener.as_ref() {
+        println!("listening {}", listener.local_addr()?);
+    }
     let _ = std::io::Write::flush(&mut std::io::stdout());
-    let socket_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        if let Err(err) = crate::companion_sock::accept_loop(listener_sock, socket_state).await {
-            eprintln!("hypermesh-visor: companion socket closed: {err}");
-        }
-    });
     spawn_companion_watch(Arc::clone(&state));
-    // The bearer file from earlier builds is not a credential anymore.
+    // Older builds wrote this name under the config dir. It is not a credential.
     let _ = std::fs::remove_file(state.mcp_dir.join("companion.token"));
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let app = router(Arc::clone(&state));
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        let _ = shutdown_rx.wait_for(|stop| *stop).await;
+    // One stop flag for every listener. The first one to finish cancels the
+    // rest, then close_all runs, then the others have the shutdown deadline.
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let companion_app = companion_router(Arc::clone(&state));
+    let companion_stop = cancel_rx.clone();
+    let companion = tokio::spawn(async move {
+        crate::companion_sock::accept_loop(
+            companion_listener,
+            companion_app,
+            "companion",
+            companion_stop,
+        )
+        .await
     });
-    shutdown_signal().await;
+    let control_app = router(Arc::clone(&state));
+    let control_stop = cancel_rx.clone();
+    let control = tokio::spawn(async move {
+        crate::companion_sock::accept_loop(control_listener, control_app, "control", control_stop)
+            .await
+    });
+    let mut jobs = vec![companion, control];
+    if let (Some(listener), Some(token)) = (tcp_listener, token) {
+        let app = tcp_router(Arc::clone(&state), token);
+        let mut tcp_stop = cancel_rx.clone();
+        jobs.push(tokio::spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = tcp_stop.wait_for(|stop| *stop).await;
+                })
+                .await
+        }));
+    }
+    let mut signal_stop = cancel_rx;
+    jobs.push(tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_signal() => Ok(()),
+            _ = signal_stop.wait_for(|stop| *stop) => Ok(()),
+        }
+    }));
+    when_first_stops(&state, jobs, cancel_tx).await
+}
+
+/// The first listener to finish or fail cancels the others. `close_all` then
+/// cancels injection, releases held input, and clears sessions. The remaining
+/// listeners have [`automation::SHUTDOWN_DEADLINE`] to return.
+async fn when_first_stops(
+    state: &AppState,
+    jobs: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    cancel: tokio::sync::watch::Sender<bool>,
+) -> std::io::Result<()> {
+    let (first, rest) = wait_first(jobs).await;
+    let _ = cancel.send(true);
+    state.close_all();
+    if rest.is_empty() {
+        return first;
+    }
     let outcome = wait_bounded(automation::SHUTDOWN_DEADLINE, async move {
-        state.close_all();
-        let _ = shutdown_tx.send(true);
-        server.await
+        for job in rest {
+            let _ = job.await;
+        }
     })
     .await;
     match outcome {
-        ShutdownWait::Finished(result) => result,
+        ShutdownWait::Finished(()) => first,
         ShutdownWait::Deadline => {
             // A desktop call stuck in one request never reaches the injection
             // lock. The X server drops this client's grabs when the process
@@ -639,6 +733,51 @@ pub async fn serve(addr: SocketAddr, state: Arc<AppState>) -> std::io::Result<()
             std::process::exit(0);
         }
     }
+}
+
+fn wait_first(
+    jobs: Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+) -> impl std::future::Future<
+    Output = (
+        std::io::Result<()>,
+        Vec<tokio::task::JoinHandle<std::io::Result<()>>>,
+    ),
+> {
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    let mut slots: Vec<Option<tokio::task::JoinHandle<std::io::Result<()>>>> =
+        jobs.into_iter().map(Some).collect();
+    std::future::poll_fn(move |cx: &mut Context<'_>| {
+        let mut ready = None;
+        for (index, slot) in slots.iter_mut().enumerate() {
+            let Some(job) = slot.as_mut() else {
+                continue;
+            };
+            if let Poll::Ready(result) = Pin::new(job).poll(cx) {
+                ready = Some((index, result));
+                break;
+            }
+        }
+        let Some((index, result)) = ready else {
+            return if slots.iter().all(|slot| slot.is_none()) {
+                Poll::Ready((Ok(()), Vec::new()))
+            } else {
+                Poll::Pending
+            };
+        };
+        slots[index] = None;
+        let rest = slots.iter_mut().filter_map(|slot| slot.take()).collect();
+        let mapped = match result {
+            Ok(result) => result,
+            Err(err) => Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                err.to_string(),
+            )),
+        };
+        Poll::Ready((mapped, rest))
+    })
 }
 
 enum ShutdownWait<T> {
@@ -1248,6 +1387,14 @@ fn injection_cancelled(captured: u64, word: u64) -> bool {
     epoch != captured || phase == Phase::Paused
 }
 
+/// A mouse or type request that waited on the injection lock must not open a
+/// new stretch when unwind left the gate `off` and the companion poll has
+/// since expired. A first injection, with no trusted instant yet, is allowed.
+fn stretch_ended(state: &AppState) -> bool {
+    let gate = lock(&state.automation);
+    gate.phase() == Phase::Off && gate.stale_reentry(Instant::now(), state.companion_poll_timeout)
+}
+
 fn gate_word(state: &AppState) -> u64 {
     state.published.load(Ordering::SeqCst)
 }
@@ -1553,7 +1700,7 @@ async fn mouse(
             }
         }
         let cancelled = || injection_cancelled(epoch, gate_word(&state2));
-        if cancelled() {
+        if cancelled() || stretch_ended(&state2) {
             return Err(ApiError::conflict("automation paused"));
         }
         let _injecting = InjectGuard::arm(&state2.automation, id, epoch)?;
@@ -1642,7 +1789,7 @@ async fn type_keys(
             return Err(ApiError::missing());
         }
         let cancelled = || injection_cancelled(epoch, gate_word(&state2));
-        if cancelled() {
+        if cancelled() || stretch_ended(&state2) {
             return Err(ApiError::conflict("automation paused"));
         }
         let _injecting = InjectGuard::arm(&state2.automation, id, epoch)?;
@@ -2359,8 +2506,16 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, router(tcp_state)).await.unwrap();
         });
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
         tokio::spawn(async move {
-            let _ = crate::companion_sock::accept_loop(unix, sock_state).await;
+            let _stop_tx = stop_tx;
+            let _ = crate::companion_sock::accept_loop(
+                unix,
+                companion_router(sock_state),
+                "companion",
+                stop_rx,
+            )
+            .await;
         });
         (addr, dir)
     }
@@ -2593,6 +2748,128 @@ mod tests {
         assert_eq!(
             companion_poll_timeout_from(Some(" 60000 ")),
             Duration::from_secs(60)
+        );
+    }
+
+    async fn spawn_with_bearer(token: &str) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        state.companion_poll_timeout = COMPANION_POLL_TIMEOUT;
+        let app = tcp_router(Arc::new(state), token.to_string());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        addr
+    }
+
+    async fn status_with(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: Option<String>,
+        authorization: Option<&str>,
+    ) -> u16 {
+        let extra = authorization.map(|value| ("authorization", value));
+        let response = dispatch(addr, method, path, body, extra).await;
+        response.status().as_u16()
+    }
+
+    #[tokio::test]
+    async fn tcp_without_the_bearer_is_401_on_every_route_and_cannot_lift_a_pause() {
+        let token = "a".repeat(64);
+        let addr = spawn_with_bearer(&token).await;
+        let routes = [
+            ("GET", "/health"),
+            ("GET", "/no-such-route"),
+            ("GET", "/companion"),
+            ("POST", "/companion/automation"),
+            ("POST", "/companion/interrupt"),
+            ("POST", "/companion/notice"),
+            ("POST", "/session"),
+            ("DELETE", "/session/00000000-0000-0000-0000-000000000001"),
+            ("POST", "/session/00000000-0000-0000-0000-000000000001/view"),
+            ("GET", "/session/00000000-0000-0000-0000-000000000001/watch"),
+            (
+                "GET",
+                "/session/00000000-0000-0000-0000-000000000001/feed/snapshot",
+            ),
+            ("GET", "/session/00000000-0000-0000-0000-000000000001/feed"),
+            (
+                "GET",
+                "/session/00000000-0000-0000-0000-000000000001/listen",
+            ),
+            (
+                "POST",
+                "/session/00000000-0000-0000-0000-000000000001/mouse",
+            ),
+            ("POST", "/session/00000000-0000-0000-0000-000000000001/type"),
+            ("POST", "/prompt"),
+            ("GET", "/audit"),
+            ("GET", "/mcp-audit"),
+            (
+                "POST",
+                "/session/00000000-0000-0000-0000-000000000001/stream",
+            ),
+            ("GET", "/session/00000000-0000-0000-0000-000000000001/inbox"),
+            ("GET", "/session/00000000-0000-0000-0000-000000000001/mcp"),
+            (
+                "POST",
+                "/session/00000000-0000-0000-0000-000000000001/mcp/call",
+            ),
+        ];
+        for (method, path) in routes {
+            let missing = status_with(addr, method, path, Some("{}".into()), None).await;
+            assert_eq!(missing, 401, "{method} {path} without a token");
+            let wrong = status_with(
+                addr,
+                method,
+                path,
+                Some("{}".into()),
+                Some("Bearer not-the-token"),
+            )
+            .await;
+            assert_eq!(wrong, 401, "{method} {path} with the wrong token");
+        }
+
+        let bearer = format!("Bearer {token}");
+        let (status, body) = {
+            let response = dispatch(
+                addr,
+                "POST",
+                "/session",
+                Some(open_body(serde_json::json!([]))),
+                Some(("authorization", bearer.as_str())),
+            )
+            .await;
+            let status = response.status().as_u16();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (status, bytes)
+        };
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 201, "{text}");
+        let paused = status_with(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"pause"}"#.into()),
+            Some(bearer.as_str()),
+        )
+        .await;
+        assert_eq!(paused, 204, "pause stays available with the token");
+        let resumed = status_with(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"resume"}"#.into()),
+            Some(bearer.as_str()),
+        )
+        .await;
+        assert_eq!(resumed, 403, "the bearer must not lift a user pause");
+        let health = status_with(addr, "GET", "/health", None, Some(bearer.as_str())).await;
+        assert_eq!(
+            health, 404,
+            "an unknown path with the token is not a handler"
         );
     }
 
@@ -3594,6 +3871,90 @@ while True:
     }
 
     #[tokio::test]
+    async fn a_stale_deferred_start_does_not_let_a_waiting_mouse_inject() {
+        let desktop = FakeDesktop::new();
+        desktop.block_type.store(true, Ordering::SeqCst);
+        let timeout = Duration::from_millis(400);
+        let (addr, dir) = spawn_pair_timeout(Arc::clone(&desktop), timeout).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let type_addr = addr;
+        let type_id = id;
+        let typed = tokio::spawn(async move {
+            send(
+                type_addr,
+                "POST",
+                &format!("/session/{type_id}/type"),
+                Some(r#"{"text":"ab"}"#.into()),
+            )
+            .await
+        });
+        let ready = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (_, _, body) = send(addr, "GET", "/companion", None).await;
+                let live: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                if live["automation"]["injecting"] == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(ready.is_ok(), "type did not take the injection lock");
+        let poll_dir = dir.clone();
+        let polled = tokio::task::spawn_blocking(move || companion_get(&poll_dir))
+            .await
+            .unwrap();
+        assert_eq!(polled["automation"]["phase"], "running");
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"stop"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 204);
+        let (status, _, body) = send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"start"}"#.into()),
+        )
+        .await;
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 204, "{text}");
+        let mouse_addr = addr;
+        let mouse_id = id;
+        let mouse = tokio::spawn(async move {
+            send(
+                mouse_addr,
+                "POST",
+                &format!("/session/{mouse_id}/mouse"),
+                Some(r#"{"action":"move","x":3,"y":4}"#.into()),
+            )
+            .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(timeout + Duration::from_millis(150)).await;
+        desktop.block_type.store(false, Ordering::SeqCst);
+        let _ = typed.await.unwrap();
+        let (status, _, body) = mouse.await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert_eq!(status, 409, "{text}");
+        assert!(
+            lock(&desktop.mice).is_empty(),
+            "the waiting move must not inject"
+        );
+        let (_, _, body) = send(addr, "GET", "/companion", None).await;
+        let snap: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_ne!(snap["automation"]["phase"], "running");
+        assert_eq!(
+            snap["automation"]["resume_seq"], 0,
+            "a start replayed after the poll expired must not enter running"
+        );
+        let _ = dir;
+    }
+
+    #[tokio::test]
     async fn repeated_tcp_starts_do_not_extend_the_watchdog() {
         let desktop = FakeDesktop::new();
         let addr = spawn_timeout(Arc::clone(&desktop), Duration::from_millis(80)).await;
@@ -4012,6 +4373,35 @@ while True:
         );
         assert_eq!(lock(&state.automation).phase(), Phase::Off);
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_tcp_exit_still_runs_close_all() {
+        let state = Arc::new(AppState::new(FakeDesktop::new(), Duration::from_millis(20)));
+        lock(&state.automation).pause();
+        assert_eq!(lock(&state.automation).phase(), Phase::Paused);
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let tcp = tokio::spawn(async { Ok(()) });
+        let saw_cancel = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&saw_cancel);
+        let mut companion_stop = cancel_rx;
+        let companion = tokio::spawn(async move {
+            let _ = companion_stop.wait_for(|stop| *stop).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        when_first_stops(&state, vec![tcp, companion], cancel_tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            lock(&state.automation).phase(),
+            Phase::Off,
+            "close_all resets the gate after the tcp task ends"
+        );
+        assert!(
+            saw_cancel.load(Ordering::SeqCst),
+            "the other listener was cancelled"
+        );
     }
 
     #[tokio::test]

@@ -92,6 +92,37 @@ pub struct Watch {
     pointer_ready: bool,
     keyboard_ready: bool,
     pending_px: f64,
+    /// Newest raw button press that has not been paired with a core
+    /// `ButtonPress`. `Some(true)` came from an XTEST device. A core press
+    /// in a later frame still sees it.
+    pending_raw_button: Option<bool>,
+}
+
+/// One button event in the order the X server queued it. A raw press
+/// replaces any unmatched raw press. The next core press consumes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ButtonQueue {
+    Raw { synthetic: bool },
+    Core,
+}
+
+/// Which core button presses in `events` are the visor's own clicks.
+/// `pending` carries an unmatched raw press into the next frame.
+pub(crate) fn synthetic_core_presses(
+    events: &[ButtonQueue],
+    pending: &mut Option<bool>,
+) -> Vec<bool> {
+    let mut cores = Vec::new();
+    for event in events {
+        match *event {
+            ButtonQueue::Raw { synthetic } => *pending = Some(synthetic),
+            ButtonQueue::Core => {
+                cores.push(*pending == Some(true));
+                *pending = None;
+            }
+        }
+    }
+    cores
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +165,7 @@ impl Watch {
             pointer_ready: false,
             keyboard_ready: false,
             pending_px: 0.0,
+            pending_raw_button: None,
         }
     }
 
@@ -267,6 +299,26 @@ impl Watch {
             }
             _ => None,
         }
+    }
+
+    /// Core `ButtonPress` events lined up with the raw presses in this frame.
+    /// `true` means that core press came from an XTEST device and must not
+    /// click the companion. Raw pointer filtering has to be active; the
+    /// fallback path has no raw presses and keeps its core clicks.
+    pub fn synthetic_core_presses(&mut self, events: &[Event]) -> Vec<bool> {
+        let mut queued = Vec::new();
+        for event in events {
+            match event {
+                Event::XinputRawButtonPress(raw) if self.pointer_ready => {
+                    queued.push(ButtonQueue::Raw {
+                        synthetic: !self.pointer_is_user(raw.deviceid, raw.sourceid),
+                    });
+                }
+                Event::ButtonPress(_) => queued.push(ButtonQueue::Core),
+                _ => {}
+            }
+        }
+        synthetic_core_presses(&queued, &mut self.pending_raw_button)
     }
 }
 
@@ -871,6 +923,70 @@ mod tests {
         assert!(!both.accepts_raw_pointer());
         assert!(!both.accepts_raw_keyboard());
         assert!(!both.key_is_user(9, 3));
+    }
+
+    #[test]
+    fn an_xtest_click_on_the_mascot_does_nothing() {
+        use crate::automation::{
+            bug_click, BugClick, Machine, Phase, VisorPhase, DEFAULT_RESUME_MS,
+        };
+
+        let pointer = u16::from(x11rb::protocol::xinput::DeviceType::SLAVE_POINTER);
+        let mut watch = super::Watch::blank();
+        watch.consider("Virtual core XTEST pointer", pointer, 6);
+        watch.finish_select(true);
+        assert!(watch.accepts_raw_pointer());
+        let xtest = !watch.pointer_is_user(6, 2);
+        let user_is_synthetic = !watch.pointer_is_user(9, 3);
+        assert!(xtest);
+        assert!(!user_is_synthetic);
+
+        let mut pending = None;
+        let cores = super::synthetic_core_presses(
+            &[
+                super::ButtonQueue::Raw { synthetic: xtest },
+                super::ButtonQueue::Core,
+            ],
+            &mut pending,
+        );
+        assert_eq!(cores, vec![true]);
+        assert!(pending.is_none());
+
+        let mut machine = Machine::new(DEFAULT_RESUME_MS);
+        machine.see_visor(VisorPhase::Running, 0, 1);
+        let pause_at_frame = machine.pause_origin();
+        // The window drops this core press before `on_click`, so the bug
+        // does not pause, ask, or open the menu.
+        assert!(cores[0]);
+        assert_ne!(
+            bug_click(pause_at_frame, machine.phase(), machine.pause_origin()),
+            BugClick::Ask
+        );
+        assert_eq!(machine.phase(), Phase::Running);
+        assert!(!machine.asking());
+
+        // The raw press can arrive one frame ahead of the core press.
+        let mut pending = Some(true);
+        let later = super::synthetic_core_presses(&[super::ButtonQueue::Core], &mut pending);
+        assert_eq!(later, vec![true]);
+        assert!(pending.is_none());
+        assert_eq!(machine.phase(), Phase::Running);
+
+        // A synthetic press that missed the window does not swallow the
+        // next physical press on the bug.
+        let mut pending = None;
+        let user = super::synthetic_core_presses(
+            &[
+                super::ButtonQueue::Raw { synthetic: true },
+                super::ButtonQueue::Raw {
+                    synthetic: user_is_synthetic,
+                },
+                super::ButtonQueue::Core,
+            ],
+            &mut pending,
+        );
+        assert_eq!(user, vec![false]);
+        assert_eq!(bug_click(None, Phase::Running, None), BugClick::Pause);
     }
 
     #[test]

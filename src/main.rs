@@ -10,6 +10,7 @@ use hypermesh_visor::{
 
 #[derive(Debug)]
 struct Options {
+    tcp: bool,
     listen: String,
     fixture_log: Option<std::path::PathBuf>,
     supervisor_url: Option<String>,
@@ -33,12 +34,16 @@ fn main() -> ExitCode {
         eprintln!("hypermesh-visor: refusing to run as root");
         return ExitCode::from(1);
     }
-    let addr = match parse_listen(&options.listen) {
-        Ok(addr) => addr,
-        Err(err) => {
-            eprintln!("hypermesh-visor: {err}");
-            return ExitCode::from(2);
+    let tcp = if tcp_enabled(options.tcp, std::env::var("HYPERMESH_TCP").ok().as_deref()) {
+        match parse_listen(&options.listen) {
+            Ok(addr) => Some(addr),
+            Err(err) => {
+                eprintln!("hypermesh-visor: {err}");
+                return ExitCode::from(2);
+            }
         }
+    } else {
+        None
     };
     let desktop: Arc<dyn Desktop> = if let Some(path) = &options.fixture_log {
         match FixtureDesktop::open(path) {
@@ -85,7 +90,7 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let result = runtime.block_on(serve(addr, state));
+    let result = runtime.block_on(serve(tcp, state));
     // Drop waits forever for a stuck spawn_blocking task. This bound is the
     // same deadline `serve` uses before it exits the process.
     runtime.shutdown_timeout(SHUTDOWN_DEADLINE);
@@ -105,6 +110,7 @@ where
     I: IntoIterator<Item = String>,
 {
     let mut args = args.into_iter();
+    let mut tcp = false;
     let mut listen = "127.0.0.1:9847".to_string();
     let mut fixture = false;
     let mut fixture_log = None;
@@ -116,6 +122,7 @@ where
     let mut answers = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--tcp" => tcp = true,
             "--listen" => {
                 listen = args
                     .next()
@@ -154,9 +161,12 @@ where
             }
             "-h" | "--help" => {
                 println!(
-                    "hypermesh-visor [--listen 127.0.0.1:9847] [--fixture --fixture-log PATH]\n\
+                    "hypermesh-visor [--tcp] [--listen 127.0.0.1:9847] [--fixture --fixture-log PATH]\n\
                      [--supervisor-url URL] [--supervisor-url-2 URL] [--default-model {DEFAULT_CATALOG_ID}]\n\
                      [--route CATALOG=URL] [--experts CATALOG] [--expert-answer CATALOG=URL]\n\
+                     The control API listens on control.sock in the runtime directory.\n\
+                     --tcp or HYPERMESH_TCP=1 also opens a loopback port. Every request on that\n\
+                     port needs the bearer in api.token. --listen sets that port and must be loopback.\n\
                      --supervisor-url or HYPERMESH_SUPERVISOR_URL is the renter supervisor.\n\
                      --supervisor-url-2 or HYPERMESH_SUPERVISOR_URL_2 is a second host. A blank first URL stays unconfigured.\n\
                      --default-model or HYPERMESH_DEFAULT_MODEL is used when a prompt omits model.\n\
@@ -176,6 +186,7 @@ where
         return Err("--fixture-log needs --fixture".into());
     }
     Ok(Some(Options {
+        tcp,
         listen,
         fixture_log,
         supervisor_url,
@@ -218,6 +229,19 @@ fn resolve_default_model(flag: Option<&str>, env: Option<&str>) -> String {
     }
 }
 
+/// TCP is off unless `--tcp` is set or `HYPERMESH_TCP` is `1`, `true`, `yes`, or `on`.
+fn tcp_enabled(flag: bool, env: Option<&str>) -> bool {
+    if flag {
+        return true;
+    }
+    matches!(
+        env.map(str::trim)
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    )
+}
+
 /// Flag wins. A blank value is not an opt-in, so the daemon stays unconfigured.
 fn resolve_supervisor_url(flag: Option<&str>, env: Option<&str>) -> Option<String> {
     let chosen = flag.filter(|value| !value.trim().is_empty()).or(env)?;
@@ -232,6 +256,32 @@ fn resolve_supervisor_url(flag: Option<&str>, env: Option<&str>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tcp_is_off_unless_the_flag_or_env_opts_in() {
+        assert!(!tcp_enabled(false, None));
+        assert!(!tcp_enabled(false, Some("")));
+        assert!(!tcp_enabled(false, Some("0")));
+        assert!(!tcp_enabled(false, Some("false")));
+        assert!(!tcp_enabled(false, Some("no")));
+        assert!(!tcp_enabled(false, Some("off")));
+        assert!(tcp_enabled(true, None));
+        assert!(tcp_enabled(false, Some("1")));
+        assert!(tcp_enabled(false, Some(" true ")));
+        assert!(tcp_enabled(false, Some("YES")));
+        assert!(tcp_enabled(false, Some("on")));
+        let options = parse_args_from([
+            "--fixture".into(),
+            "--fixture-log".into(),
+            "events.jsonl".into(),
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(!options.tcp);
+        let options = parse_args_from(["--tcp".into()]).unwrap().unwrap();
+        assert!(options.tcp);
+        assert_eq!(options.listen, "127.0.0.1:9847");
+    }
 
     #[test]
     fn supervisor_url_is_an_explicit_opt_in() {

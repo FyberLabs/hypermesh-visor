@@ -21,6 +21,7 @@ mod vault;
 pub use api::{serve, AppState};
 pub use automation::SHUTDOWN_DEADLINE;
 pub use bind::parse_listen;
+pub use companion_sock::{control_socket_file, read_api_token, runtime_dir};
 pub use desktop::{current_euid, Desktop, FixtureDesktop, LinuxDesktop};
 pub use hypermesh_session::{refresh_token, MemoryStore, SessionStore};
 pub use prompt::{open_supervisor_door, DoorConfig, PromptDoor, DEFAULT_CATALOG_ID};
