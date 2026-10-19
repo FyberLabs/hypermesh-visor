@@ -732,42 +732,57 @@ PY
 # pointer batches. Its pipe ends are ordinary fds, inherited by scenario
 # subshells. A broken channel fails the scenario. An explicit err ack is the
 # companion refusing the action, and callers may retry that.
-socket_action() {
-  local action=$1
+#
+# Every action is written before any ack is read. The helper posts the next
+# one as soon as the previous response is in hand. Waiting for stop's ack in
+# this shell, then writing resume, lets the in-flight type finish first.
+# Resume on off is a successful no-op.
+socket_actions() {
+  local action
   if [[ -z ${SOCK_IN:-} && -z ${SOCK_OUT:-} ]]; then
-    socket_action_direct "$action"
+    for action in "$@"; do
+      socket_action_direct "$action"
+    done
     return
   fi
-  local ack lockfd kind
+  [[ $# -ge 1 ]] || die "socket helper needs an action"
+  local ack lockfd failed=0
   [[ ${SOCK_IN:-} =~ ^[0-9]+$ && ${SOCK_OUT:-} =~ ^[0-9]+$ ]] || die "socket helper command channel is not open"
-  for kind in "$SOCK_IN" "$SOCK_OUT"; do
-    if [[ ! -e /proc/${BASHPID:-$$}/fd/$kind ]] || [[ $(readlink "/proc/${BASHPID:-$$}/fd/$kind" 2>/dev/null || true) != pipe:* ]]; then
-      die "socket helper command channel is not open"
-    fi
-  done
-  allow_write "$PROC/sock.cmd.lock"
+  # Builtin test. A forked readlink here is another gap before the write.
+  if [[ ! -p /proc/${BASHPID:-$$}/fd/$SOCK_IN || ! -p /proc/${BASHPID:-$$}/fd/$SOCK_OUT ]]; then
+    die "socket helper command channel is not open"
+  fi
   exec {lockfd}>>"$PROC/sock.cmd.lock" || die "socket helper lock open failed"
   if ! flock -x "$lockfd"; then
     exec {lockfd}>&- || true
     die "socket helper lock failed"
   fi
-  if ! printf '%s\n' "$action" >&"$SOCK_IN"; then
-    exec {lockfd}>&- || true
-    die "socket helper write failed: $action"
-  fi
-  if ! IFS= read -r -t 2 ack <&"$SOCK_OUT"; then
-    exec {lockfd}>&- || true
-    die "socket helper did not answer: $action"
-  fi
+  for action in "$@"; do
+    if ! printf '%s\n' "$action" >&"$SOCK_IN"; then
+      exec {lockfd}>&- || true
+      die "socket helper write failed: $action"
+    fi
+  done
+  for action in "$@"; do
+    if ! IFS= read -r -t 2 ack <&"$SOCK_OUT"; then
+      exec {lockfd}>&- || true
+      die "socket helper did not answer: $action"
+    fi
+    if [[ -z ${ack:-} ]]; then
+      exec {lockfd}>&- || true
+      die "socket helper $action -> missing ack"
+    fi
+    if [[ $ack != ok* ]]; then
+      echo "socket $action -> $ack" >&2
+      failed=1
+    fi
+  done
   exec {lockfd}>&- || true
-  if [[ -z ${ack:-} ]]; then
-    die "socket helper $action -> missing ack"
-  fi
-  if [[ $ack == ok* ]]; then
-    return 0
-  fi
-  echo "socket $action -> $ack" >&2
-  return 1
+  return "$failed"
+}
+
+socket_action() {
+  socket_actions "$1"
 }
 
 # HTTP body "error" field. Empty and non-JSON bodies yield an empty string.
@@ -1234,9 +1249,9 @@ assert_harness_no_tcp_listen() {
       exe_of[$pid]=$exe
     done <"$PROC/started"
   fi
-  if ! ss_out=$(sudo -n ss -H -ltnp 2>/dev/null); then
-    ss_out=$(ss -H -ltnp 2>/dev/null || true)
-  fi
+  # The harness processes are this user. sudo ss walks every process on
+  # the machine and is slow enough to disturb a stop/resume during a type.
+  ss_out=$(ss -H -ltnp 2>/dev/null || true)
   while IFS= read -r line; do
     [[ $line == LISTEN* ]] || continue
     for seen_pid in $(grep -oE 'pid=[0-9]+' <<<"$line" | cut -d= -f2); do
@@ -1868,8 +1883,9 @@ PY
       echo "attempt $attempt type ended before injection was visible"
       continue
     fi
-    socket_action stop
-    socket_action resume
+    # Both lines are in the pipe before stop's ack comes back, so resume is
+    # queued while the type is still inside its chunk.
+    socket_actions stop resume
     wait "$curl_pid" || true
     code=$(cat "$REQ_DIR/type.code")
     echo "attempt $attempt type status $code $(error_text "$HTTP_BODY")"

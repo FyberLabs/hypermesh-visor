@@ -49,25 +49,34 @@ def post(path, action):
     return code, detail
 
 
+def emit(line):
+    try:
+        print(line, flush=True)
+    except BrokenPipeError:
+        raise SystemExit(0)
+
+
 def main():
     path = sys.argv[1]
-    print("ready", flush=True)
-    for raw in sys.stdin:
+    emit("ready")
+    while True:
+        raw = sys.stdin.readline()
+        if raw == "":
+            return 0
         action = raw.strip()
         if not action:
             continue
         if action == "quit":
-            print("ok", flush=True)
+            emit("ok")
             return 0
         if action not in ACTIONS:
-            print("err unknown", flush=True)
+            emit("err unknown")
             continue
         code, detail = post(path, action)
         if code == 204:
-            print("ok 204", flush=True)
+            emit("ok 204")
         else:
-            print("err %s %s" % (code, detail), flush=True)
-    return 0
+            emit("err %s %s" % (code, detail))
 
 
 if __name__ == "__main__":
