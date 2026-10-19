@@ -12,9 +12,12 @@
 # with XTEST.
 #
 # Each scenario runs in its own process group with a hard timeout. Logs and
-# failure captures go to display-logs/. The runtime directory is always one
-# this script creates. A caller-provided HYPERMESH_RUNTIME_DIR is ignored so
-# the harness never unlinks a live visor's socket or lock.
+# failure captures go to display-logs/. Caller-provided HYPERMESH_* filesystem
+# paths are ignored. Runtime, config, state, and data directories are ones
+# this script creates with mktemp. remove, chmod, and writes go through
+# refuse_outside, which rejects a path outside those directories and
+# display-logs/. The X11 :99 lock files and the uinput nodes this script
+# creates are the only other paths it may remove or chmod.
 set -euo pipefail
 set -m
 
@@ -23,18 +26,51 @@ cd "$root"
 
 DISPLAY_LOG_DIR=$root/display-logs
 mkdir -p "$DISPLAY_LOG_DIR"
+HARNESS_ROOTS=("$DISPLAY_LOG_DIR")
 # Request bodies for code that runs outside a scenario. run_named points
 # each scenario at its own directory.
 REQ_DIR=$DISPLAY_LOG_DIR
 HTTP_BODY=$REQ_DIR/http.body
 SCENARIO_BG=
-if [[ -n ${HYPERMESH_RUNTIME_DIR:-} ]]; then
-  echo "ignoring HYPERMESH_RUNTIME_DIR ($HYPERMESH_RUNTIME_DIR): the display harness uses a private temporary runtime directory and does not remove files from a directory it did not create" >&2
-  unset HYPERMESH_RUNTIME_DIR
-fi
+
+ignore_caller_hypermesh_path() {
+  local name=$1
+  local value=${!name-}
+  [[ -n $value ]] || return 0
+  echo "ignoring $name ($value): the display harness uses a private temporary directory and does not remove files from a directory it did not create" >&2
+  unset "$name"
+}
+
+hypermesh_path_name() {
+  case $1 in
+    HYPERMESH_*_DIR|HYPERMESH_*_PATH|HYPERMESH_*_FILE|HYPERMESH_*_HOME|HYPERMESH_*_ROOT|HYPERMESH_*_PROJECT|HYPERMESH_*STATE*|HYPERMESH_*DATA*|HYPERMESH_*CONFIG*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+while IFS= read -r name; do
+  hypermesh_path_name "$name" || continue
+  ignore_caller_hypermesh_path "$name"
+done < <(compgen -e || true)
+
 RUNTIME=$(mktemp -d "${TMPDIR:-/tmp}/hm-display.XXXXXX")
+CONFIG=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-config.XXXXXX")
+STATE=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-state.XXXXXX")
+DATA=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-data.XXXXXX")
+MCP_PROJECT=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-mcp.XXXXXX")
 HARNESS_RUNTIME_DIR=$RUNTIME
-CONFIG=${HYPERMESH_CONFIG_DIR:-/tmp/hm-config}
+HARNESS_CONFIG_DIR=$CONFIG
+HARNESS_STATE_DIR=$STATE
+HARNESS_DATA_DIR=$DATA
+HARNESS_MCP_DIR=$MCP_PROJECT
+HARNESS_ROOTS+=("$RUNTIME" "$CONFIG" "$STATE" "$DATA" "$MCP_PROJECT")
+if [[ -z ${XDG_RUNTIME_DIR:-} ]]; then
+  HARNESS_XDG=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-xdg.XXXXXX")
+  export XDG_RUNTIME_DIR=$HARNESS_XDG
+  HARNESS_ROOTS+=("$HARNESS_XDG")
+fi
 VISOR_BIN=$root/target/debug/hypermesh-visor
 COMPANION_BIN=$root/target/debug/hypermesh-companion
 COMPANION_PID_FILE=$DISPLAY_LOG_DIR/companion.pid
@@ -66,11 +102,110 @@ WAYLAND_SOCK_BEFORE=
 
 export HYPERMESH_RUNTIME_DIR=$RUNTIME
 export HYPERMESH_CONFIG_DIR=$CONFIG
+export HYPERMESH_STATE_DIR=$STATE
+export HYPERMESH_DATA_DIR=$DATA
+export HYPERMESH_MCP_PROJECT=$MCP_PROJECT
 unset HYPERMESH_AUTOMATION_RESUME_SECS || true
 
 die() {
   echo "FAIL: $*" >&2
   exit 1
+}
+
+# Canonical path. Missing components are kept so a file we are about to
+# create is judged the same way as one that already exists.
+owned_path() {
+  realpath -m -- "$1"
+}
+
+# True when `path` is a harness root or a file inside one.
+path_inside_roots() {
+  local path=$1 root
+  [[ -n $path && $path != / ]] || return 1
+  for root in "${HARNESS_ROOTS[@]}"; do
+    [[ -n $root && $root != / ]] || continue
+    root=$(owned_path "$root")
+    [[ $path == "$root" || $path == "$root"/* ]] && return 0
+  done
+  return 1
+}
+
+# Paths this script creates that cannot live under the temp dirs: the Xorg
+# :99 lock, and the uinput nodes start_uinput recorded.
+path_is_display_artifact() {
+  local path=$1 recorded
+  case $path in
+    /tmp/.X99-lock|/tmp/.X11-unix/X99) return 0 ;;
+  esac
+  [[ $path == "$(owned_path /dev/uinput)" ]] && return 0
+  if [[ $path =~ ^/dev/input/event[0-9]+$ ]]; then
+    for recorded in "${UINPUT_POINTER:-}" "${UINPUT_KEYBOARD:-}"; do
+      [[ -n $recorded && $path == "$(owned_path "$recorded")" ]] && return 0
+    done
+  fi
+  return 1
+}
+
+# Refuse rm, chmod, or a write outside the harness temp dirs and display-logs.
+refuse_outside() {
+  local path
+  [[ -n ${1:-} ]] || die "refusing an empty path"
+  path=$(owned_path "$1")
+  if path_inside_roots "$path" || path_is_display_artifact "$path"; then
+    return 0
+  fi
+  die "refusing to remove, chmod, or write $path: outside the harness temp dirs and display-logs"
+}
+
+allow_write() {
+  local path
+  for path in "$@"; do
+    refuse_outside "$path"
+  done
+}
+
+remove_inside() {
+  local path
+  [[ $# -gt 0 ]] || return 0
+  for path in "$@"; do
+    refuse_outside "$path"
+  done
+  rm -f -- "$@"
+}
+
+remove_tree() {
+  local path
+  for path in "$@"; do
+    [[ -n $path && -d $path ]] || continue
+    refuse_outside "$path"
+    rm -rf -- "$path"
+  done
+}
+
+chmod_inside() {
+  local mode=$1
+  shift
+  local path
+  for path in "$@"; do
+    refuse_outside "$path"
+  done
+  chmod "$mode" -- "$@"
+}
+
+chmod_device() {
+  local mode=$1
+  shift
+  local path
+  for path in "$@"; do
+    refuse_outside "$path"
+  done
+  sudo chmod "$mode" -- "$@"
+}
+
+remove_x11_locks() {
+  refuse_outside /tmp/.X99-lock
+  refuse_outside /tmp/.X11-unix/X99
+  sudo rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
 }
 
 # True when /proc/$pid still belongs to this executable. A recycled pid must
@@ -114,7 +249,7 @@ signal_recorded_pid() {
   local pid="" signalled=1
   if [[ -f $file ]]; then
     pid=$(cat "$file" 2>/dev/null || true)
-    rm -f "$file"
+    remove_inside "$file"
   fi
   if signal_if_exe "$pid" "$expected"; then
     signalled=0
@@ -155,9 +290,13 @@ cleanup() {
   fi
   signal_recorded_pid "$COMPANION_PID_FILE" "$COMPANION_BIN" || true
   signal_recorded_pid "$VISOR_PID_FILE" "$VISOR_BIN" "${VISOR_PID:-}" || true
-  if [[ -n ${HARNESS_RUNTIME_DIR:-} && -d $HARNESS_RUNTIME_DIR ]]; then
-    rm -rf "$HARNESS_RUNTIME_DIR"
-  fi
+  remove_tree \
+    "${HARNESS_RUNTIME_DIR:-}" \
+    "${HARNESS_CONFIG_DIR:-}" \
+    "${HARNESS_STATE_DIR:-}" \
+    "${HARNESS_DATA_DIR:-}" \
+    "${HARNESS_MCP_DIR:-}" \
+    "${HARNESS_XDG:-}"
   if [[ -n ${SOCK_FD:-} ]]; then
     printf 'quit\n' >&"$SOCK_FD" 2>/dev/null || true
   fi
@@ -172,7 +311,7 @@ cleanup() {
   fi
   if [[ -f /tmp/.X99-lock ]]; then
     sudo kill "$(head -n 1 /tmp/.X99-lock)" 2>/dev/null || true
-    sudo rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
+    remove_x11_locks
   fi
   if [[ -n ${XORG_PID:-} ]]; then
     kill "$XORG_PID" 2>/dev/null || sudo kill "$XORG_PID" 2>/dev/null || true
@@ -188,6 +327,7 @@ curl_visor() {
 
 http_code() {
   local out=$1 method=$2 url=$3 body=${4:-}
+  allow_write "$out" "$HTTP_BODY"
   if [[ -n $body ]]; then
     curl_visor --max-time 20 -sS -o "$HTTP_BODY" -w '%{http_code}' -X "$method" "$url" \
       -H 'content-type: application/json' --data-binary "$body" >"$out"
@@ -201,6 +341,7 @@ spawn_request() {
   "$@" &
   SPAWN_PID=$!
   if [[ -n ${SCENARIO_BG:-} ]]; then
+    allow_write "$SCENARIO_BG"
     echo "$SPAWN_PID" >>"$SCENARIO_BG"
   fi
 }
@@ -339,8 +480,13 @@ start_visor() {
     return 0
   fi
   mkdir -p "$RUNTIME" "$CONFIG"
-  chmod 0700 "$RUNTIME" "$CONFIG"
-  rm -f "$RUNTIME/control.sock" "$RUNTIME/companion.sock" "$RUNTIME/companion.lock" "$RUNTIME/api.token"
+  chmod_inside 0700 "$RUNTIME" "$CONFIG"
+  remove_inside \
+    "$RUNTIME/control.sock" \
+    "$RUNTIME/companion.sock" \
+    "$RUNTIME/companion.lock" \
+    "$RUNTIME/api.token"
+  allow_write "$DISPLAY_LOG_DIR/visor.out" "$DISPLAY_LOG_DIR/visor.err" "$VISOR_PID_FILE"
   local -a args=()
   if [[ $tcp == tcp ]]; then
     args=(--tcp --listen 127.0.0.1:0)
@@ -392,6 +538,7 @@ start_companion() {
   local resume=${1:-}
   local mode=${2:-x11}
   stop_companion
+  allow_write "$DISPLAY_LOG_DIR/companion.log" "$COMPANION_PID_FILE"
   # The script already cleared HYPERMESH_AUTOMATION_RESUME_SECS. A direct
   # exec keeps that. `env -u` reported the binary missing on the runner
   # even when this same path executed.
@@ -552,6 +699,7 @@ focus_xev() {
 
 query_state() {
   local id=$1 out
+  allow_write "$DISPLAY_LOG_DIR/xinput.err"
   if ! out=$(xinput query-state "$id" 2>"$DISPLAY_LOG_DIR/xinput.err"); then
     echo "xinput query-state $id failed" >&2
     cat "$DISPLAY_LOG_DIR/xinput.err" >&2 || true
@@ -592,6 +740,11 @@ keycode_for() {
 
 capture_shot() {
   local name=$1
+  allow_write \
+    "$DISPLAY_LOG_DIR/${name}-root.xwd" \
+    "$DISPLAY_LOG_DIR/${name}-companion.xwd" \
+    "$DISPLAY_LOG_DIR/${name}-xinput.txt" \
+    "$DISPLAY_LOG_DIR/${name}.png"
   if [[ -n ${DISPLAY:-} ]] && command -v xwd >/dev/null 2>&1; then
     xwd -root -silent -out "$DISPLAY_LOG_DIR/${name}-root.xwd" 2>/dev/null || true
     xwd -name Hypermesh -silent -out "$DISPLAY_LOG_DIR/${name}-companion.xwd" 2>/dev/null || true
@@ -609,11 +762,13 @@ run_named() {
   local flag="$DISPLAY_LOG_DIR/$name.running"
   local req=$DISPLAY_LOG_DIR/scenarios/$name
   mkdir -p "$req"
+  allow_write "$req/bg.pids" "$flag" "$DISPLAY_LOG_DIR/$name.log" "$DISPLAY_LOG_DIR/$name.pid"
   : >"$req/bg.pids"
   touch "$flag"
   (
     sleep "$limit"
     if [[ -f $flag && -f $DISPLAY_LOG_DIR/$name.pid ]]; then
+      allow_write "$DISPLAY_LOG_DIR/$name.log"
       echo "TIMEOUT $name after ${limit}s" >>"$DISPLAY_LOG_DIR/$name.log"
       # Not a function: `local` would abort this subshell before the kill.
       pid=$(cat "$DISPLAY_LOG_DIR/$name.pid")
@@ -642,7 +797,7 @@ run_named() {
   wait "$test_pid"
   local status=$?
   set -e
-  rm -f "$flag" "$DISPLAY_LOG_DIR/$name.pid"
+  remove_inside "$flag" "$DISPLAY_LOG_DIR/$name.pid"
   # A request that outlived the scenario must not keep injecting, and its
   # files live under this scenario's directory either way.
   kill_tracked_requests "$req/bg.pids"
@@ -662,7 +817,7 @@ stop_xorg() {
   if [[ -f /tmp/.X99-lock ]]; then
     sudo kill "$(head -n 1 /tmp/.X99-lock)" 2>/dev/null || true
     sleep 0.2
-    sudo rm -f /tmp/.X99-lock /tmp/.X11-unix/X99 2>/dev/null || true
+    remove_x11_locks
   fi
   if [[ -n ${XORG_PID:-} ]]; then
     kill "$XORG_PID" 2>/dev/null || sudo kill "$XORG_PID" 2>/dev/null || true
@@ -683,6 +838,7 @@ wait_for_display() {
 
 start_xorg() {
   local conf=$1 log=$2
+  allow_write "$log"
   stop_xorg
   Xorg :99 -ac -noreset -novtswitch -sharevts -nolisten tcp \
     -config "$conf" -logfile "$log" >/dev/null 2>&1 &
@@ -705,6 +861,7 @@ have_physical() {
 }
 
 write_evdev_conf() {
+  allow_write "$DISPLAY_LOG_DIR/xorg-evdev.conf"
   cat >"$DISPLAY_LOG_DIR/xorg-evdev.conf" <<EOF
 Section "ServerFlags"
     Option "DontVTSwitch" "true"
@@ -774,7 +931,8 @@ start_uinput() {
     echo "uinput: /dev/uinput is missing after modprobe. Physical input is not faked with XTEST." >&2
     return 1
   fi
-  sudo chmod 0666 /dev/uinput || true
+  chmod_device 0666 /dev/uinput || true
+  allow_write "$DISPLAY_LOG_DIR/uinput.ready" "$DISPLAY_LOG_DIR/uinput.err"
   python3 -u "$root/ci/display/uinput.py" \
     >"$DISPLAY_LOG_DIR/uinput.ready" 2>"$DISPLAY_LOG_DIR/uinput.err" &
   UINPUT_PID=$!
@@ -802,7 +960,7 @@ start_uinput() {
     return 1
   fi
   sudo udevadm settle 2>/dev/null || true
-  sudo chmod 0666 "$UINPUT_POINTER" "$UINPUT_KEYBOARD" || true
+  chmod_device 0666 "$UINPUT_POINTER" "$UINPUT_KEYBOARD" || true
   exec {UINPUT_FD}<>/dev/tcp/127.0.0.1/"$UINPUT_PORT"
   echo "uinput pointer=$UINPUT_POINTER keyboard=$UINPUT_KEYBOARD"
 }
@@ -836,6 +994,7 @@ build_bins() {
 }
 
 start_socket_helper() {
+  allow_write "$DISPLAY_LOG_DIR/sock.ready" "$DISPLAY_LOG_DIR/sock.err"
   python3 -u "$root/ci/display/sock.py" "$RUNTIME/companion.sock" \
     >"$DISPLAY_LOG_DIR/sock.ready" 2>"$DISPLAY_LOG_DIR/sock.err" &
   SOCK_PID=$!
@@ -879,7 +1038,7 @@ setup_x11() {
   unset WAYLAND_DISPLAY || true
   export XDG_SESSION_TYPE=x11
   mkdir -p "$CONFIG"
-  rm -f "$CONFIG/companion.toml"
+  remove_inside "$CONFIG/companion.toml"
   build_bins
   start_uinput
   if ! start_xorg "$root/ci/display/xorg-libinput.conf" "$DISPLAY_LOG_DIR/xorg-libinput.log"; then
@@ -907,6 +1066,7 @@ setup_x11() {
   fi
   export DISPLAY=:99
   probe_physical_move
+  allow_write "$XEV_LOG"
   xev -geometry 500x400+40+40 >"$XEV_LOG" 2>&1 &
   XEV_PID=$!
   local i
@@ -953,6 +1113,7 @@ scenario_key_down_detects() {
 
 scenario_stop_resume_during_type() {
   ensure_companion
+  allow_write "$REQ_DIR/stop-resume-type.json"
   python3 - <<'PY' >"$REQ_DIR/stop-resume-type.json"
 import json
 print(json.dumps({"text": "q" * 2000}))
@@ -1086,6 +1247,7 @@ scenario_inject_lands() {
 scenario_uinput_key_pauses_type() {
   ensure_companion
   focus_xev
+  allow_write "$REQ_DIR/long-type.json"
   python3 - <<'PY' >"$REQ_DIR/long-type.json"
 import json
 print(json.dumps({"text": "q" * 2000}))
@@ -1202,7 +1364,7 @@ scenario_watchdog_pauses() {
   pid=$(cat "$COMPANION_PID_FILE")
   pid_matches_exe "$pid" "$COMPANION_BIN" || die "companion pid $pid is not $COMPANION_BIN"
   kill "$pid"
-  rm -f "$COMPANION_PID_FILE"
+  remove_inside "$COMPANION_PID_FILE"
   start=$(date +%s)
   got=running
   local i
@@ -1234,6 +1396,7 @@ scenario_held_release() {
     die "finished type left a key down"
   fi
 
+  allow_write "$REQ_DIR/held-type.json"
   python3 - <<'PY' >"$REQ_DIR/held-type.json"
 import json
 keys = [{"key": "control", "action": "down"}]
@@ -1369,6 +1532,7 @@ PY
 
 guest_unix_denied() {
   local sock=$1 err=$REQ_DIR/guest-connect.err rc=0
+  allow_write "$err"
   as_guest /usr/bin/python3 - "$sock" >"$err" 2>&1 <<'PY' || rc=$?
 import socket, sys
 client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -1397,6 +1561,7 @@ scenario_other_user_cannot_drive() {
   guest_unix_denied "$CONTROL_SOCK"
   guest_unix_denied "$RUNTIME/companion.sock"
   local dir_err=$REQ_DIR/guest-dir.err dir_rc=0
+  allow_write "$dir_err"
   as_guest /usr/bin/python3 - "$RUNTIME" >"$dir_err" 2>&1 <<'PY' || dir_rc=$?
 import os, sys
 try:
@@ -1415,6 +1580,7 @@ PY
   mode=$(stat -c '%a' "$token_file")
   [[ $mode == 600 && ${#token} -eq 64 ]] || die "api.token mode=$mode len=${#token}"
   local token_err=$REQ_DIR/guest-token.err
+  allow_write "$token_err" "$HTTP_BODY"
   if as_guest /bin/cat "$token_file" >/dev/null 2>"$token_err"; then
     die "guest read api.token"
   fi
@@ -1578,15 +1744,19 @@ wait_for_new_display() {
 start_compositor() {
   local before_x11=$1 socket_mode=$2
   shift 2
+  allow_write "$DISPLAY_LOG_DIR/compositor.log"
   "$@" >"$DISPLAY_LOG_DIR/compositor.log" 2>&1 &
   COMPOSITOR_PID=$!
   wait_for_new_display "$before_x11" "$socket_mode" "$1"
 }
 
 start_wayland() {
-  export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp/hm-xdg}
-  mkdir -p "$XDG_RUNTIME_DIR"
-  chmod 0700 "$XDG_RUNTIME_DIR"
+  if path_inside_roots "$(owned_path "$XDG_RUNTIME_DIR")"; then
+    mkdir -p "$XDG_RUNTIME_DIR"
+    chmod_inside 0700 "$XDG_RUNTIME_DIR"
+  elif [[ ! -d $XDG_RUNTIME_DIR ]]; then
+    die "XDG_RUNTIME_DIR is not a directory this harness created"
+  fi
   export XDG_SESSION_TYPE=wayland
   unset WAYLAND_DISPLAY || true
   export WLR_BACKENDS=headless
@@ -1594,6 +1764,7 @@ start_wayland() {
   export WLR_LIBINPUT_NO_DEVICES=1
   local before
   before=$(x11_sockets)
+  allow_write "$DISPLAY_LOG_DIR/sway.conf"
   cat >"$DISPLAY_LOG_DIR/sway.conf" <<'EOF'
 xwayland enable
 output * resolution 1280x720
@@ -1611,6 +1782,7 @@ EOF
   fi
   unset WAYLAND_DISPLAY || true
   before=$(x11_sockets)
+  allow_write "$DISPLAY_LOG_DIR/weston.ini"
   cat >"$DISPLAY_LOG_DIR/weston.ini" <<'EOF'
 [core]
 backend=headless-backend.so
