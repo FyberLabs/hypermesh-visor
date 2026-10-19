@@ -1,2 +1,5 @@
 /target
 /dist
+/display-logs
+__pycache__/
+*.pyc

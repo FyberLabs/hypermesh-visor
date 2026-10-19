@@ -15,3 +15,14 @@ jobs:
       - run: cargo test --locked --workspace
       - name: Another Linux user cannot drive the desktop
         run: bash ci/cross-user.sh
+      - name: Workspace tests with harness environment
+        run: |
+          set -euo pipefail
+          runtime=$(mktemp -d)
+          config=$(mktemp -d)
+          chmod 700 "$runtime" "$config"
+          export HYPERMESH_AUTOMATION_RESUME_SECS=2
+          export HYPERMESH_RUNTIME_DIR="$runtime"
+          export HYPERMESH_CONFIG_DIR="$config"
+          export HYPERMESH_COMPANION_POLL_MS=200
+          cargo test --locked --workspace

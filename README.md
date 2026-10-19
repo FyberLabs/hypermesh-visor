@@ -10,7 +10,7 @@ Optional `mcp_profile` on `POST /session` attaches local MCP *tool* servers from
 
 ## Linux build and tests
 
-Stable Rust. Tests do not need a display server.
+Stable Rust. The workspace tests do not need a display server.
 
 ```bash
 cargo test
@@ -19,6 +19,26 @@ cargo build --release
 ```
 
 Run the daemon as the logged-in user, not as root. It prints `control socket` and `companion socket` when those sockets are up. TCP stays closed unless `--tcp` or `HYPERMESH_TCP=1` is set. `--listen` then sets that loopback port (default `127.0.0.1:9847`).
+
+### Display harness
+
+`ci/display/run.sh` drives the visor and the companion on a real display. GitHub Actions runs the same script as `display-x11` and `display-wayland`. View, mouse, type, and phase reads use `control.sock`. Automation start, stop, and resume from the harness stay on `companion.sock`. Each scenario has its own timeout. A failure leaves logs and a capture (`xwd` on X11, `grim` on Wayland) in `display-logs/`. The harness ignores caller-provided `HYPERMESH_*` filesystem paths (`HYPERMESH_RUNTIME_DIR`, `HYPERMESH_CONFIG_DIR`, state and data directories, and any other path variable of that form) and creates private temporary directories with `mktemp`. It does not remove, chmod, or write outside those directories and `display-logs/`. Process ids that have to survive a scenario live in that private state directory. Xorg's display number comes from `-displayfd`; the harness does not read or remove `/tmp/.X*-lock`. The uinput helper runs as root and only creates the pointer and keyboard. Commands are lines on that process's stdin. The harness duplicates those pipe ends onto ordinary file descriptors right after the helper starts, so a scenario subshell still has them; bash closes the coproc descriptors themselves in a subshell. Each command takes a flock in the private state directory, and a write error, a read error, or a missing ack fails the scenario. It does not listen on a port. Companion start, pause, resume, and stop use the same kind of inherited pipe. That helper connects to `companion.sock` as the harness user and does not listen. While scenarios run, the harness polls `ss -ltnp` and fails if a process it started has a listening TCP socket. The visor is the exception only when its command line contains `--tcp`. Device modes stay as udev created them. `/dev/uinput` must not be world-writable, and its mode and owner at the end of the run must match the start. A permission change requires `HYPERMESH_DISPLAY_DEVICE_PERMS=1`, and the exit trap restores the saved mode, owner, and ACL. The harness does not call that path. A caller-provided `XDG_RUNTIME_DIR` is left unchanged. Cleanup stops every process this run started, and a pid is signalled only when `/proc` still shows that binary. A scenario timeout also stops that scenario's background HTTP jobs. Each scenario writes `http.body` and its status files under `display-logs/scenarios/<name>/`.
+
+X11 uses Xorg with the dummy video driver. Injected mouse and type go through XTEST, and a small `xev` window checks that those events landed. Physical input is separate: the harness creates a pointer and a keyboard with `/dev/uinput` (`sudo modprobe uinput`, then `ci/display/uinput.py` under `sudo`). libinput attaches those nodes as slave devices. If libinput does not attach them, the same nodes are handed to the evdev driver. They are not the XTEST pointer or keyboard, and the harness does not pretend that XTEST input is physical. The companion's XTEST classification is what the pause and click scenarios exercise.
+
+```bash
+sudo modprobe uinput
+cargo build --locked --workspace --bins
+bash ci/display/run.sh x11
+bash ci/display/run.sh x11 inject-lands
+bash ci/display/run.sh wayland
+```
+
+X11 scenarios: `uinput-channel`, `key-down-detects`, `inject-lands`, `stop-resume-during-type`, `uinput-key-pauses-type`, `uinput-move-pauses`, `pausing-click-does-not-ask`, `off-bug-toggles-menu`, `xtest-click-does-nothing`, `watchdog-pauses`, `held-release`, `auto-resume`, `tcp-start-without-poll`, `other-user-cannot-drive`. An unknown name exits non-zero and lists these names. `uinput-channel` runs inside a scenario subshell, moves the pointer through the inherited command channel, and expects the companion to pause. `key-down-detects` holds an XTEST key down with no up and checks that `key[$code]=down` is reported. `stop-resume-during-type` posts stop and then resume while a long type is still injecting; the type is cancelled and the phase is running again. `off-bug-toggles-menu` clicks the bug while automation is off and expects the menu to open and close. `tcp-start-without-poll` posts `start` on the control socket with no companion poll and expects 503. That is the same rule as opted-in TCP. `other-user-cannot-drive` adds a second account with `sudo useradd` and checks that it cannot connect to either socket. It then restarts the visor with `--tcp` and checks that the account cannot read `api.token` and gets 401 on session, view, mouse, and type. A resume with that bearer is 403, or 501 on Wayland until #17.
+
+`auto-resume` sets `HYPERMESH_AUTOMATION_RESUME_SECS` on the companion process so the idle resume is a couple of seconds. Unset, or set to anything that is not a positive integer, the companion keeps `automation_resume_secs` from `companion.toml`, or 120 seconds. That variable does not change the default.
+
+Wayland starts sway with `WLR_BACKENDS=headless` and `WLR_RENDERER=pixman`. Sway binds its own `wayland-N` socket. The script reads that name from sway's log, or from a new socket in `XDG_RUNTIME_DIR`. It does not wait for a client-side `hm-display` name. If sway does not provide Xwayland, weston `--backend=headless --socket=hm-display` is the fallback. `start`, `mouse`, and `type` must fail with the issue #17 error, and the companion must still be running. Portal and libei checks are a skipped placeholder in that script until issue #17 lands. An unknown Wayland scenario name exits non-zero and lists `wayland-refuses-automation`, `portal-libei`, and `other-user-cannot-drive`.
 
 ## Release packages
 

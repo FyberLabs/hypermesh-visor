@@ -1,0 +1,107 @@
+name: display
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  display-x11:
+    name: display-x11
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install a headless X server and uinput
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            xserver-xorg-core \
+            xserver-xorg-video-dummy \
+            xserver-xorg-input-libinput \
+            xserver-xorg-input-evdev \
+            x11-utils \
+            x11-apps \
+            x11-xserver-utils \
+            xinput \
+            xdotool \
+            python3 \
+            iproute2
+          sudo modprobe uinput
+          # The harness opens /dev/uinput as root and does not change device modes.
+
+      - name: Run X11 display scenarios
+        run: |
+          before=$(stat -c '%a %U %G' /dev/uinput)
+          echo "uinput before: $before"
+          mode=${before%% *}
+          other=${mode: -1}
+          if (( other & 2 )); then
+            echo "/dev/uinput is world-writable before the run ($before)" >&2
+            exit 1
+          fi
+          # The harness polls ss -ltnp and fails if a process it started is
+          # listening on TCP. The visor is allowed only when launched with --tcp.
+          bash ci/display/run.sh x11
+          after=$(stat -c '%a %U %G' /dev/uinput)
+          echo "uinput after: $after"
+          if [[ $before != "$after" ]]; then
+            echo "/dev/uinput changed from $before to $after" >&2
+            exit 1
+          fi
+          mode=${after%% *}
+          other=${mode: -1}
+          if (( other & 2 )); then
+            echo "/dev/uinput is world-writable after the run ($after)" >&2
+            exit 1
+          fi
+
+      - name: Upload logs and captures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: display-x11-logs
+          path: display-logs/
+          if-no-files-found: ignore
+
+  display-wayland:
+    name: display-wayland
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install a headless compositor
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            sway \
+            weston \
+            grim \
+            xwayland \
+            x11-utils \
+            x11-apps \
+            python3 \
+            iproute2
+
+      - name: Run Wayland display scenarios
+        run: |
+          # The harness polls ss -ltnp and fails if a process it started is
+          # listening on TCP. The visor is allowed only when launched with --tcp.
+          bash ci/display/run.sh wayland
+
+      - name: Upload logs and captures
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: display-wayland-logs
+          path: display-logs/
+          if-no-files-found: ignore
