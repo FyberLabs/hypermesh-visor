@@ -1832,6 +1832,9 @@ scenario_uinput_channel() {
   [[ $before != "$after" ]] || die "uinput move did not move the pointer ($before)"
   wait_phase paused 40
   echo "companion saw the uinput move ($before -> $after) and paused"
+  # start while paused is 403, before the "no recent poll" check. Leave the
+  # phase off, which is where the visor was before this scenario.
+  ensure_off
 }
 
 scenario_uinput_key_pauses_type() {
