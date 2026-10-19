@@ -20,8 +20,11 @@
 # in the private state directory. A pid file is removed only after that
 # process is gone. Xorg's display comes from -displayfd. The harness does
 # not read or remove /tmp/.X*-lock, and it does not chmod /dev/uinput or
-# the event nodes. The uinput helper reads commands on stdin. It does not
-# listen on a port.
+# the event nodes. The uinput helper reads commands on stdin. The coproc
+# ends are duplicated onto ordinary fds before any scenario starts, because
+# bash closes coproc fds in a subshell. Commands take a flock in the private
+# state directory. A write error, a read error, or a missing ack fails the
+# scenario. The helper does not listen on a port.
 set -euo pipefail
 set -m
 
@@ -90,7 +93,7 @@ BASE=
 CONTROL_SOCK=
 TCP_BASE=
 SID=
-UINPUT_FD=
+UINPUT_IN=
 UINPUT_OUT=
 UINPUT_PID=
 SOCK_FD=
@@ -582,10 +585,18 @@ cleanup() {
   if [[ ${BASHPID:-} != "$MAIN_BASHPID" ]]; then
     return 0
   fi
-  if [[ -n ${UINPUT_FD:-} ]]; then
-    printf 'quit\n' >&"$UINPUT_FD" 2>/dev/null || true
-    exec {UINPUT_FD}>&- || true
-    unset UINPUT_FD
+  if [[ -n ${UINPUT_IN:-} ]]; then
+    # printf is a builtin. A helper that has already exited delivers SIGPIPE
+    # to this shell, and that would skip the rest of cleanup.
+    trap '' PIPE
+    printf 'quit\n' >&"$UINPUT_IN" 2>/dev/null || true
+    trap - PIPE
+    exec {UINPUT_IN}>&- || true
+    unset UINPUT_IN
+  fi
+  if [[ -n ${UINPUT_OUT:-} ]]; then
+    exec {UINPUT_OUT}<&- || true
+    unset UINPUT_OUT
   fi
   if [[ -n ${SOCK_FD:-} ]]; then
     printf 'quit\n' >&"$SOCK_FD" 2>/dev/null || true
@@ -1016,11 +1027,32 @@ window_origin() {
 }
 
 uinput_cmd() {
-  printf '%s\n' "$*" >&"$UINPUT_FD"
-  local ack
-  IFS= read -r -t 2 ack <&"$UINPUT_OUT" || die "uinput did not answer: $*"
-  if [[ $ack != ok ]]; then
-    die "uinput $* -> $ack"
+  local ack lockfd kind
+  [[ ${UINPUT_IN:-} =~ ^[0-9]+$ && ${UINPUT_OUT:-} =~ ^[0-9]+$ ]] || die "uinput command channel is not open"
+  # Check before opening the lock file. A closed descriptor number can be
+  # reused by that open, and the command would then land in the lock file.
+  for kind in "$UINPUT_IN" "$UINPUT_OUT"; do
+    if [[ ! -e /proc/${BASHPID:-$$}/fd/$kind ]] || [[ $(readlink "/proc/${BASHPID:-$$}/fd/$kind" 2>/dev/null || true) != pipe:* ]]; then
+      die "uinput command channel is not open"
+    fi
+  done
+  allow_write "$PROC/uinput.cmd.lock"
+  exec {lockfd}>>"$PROC/uinput.cmd.lock" || die "uinput lock open failed"
+  if ! flock -x "$lockfd"; then
+    exec {lockfd}>&- || true
+    die "uinput lock failed"
+  fi
+  if ! printf '%s\n' "$*" >&"$UINPUT_IN"; then
+    exec {lockfd}>&- || true
+    die "uinput write failed: $*"
+  fi
+  if ! IFS= read -r -t 2 ack <&"$UINPUT_OUT"; then
+    exec {lockfd}>&- || true
+    die "uinput did not answer: $*"
+  fi
+  exec {lockfd}>&- || true
+  if [[ -z ${ack:-} || $ack != ok ]]; then
+    die "uinput $* -> ${ack:-missing ack}"
   fi
 }
 
@@ -1435,15 +1467,21 @@ start_uinput() {
   fi
   assert_uinput_mode || return 1
   # The helper runs as root with stdin as the only command channel. It does
-  # not listen, and it does not change device modes.
+  # not listen, and it does not change device modes. Coproc fds are closed
+  # in the scenario subshells, so the ends are duplicated onto ordinary fds
+  # and the coproc originals are closed. Subshells inherit the duplicates.
   local helper=$root/ci/display/uinput.py
-  allow_write "$DISPLAY_LOG_DIR/uinput.err"
+  allow_write "$DISPLAY_LOG_DIR/uinput.err" "$PROC/uinput.cmd.lock"
   coproc UINPUT_PROC {
     sudo -n python3 -u "$helper" 2>"$DISPLAY_LOG_DIR/uinput.err"
   }
-  UINPUT_OUT=${UINPUT_PROC[0]}
-  UINPUT_FD=${UINPUT_PROC[1]}
   local launcher=$UINPUT_PROC_PID
+  local coproc_out=${UINPUT_PROC[0]}
+  local coproc_in=${UINPUT_PROC[1]}
+  # Ordinary fds survive the scenario subshell. The {array[i]} close form
+  # stores -1 and leaves the coproc descriptor open, so close the numbers.
+  exec {UINPUT_IN}>&"${UINPUT_PROC[1]}" {UINPUT_OUT}<&"${UINPUT_PROC[0]}"
+  exec {coproc_out}<&- {coproc_in}>&-
   local py_bin
   py_bin=$(command -v python3)
   note_started "$launcher" "$(command -v sudo)"
@@ -1780,6 +1818,22 @@ scenario_inject_lands() {
   [[ $(phase) == running ]] || die "injected input paused automation ($(phase))"
 }
 
+scenario_uinput_channel() {
+  ensure_companion
+  ensure_running
+  # Same poll gap as the other physical-move scenarios: the companion has to
+  # observe running before the pointer move, or the move does not pause it.
+  sleep 0.5
+  local before after
+  before=$(xdotool getmouselocation --shell | awk -F= '/^X=/{print $2}')
+  uinput_cmd "rel 40 0"
+  sleep 0.2
+  after=$(xdotool getmouselocation --shell | awk -F= '/^X=/{print $2}')
+  [[ $before != "$after" ]] || die "uinput move did not move the pointer ($before)"
+  wait_phase paused 40
+  echo "companion saw the uinput move ($before -> $after) and paused"
+}
+
 scenario_uinput_key_pauses_type() {
   ensure_companion
   focus_xev
@@ -1797,7 +1851,7 @@ PY
     sleep 0.05
     local spins=0
     while kill -0 "$curl_pid" 2>/dev/null; do
-      uinput_cmd "key F12" || true
+      uinput_cmd "key F12"
       spins=$((spins + 1))
       if (( spins > 100 )); then
         break
@@ -2162,6 +2216,7 @@ PY
 }
 
 X11_SCENARIOS=(
+  uinput-channel
   key-down-detects
   tcp-start-without-poll
   inject-lands
