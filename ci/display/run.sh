@@ -1444,7 +1444,14 @@ PY
     -H 'content-type: application/json' \
     -H "authorization: Bearer $token" \
     -d '{"action":"resume"}')
-  [[ $code == 403 ]] || die "bearer resume returned $code ($(cat "$HTTP_BODY"))"
+  # X11 refuses the lift with 403. Wayland refuses resume before that check.
+  if [[ $code == 403 ]]; then
+    :
+  elif [[ $code == 501 ]] && grep -q '#17' "$HTTP_BODY"; then
+    :
+  else
+    die "bearer resume returned $code ($(cat "$HTTP_BODY"))"
+  fi
   echo "other user cannot drive the control socket, the companion socket, or the opted-in port"
 }
 
