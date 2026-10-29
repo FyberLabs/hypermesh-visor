@@ -12,6 +12,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Check embedded includes
         run: bash ci/check-includes.sh
+      - name: Check display harness process identity
+        run: python3 ci/display/test-process-identity.py
       - run: cargo test --locked --workspace
       - name: Another Linux user cannot drive the desktop
         run: bash ci/cross-user.sh

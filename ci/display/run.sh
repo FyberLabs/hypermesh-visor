@@ -247,10 +247,22 @@ load_proc_state() {
   fi
 }
 
+# Root-owned Xorg is not ptrace-readable by the unprivileged CI runner.
+# Keep executable identity checks exact; only the readlink needs privilege.
+proc_executable() {
+  local pid=$1 exe
+  [[ $pid =~ ^[0-9]+$ ]] || return 1
+  if exe=$(readlink "/proc/$pid/exe" 2>/dev/null); then
+    printf '%s\n' "$exe"
+  else
+    sudo -n readlink "/proc/$pid/exe" 2>/dev/null
+  fi
+}
+
 exe_is_xorg() {
   local pid=$1 exe base
   [[ $pid =~ ^[0-9]+$ ]] || return 1
-  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  exe=$(proc_executable "$pid" || true)
   base=$(basename "$exe")
   [[ $base == Xorg || $base == Xorg.bin ]]
 }
@@ -353,11 +365,11 @@ pid_matches_exe() {
   local pid=$1 expected=$2 exe raw cmd
   [[ $pid =~ ^[0-9]+$ ]] || return 1
   [[ -r /proc/$pid/cmdline ]] || return 1
-  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  exe=$(proc_executable "$pid" || true)
   if [[ -n $exe && $exe == "$expected" ]]; then
     return 0
   fi
-  raw=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+  raw=$exe
   if [[ $raw == "$expected" || $raw == "$expected (deleted)" ]]; then
     return 0
   fi
@@ -1226,7 +1238,7 @@ capture_shot() {
 harness_same_exe() {
   local pid=$1 expected=$2 exe resolved
   pid_matches_exe "$pid" "$expected" && return 0
-  exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null || true)
+  exe=$(proc_executable "$pid" || true)
   resolved=$(readlink -f "$expected" 2>/dev/null || true)
   [[ -n $exe && -n $resolved && $exe == "$resolved" ]]
 }
@@ -1504,7 +1516,7 @@ launch_xorg() {
   done
   [[ -n $xpid ]] || return 1
   exe_is_xorg "$xpid" || return 1
-  xexe=$(readlink -f "/proc/$xpid/exe")
+  xexe=$(proc_executable "$xpid")
   note_started "$xpid" "$xexe" "$log"
   write_state xorg.pid "$xpid"
   XORG_PID=$xpid
