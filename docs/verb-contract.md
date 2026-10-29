@@ -138,7 +138,7 @@ Task lifecycle, cancellation, and broader tool parity remain in #32.
 | Conventional AI client | Five inverse MCP tools; binary-image and validation transport tests | Broader parity and lifecycle: #32 |
 
 The live X11 harness covers 17 scenarios: uinput channel, key state, TCP startup,
-injection, wheel press/release balance, real editor scrolling, stop/resume ordering, physical key/motion pause, pausing-click behavior,
+injection, wheel press/release balance, real editor and browser scrolling, stop/resume ordering, physical key/motion pause, pausing-click behavior,
 menu behavior, synthetic-click rejection, watchdog, held-input release,
 auto-resume, and cross-user denial. These are primitive and security checks,
 not evidence that browser/editor task suites or all desktop platforms work.

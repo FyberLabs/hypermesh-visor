@@ -2313,48 +2313,13 @@ PY
     fi
   done
 
-  # A short drag finishes before a pause can land. The root is wide so
-  # this is hundreds of pointer steps, and the socket helper pauses between
-  # batches. sent must include the button-down and exclude the button-up.
+  # Observe the held button on an already-open X connection before pausing.
+  # Fixed shell sleeps can miss the entire drag on fast runners.
   local to_x=$((ROOT_W - 1)) to_y=$((ROOT_H / 2))
   (( to_x <= 32767 )) || to_x=32767
-  local points=$(( (to_x + 63) / 64 ))
-  local total=$((points + 3))
-  local drag_ok=0
-  local delay
-  for attempt in 1 2 3 4 5; do
-    case $attempt in
-      1) delay=0.02 ;;
-      2) delay=0.05 ;;
-      3) delay=0.01 ;;
-      4) delay=0.08 ;;
-      *) delay=0 ;;
-    esac
-    ensure_running
-    spawn_request http_code "$REQ_DIR/drag.code" POST "$BASE/session/$SID/mouse" \
-      "{\"action\":\"drag\",\"x\":0,\"y\":0,\"to_x\":$to_x,\"to_y\":$to_y,\"button\":\"left\"}"
-    curl_pid=$SPAWN_PID
-    sleep "$delay"
-    for i in $(seq 1 400); do
-      if ! kill -0 "$curl_pid" 2>/dev/null; then
-        break
-      fi
-      socket_action pause || true
-    done
-    wait "$curl_pid" || true
-    code=$(cat "$REQ_DIR/drag.code")
-    n=$(sent_after "pointer steps")
-    echo "drag cancel attempt $attempt status $code sent ${n:-none} total $total $(error_text "$HTTP_BODY")"
-    if button_is_down; then
-      query_state "$XTEST_POINTER" >&2 || true
-      die "left button stayed down"
-    fi
-    if [[ $code == 409 && -n $n && $n -ge 2 && $n -lt $total ]]; then
-      drag_ok=1
-      break
-    fi
-  done
-  (( drag_ok == 1 )) || die "could not cancel a drag while the button was down"
+  ensure_running
+  python3 "$root/ci/display/cancel-drag.py" "$CONTROL_SOCK" \
+    "$RUNTIME/companion.sock" "$SID" "$to_x" "$to_y"
   if button_is_down; then
     die "left button stayed down after cancel"
   fi
