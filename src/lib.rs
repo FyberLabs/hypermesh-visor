@@ -7,6 +7,7 @@ compile_error!("hypermesh-visor version one is Linux only");
 mod api;
 mod automation;
 mod bind;
+mod capabilities;
 mod companion_sock;
 mod desktop;
 mod harness;

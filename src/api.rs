@@ -597,6 +597,7 @@ struct CompanionLink(bool);
 
 fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
     Router::new()
+        .route("/capabilities", get(capabilities))
         .route("/companion", get(companion))
         .route("/companion/automation", post(companion_automation))
         .route("/companion/interrupt", post(companion_interrupt))
@@ -619,6 +620,12 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .route("/session/:id/mcp/call", post(mcp_call))
         .layer(Extension(CompanionLink(from_companion)))
         .with_state(state)
+}
+
+/// Reports implementation support without capturing a screen, opening audio,
+/// attaching MCP servers, or changing the automation gate.
+async fn capabilities(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(crate::capabilities::describe(state.desktop.backend_name()))
 }
 
 /// `tcp` is the opt-in loopback listener. `None` does not bind a port.
@@ -2783,11 +2790,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capabilities_do_not_touch_devices_or_open_sessions() {
+        let desktop = FakeDesktop::new();
+        desktop.wayland.store(true, Ordering::SeqCst);
+        let state = Arc::new(AppState::new(desktop.clone(), Duration::from_millis(20)));
+        let Json(value) = capabilities(State(state.clone())).await;
+        assert_eq!(value["desktop"]["mouse"], "disabled");
+        assert!(lock(&state.sessions).is_empty());
+        assert_eq!(desktop.views.load(Ordering::SeqCst), 0);
+        assert_eq!(desktop.audio_opens.load(Ordering::SeqCst), 0);
+        assert_eq!(desktop.focus_probes.load(Ordering::SeqCst), 0);
+        assert!(lock(&desktop.mice).is_empty());
+        assert!(lock(&desktop.typed).is_empty());
+    }
+
+    #[tokio::test]
+    async fn capabilities_are_discoverable_without_opening_a_session() {
+        let token = "a".repeat(64);
+        let addr = spawn_with_bearer(&token).await;
+        let authorization = format!("Bearer {token}");
+        let response = dispatch(
+            addr,
+            "GET",
+            "/capabilities",
+            None,
+            Some(("authorization", &authorization)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["backend"], "fixture");
+        assert_eq!(value["desktop"]["mouse"], "fixture");
+        assert_eq!(value["authorization_granted"], false);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            "/session/00000000-0000-0000-0000-000000000001/mouse",
+            Some("{}".into()),
+        )
+        .await;
+        assert_eq!(status, 401);
+    }
+
+    #[tokio::test]
     async fn tcp_without_the_bearer_is_401_on_every_route_and_cannot_lift_a_pause() {
         let token = "a".repeat(64);
         let addr = spawn_with_bearer(&token).await;
         let routes = [
             ("GET", "/health"),
+            ("GET", "/capabilities"),
             ("GET", "/no-such-route"),
             ("GET", "/companion"),
             ("POST", "/companion/automation"),

@@ -175,6 +175,14 @@ curl --unix-socket "${XDG_RUNTIME_DIR}/hypermesh/control.sock" \
   -d '{"purpose":"look at the desktop","recipes":[],"agent":{"name":"local","instructions":""},"skills":[]}'
 ```
 
+## Capability discovery and verb coverage
+
+`GET /capabilities` describes implemented desktop operations, backend restrictions,
+input limits, and inverse-MCP coverage without accessing devices. It requires the
+normal transport authorization and does not grant permission or prove readiness.
+See the [verb contract and task coverage audit](docs/verb-contract.md) for request
+shapes, cancellation/retry rules, platform limits, and remaining gaps.
+
 ## Verb checks
 
 `ci/verbs.sh` starts the daemon with `--fixture` and calls view, watch, listen, mouse, and type on the control socket. `ci/cross-user.sh` checks that TCP stays closed and that another Linux user cannot drive the desktop. The bodies are the same fixed HTTP requests. View and watch must return the frame in `tests/fixtures/view.png.b64`. Listen must return the audio in `tests/fixtures/listen.pcm.b64`. Mouse and type checks read the coordinates, buttons, and keystrokes written by the input path. GitHub Actions runs that script. It does not call a model.
