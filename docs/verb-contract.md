@@ -85,9 +85,21 @@ silently trigger desktop replay. Discovery and stale-binding work is #29.
 The inverse stdio adapter advertises only `view`, `mouse_move`, `mouse_click`,
 and `type_text`. It needs an existing session. It does not yet expose watch,
 listen, drag, named keys, secret handles, capability discovery, or session/task
-lifecycle. Its current `view` response is a status string, not image content;
-therefore the advertised tool alone does not complete a visual observation loop.
-Argument validation and structured error fidelity also need improvement in #32.
+lifecycle. `view` returns a base64 PNG MCP image block, preserving the captured bytes over
+both Unix and TCP transports (including chunked HTTP). Responses are bounded to
+32 MiB; transport operations time out after 30 seconds. TCP redirects are refused.
+
+The four tool schemas reject extra arguments. Coordinates are required integers
+from 0 to 32767; the visor still checks live root geometry and the automation
+gate. Click buttons are exactly `left`, `right`, or `middle` (omission means
+`left`). Text is a required nonempty string of at most 4096 Unicode characters;
+the backend additionally validates supported characters and planned keystrokes.
+Session IDs must parse as UUIDs. Invalid arguments return JSON-RPC `-32602`
+before transport access. Backend/transport failures return `isError: true`,
+retaining the HTTP status and JSON error detail, including partial progress.
+A tool-call notification without a request ID never executes input.
+
+Task lifecycle, cancellation, and broader tool parity remain in #32.
 
 ## Task coverage and evidence
 
@@ -104,7 +116,7 @@ Argument validation and structured error fidelity also need improvement in #32.
 | Native Wayland | Refusal/access-control scenarios | Portal/libei scenario is skipped; #17 |
 | Windows/macOS | Linux compile guard | #18/#25/#26 |
 | Container bots | No supported production deployment yet | #27/#35 |
-| Conventional AI client | Four inverse MCP tools | Image result, validation, parity and lifecycle: #32 |
+| Conventional AI client | Four inverse MCP tools; binary-image and validation transport tests | Broader parity and lifecycle: #32 |
 
 The live X11 harness covers 14 scenarios: uinput channel, key state, TCP startup,
 injection, stop/resume ordering, physical key/motion pause, pausing-click behavior,

@@ -8,6 +8,13 @@ Optional `mcp_profile` on `POST /session` attaches local MCP *tool* servers from
 
 `hypermesh-desktop-mcp` is an inverse stdio MCP that wraps visor view/mouse/type for external agents. It uses the control socket by default. `HYPERMESH_VISOR_URL` selects the opt-in TCP listener, and `HYPERMESH_SESSION_ID` names the session.
 
+Its `view` tool returns a PNG image content block. Pointer tools require integer
+root-window coordinates; malformed arguments are rejected before desktop access.
+Backend failures remain tool errors, including pause/partial-progress details.
+See the [inverse MCP contract](docs/verb-contract.md#mcp-preference-and-inverse-adapter)
+for limits and supported tools.
+
+
 ## Linux build and tests
 
 Stable Rust. The workspace tests do not need a display server.
