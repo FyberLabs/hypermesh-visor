@@ -2067,6 +2067,51 @@ scenario_scroll_editor() {
   wait_for_exit "$editor_pid" "$python" "$root/ci/display/scroll-editor.py"
 }
 
+# Observe page offsets from the browser engine; never synthesize input in JS.
+scenario_scroll_browser() {
+  ensure_companion
+  ensure_running
+  local python browser_pid i delta log=$DISPLAY_LOG_DIR/scroll-browser.log
+  python=$(readlink -f "$(command -v python3)")
+  allow_write "$log"
+  GDK_BACKEND=x11 "$python" "$root/ci/display/scroll-browser.py" >"$log" 2>&1 &
+  browser_pid=$!
+  note_started "$browser_pid" "$python" "$root/ci/display/scroll-browser.py"
+  for i in $(seq 1 100); do
+    if xwininfo -name 'Visor scroll browser' >/dev/null 2>&1 && grep -q '^POSITION 0 0$' "$log"; then break; fi
+    sleep 0.1
+  done
+  xwininfo -name 'Visor scroll browser' >/dev/null 2>&1 || die "browser did not open: $(cat "$log")"
+  grep -q '^POSITION 0 0$' "$log" || die "browser did not load: $(cat "$log")"
+  # A load event can precede the first composited frame and its hit-test data.
+  # Require input delivery to the actual page before sending wheel events.
+  for i in $(seq 1 50); do
+    http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" \
+      "{\"action\":\"move\",\"x\":$((650 + i % 2)),\"y\":120}"
+    [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "browser readiness move failed"
+    grep -q '^POINTER$' "$log" && break
+    sleep 0.1
+  done
+  grep -q '^POINTER$' "$log" || die "browser is not receiving pointer input: $(cat "$log")"
+  # Exercise axes independently; the untouched axis must remain at zero.
+  for delta in '0 3' '0 -3' '3 0' '-3 0'; do
+    local dx dy matched=0
+    read -r dx dy <<<"$delta"
+    http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" "{\"action\":\"scroll\",\"x\":650,\"y\":120,\"delta_x\":$dx,\"delta_y\":$dy}"
+    [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "browser scroll $delta: $(cat "$HTTP_BODY")"
+    for i in $(seq 1 100); do
+      if grep '^POSITION ' "$log" | tail -n 1 | awk -v dx="$dx" -v dy="$dy" '
+        { if (dx > 0) ok=($2>0 && $3==0);
+          else if (dy > 0) ok=($2==0 && $3>0);
+          else ok=($2==0 && $3==0); }
+        END {exit !ok}'; then matched=1; break; fi
+      sleep 0.1
+    done
+    [[ $matched == 1 ]] || die "browser viewport did not follow $delta: $(cat "$log")"
+  done
+  wait_for_exit "$browser_pid" "$python" "$root/ci/display/scroll-browser.py"
+}
+
 scenario_uinput_channel() {
   ensure_companion
   ensure_running
@@ -2278,48 +2323,13 @@ PY
     fi
   done
 
-  # A short drag finishes before a pause can land. The root is wide so
-  # this is hundreds of pointer steps, and the socket helper pauses between
-  # batches. sent must include the button-down and exclude the button-up.
+  # Observe the held button on an already-open X connection before pausing.
+  # Fixed shell sleeps can miss the entire drag on fast runners.
   local to_x=$((ROOT_W - 1)) to_y=$((ROOT_H / 2))
   (( to_x <= 32767 )) || to_x=32767
-  local points=$(( (to_x + 63) / 64 ))
-  local total=$((points + 3))
-  local drag_ok=0
-  local delay
-  for attempt in 1 2 3 4 5; do
-    case $attempt in
-      1) delay=0.02 ;;
-      2) delay=0.05 ;;
-      3) delay=0.01 ;;
-      4) delay=0.08 ;;
-      *) delay=0 ;;
-    esac
-    ensure_running
-    spawn_request http_code "$REQ_DIR/drag.code" POST "$BASE/session/$SID/mouse" \
-      "{\"action\":\"drag\",\"x\":0,\"y\":0,\"to_x\":$to_x,\"to_y\":$to_y,\"button\":\"left\"}"
-    curl_pid=$SPAWN_PID
-    sleep "$delay"
-    for i in $(seq 1 400); do
-      if ! kill -0 "$curl_pid" 2>/dev/null; then
-        break
-      fi
-      socket_action pause || true
-    done
-    wait "$curl_pid" || true
-    code=$(cat "$REQ_DIR/drag.code")
-    n=$(sent_after "pointer steps")
-    echo "drag cancel attempt $attempt status $code sent ${n:-none} total $total $(error_text "$HTTP_BODY")"
-    if button_is_down; then
-      query_state "$XTEST_POINTER" >&2 || true
-      die "left button stayed down"
-    fi
-    if [[ $code == 409 && -n $n && $n -ge 2 && $n -lt $total ]]; then
-      drag_ok=1
-      break
-    fi
-  done
-  (( drag_ok == 1 )) || die "could not cancel a drag while the button was down"
+  ensure_running
+  python3 "$root/ci/display/cancel-drag.py" "$CONTROL_SOCK" \
+    "$RUNTIME/companion.sock" "$SID" "$to_x" "$to_y"
   if button_is_down; then
     die "left button stayed down after cancel"
   fi
@@ -2474,6 +2484,7 @@ X11_SCENARIOS=(
   inject-lands
   scroll-lands
   scroll-editor
+  scroll-browser
   stop-resume-during-type
   uinput-key-pauses-type
   uinput-move-pauses
