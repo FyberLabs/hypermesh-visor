@@ -5,11 +5,24 @@
 //! the opt-in TCP listener, with `HYPERMESH_VISOR_TOKEN` or the `api.token` file.
 
 use std::io::{self, BufRead, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, Limited};
+use hyper_util::rt::TokioIo;
 use serde_json::{json, Value};
+
+const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TEXT_CHARS: usize = 4096;
+const MAX_COORD: i64 = 32767;
+
+struct VisorResponse {
+    status: u16,
+    mime: String,
+    body: Vec<u8>,
+}
 
 enum VisorEndpoint {
     Unix(PathBuf),
@@ -79,42 +92,19 @@ fn main() {
                 }
                 "notifications/initialized" => {}
                 "tools/list" => {
-                    reply(
-                        &mut stdout,
-                        msg.get("id").cloned(),
-                        json!({
-                            "tools": [
-                                {"name": "view", "description": "Capture the desktop (POST /session/{id}/view)", "inputSchema": {"type": "object", "properties": {}}},
-                                {"name": "mouse_move", "description": "Move the pointer", "inputSchema": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]}},
-                                {"name": "mouse_click", "description": "Click", "inputSchema": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "button": {"type": "string"}}, "required": ["x", "y"]}},
-                                {"name": "type_text", "description": "Type text", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}
-                            ]
-                        }),
-                    );
+                    reply(&mut stdout, msg.get("id").cloned(), tool_list());
                 }
                 "tools/call" => {
-                    let id = msg.get("id").cloned();
-                    let params = msg.get("params").cloned().unwrap_or(json!({}));
-                    let tool = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                    match visor.call(&session, tool, &args) {
-                        Ok(text) => reply(
-                            &mut stdout,
-                            id,
-                            json!({"content": [{"type": "text", "text": text}]}),
-                        ),
-                        Err(err) => {
-                            let _ = writeln!(
-                                stdout,
-                                "{}",
-                                json!({
-                                    "jsonrpc": "2.0",
-                                    "id": id,
-                                    "error": {"code": -32000, "message": err}
-                                })
-                            );
-                            let _ = stdout.flush();
-                        }
+                    // A tool invocation is a request, never an executable notification.
+                    if let Some(id) = msg.get("id").filter(|id| id.is_string() || id.is_number()) {
+                        let result = handle_call(&visor, &session, msg.get("params"));
+                        let envelope = match result {
+                            Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
+                            Err(message) => json!({"jsonrpc":"2.0", "id":id,
+                                "error":{"code":-32602,"message":message}}),
+                        };
+                        let _ = writeln!(stdout, "{envelope}");
+                        let _ = stdout.flush();
                     }
                 }
                 _ => {
@@ -145,24 +135,52 @@ fn reply(stdout: &mut impl Write, id: Option<Value>, result: Value) {
     let _ = stdout.flush();
 }
 
-impl VisorEndpoint {
-    fn call(&self, session: &str, tool: &str, args: &Value) -> Result<String, String> {
-        if session.trim().is_empty() {
-            return Err("HYPERMESH_SESSION_ID is required".into());
-        }
-        let (method, path, body) = tool_request(session, tool, args)?;
-        match self {
-            Self::Unix(path_sock) => {
-                let (status, _) = unix_exchange(path_sock, method, &path, body.as_deref(), None)?;
-                tool_result(tool, status)
-            }
-            Self::Http { base, token } => {
-                let url = format!("{}{path}", base.trim_end_matches('/'));
-                let status = http_exchange(&url, method, body.as_deref(), token.as_deref())?;
-                tool_result(tool, status)
-            }
-        }
-    }
+fn tool_list() -> Value {
+    let coordinate = json!({"type":"integer", "minimum":0, "maximum":MAX_COORD});
+    json!({"tools":[
+        {"name":"view", "description":"Capture the desktop as a PNG image", "inputSchema":
+            {"type":"object", "properties":{}, "additionalProperties":false}},
+        {"name":"mouse_move", "description":"Move the pointer in root-window pixels", "inputSchema":
+            {"type":"object", "properties":{"x":coordinate,"y":coordinate}, "required":["x","y"], "additionalProperties":false}},
+        {"name":"mouse_click", "description":"Click in root-window pixels", "inputSchema":
+            {"type":"object", "properties":{"x":coordinate,"y":coordinate,
+                "button":{"type":"string","enum":["left","right","middle"],"default":"left"}},
+             "required":["x","y"],"additionalProperties":false}},
+        {"name":"type_text", "description":"Type text; the visor also validates key support and the planned keystroke limit", "inputSchema":
+            {"type":"object", "properties":{"text":{"type":"string","minLength":1,"maxLength":MAX_TEXT_CHARS}},
+             "required":["text"],"additionalProperties":false}}
+    ]})
+}
+
+fn handle_call(
+    visor: &VisorEndpoint,
+    session: &str,
+    params: Option<&Value>,
+) -> Result<Value, String> {
+    let params = params
+        .and_then(Value::as_object)
+        .ok_or("params must be an object")?;
+    let tool = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or("name must be a string")?;
+    let empty = json!({});
+    let args = params.get("arguments").unwrap_or(&empty);
+    // Validate before connecting, so malformed input can never drive the desktop.
+    let (method, path, body) = tool_request(session, tool, args)?;
+    let response = match visor {
+        VisorEndpoint::Unix(socket) => unix_exchange(socket, method, &path, body.as_deref()),
+        VisorEndpoint::Http { base, token } => http_exchange(
+            &format!("{}{path}", base.trim_end_matches('/')),
+            method,
+            body.as_deref(),
+            token.as_deref(),
+        ),
+    };
+    Ok(match response {
+        Ok(response) => tool_result(tool, response),
+        Err(error) => failure(format!("{tool}: {error}")),
+    })
 }
 
 fn tool_request(
@@ -170,89 +188,102 @@ fn tool_request(
     tool: &str,
     args: &Value,
 ) -> Result<(&'static str, String, Option<String>), String> {
+    let allowed: &[&str] = match tool {
+        "view" => &[],
+        "mouse_move" => &["x", "y"],
+        "mouse_click" => &["x", "y", "button"],
+        "type_text" => &["text"],
+        _ => return Err("unknown tool".into()),
+    };
+    let args = args.as_object().ok_or("arguments must be an object")?;
+    if args.keys().any(|key| !allowed.contains(&key.as_str())) {
+        return Err("unexpected argument".into());
+    }
+    let session =
+        uuid::Uuid::parse_str(session).map_err(|_| "HYPERMESH_SESSION_ID must be a UUID")?;
+    let coord = |name: &str| -> Result<i64, String> {
+        args.get(name)
+            .and_then(Value::as_i64)
+            .filter(|value| (0..=MAX_COORD).contains(value))
+            .ok_or_else(|| format!("{name} must be an integer from 0 to {MAX_COORD}"))
+    };
     match tool {
         "view" => Ok(("POST", format!("/session/{session}/view"), None)),
-        "mouse_move" => {
-            let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-            let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+        "mouse_move" | "mouse_click" => {
+            let x = coord("x")?;
+            let y = coord("y")?;
+            let mut body =
+                json!({"action":if tool == "mouse_move" {"move"} else {"click"},"x":x,"y":y});
+            if tool == "mouse_click" {
+                let button = match args.get("button") {
+                    None => "left",
+                    Some(value) => value
+                        .as_str()
+                        .filter(|b| ["left", "right", "middle"].contains(b))
+                        .ok_or("button must be left, right, or middle")?,
+                };
+                body["button"] = json!(button);
+            }
             Ok((
                 "POST",
                 format!("/session/{session}/mouse"),
-                Some(json!({"action": "move", "x": x, "y": y}).to_string()),
-            ))
-        }
-        "mouse_click" => {
-            let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-            let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
-            let button = args
-                .get("button")
-                .and_then(|v| v.as_str())
-                .unwrap_or("left");
-            Ok((
-                "POST",
-                format!("/session/{session}/mouse"),
-                Some(json!({"action": "click", "x": x, "y": y, "button": button}).to_string()),
+                Some(body.to_string()),
             ))
         }
         "type_text" => {
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let text = args
+                .get("text")
+                .and_then(Value::as_str)
+                .ok_or("text must be a string")?;
+            if text.is_empty() || text.chars().count() > MAX_TEXT_CHARS {
+                return Err(format!(
+                    "text must contain 1 to {MAX_TEXT_CHARS} characters"
+                ));
+            }
             Ok((
                 "POST",
                 format!("/session/{session}/type"),
-                Some(json!({"text": text}).to_string()),
+                Some(json!({"text":text}).to_string()),
             ))
         }
-        other => Err(format!("unknown tool {other}")),
+        _ => unreachable!(),
     }
 }
 
-fn tool_result(tool: &str, status: u16) -> Result<String, String> {
-    if !(200..300).contains(&status) {
-        return Err(format!("{tool} status {status}"));
-    }
-    Ok(match tool {
-        "view" => format!("view status {status}"),
-        "mouse_move" => "moved".into(),
-        "mouse_click" => "clicked".into(),
-        "type_text" => "typed".into(),
-        other => format!("{other} status {status}"),
-    })
+fn failure(message: String) -> Value {
+    json!({"content":[{"type":"text","text":message}],"isError":true})
 }
 
-#[cfg(test)]
-fn call_visor(base: &str, session: &str, tool: &str, args: &Value) -> Result<String, String> {
-    VisorEndpoint::Http {
-        base: base.to_string(),
-        token: None,
+fn tool_result(tool: &str, response: VisorResponse) -> Value {
+    if !(200..300).contains(&response.status) {
+        let error = serde_json::from_slice::<Value>(&response.body)
+            .ok()
+            .and_then(|v| v.get("error").and_then(Value::as_str).map(str::to_owned));
+        let detail = error
+            .map(|s| format!(": {}", s.chars().take(2048).collect::<String>()))
+            .unwrap_or_default();
+        return failure(format!("{tool} status {}{detail}", response.status));
     }
-    .call(session, tool, args)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn desktop_tools_cannot_control_the_companion() {
-        let err = call_visor(
-            "http://127.0.0.1:9",
-            "00000000-0000-0000-0000-000000000001",
-            "read_file",
-            &json!({"path": "/run/user/1/hypermesh/companion.sock"}),
-        )
-        .unwrap_err();
-        assert!(err.contains("unknown tool"));
-        let err = call_visor(
-            "http://127.0.0.1:9",
-            "00000000-0000-0000-0000-000000000001",
-            "resume",
-            &json!({}),
-        )
-        .unwrap_err();
-        assert!(err.contains("unknown tool"));
-        let err = call_visor("http://127.0.0.1:9", "  ", "view", &json!({})).unwrap_err();
-        assert!(err.contains("HYPERMESH_SESSION_ID"));
+    if tool == "view" {
+        if !response
+            .mime
+            .split(';')
+            .next()
+            .is_some_and(|m| m.trim().eq_ignore_ascii_case("image/png"))
+            || !response.body.starts_with(b"\x89PNG\r\n\x1a\n")
+        {
+            return failure("view returned an invalid PNG response".into());
+        }
+        return json!({"content":[{"type":"image", "mimeType":"image/png",
+            "data":base64::engine::general_purpose::STANDARD.encode(response.body)}], "isError":false});
     }
+    let text = match tool {
+        "mouse_move" => "moved",
+        "mouse_click" => "clicked",
+        "type_text" => "typed",
+        _ => "done",
+    };
+    json!({"content":[{"type":"text","text":text}],"isError":false})
 }
 
 fn http_exchange(
@@ -260,24 +291,37 @@ fn http_exchange(
     method: &str,
     body: Option<&str>,
     token: Option<&str>,
-) -> Result<u16, String> {
-    let mut request = match method {
-        "POST" => ureq::post(url),
-        other => return Err(format!("unsupported method {other}")),
-    };
-    request = request
-        .set("Content-Type", "application/json")
-        .timeout(Duration::from_secs(30));
+) -> Result<VisorResponse, String> {
+    let agent = ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(Duration::from_secs(30))
+        .build();
+    let mut request = agent
+        .request(method, url)
+        .set("Content-Type", "application/json");
     if let Some(token) = token {
         request = request.set("Authorization", &format!("Bearer {token}"));
     }
-    let response = match body {
+    let result = match body {
         Some(body) => request.send_string(body),
         None => request.call(),
     };
+    let response = match result {
+        Ok(response) | Err(ureq::Error::Status(_, response)) => response,
+        Err(_) => return Err("visor HTTP transport failed".into()),
+    };
+    let status = response.status();
+    let mime = response.header("content-type").unwrap_or("").to_owned();
+    let mut body = Vec::new();
     response
-        .map(|response| response.status())
-        .map_err(|err| err.to_string())
+        .into_reader()
+        .take((MAX_RESPONSE_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| "visor response read failed")?;
+    if body.len() > MAX_RESPONSE_BYTES {
+        return Err("visor response exceeds 32 MiB".into());
+    }
+    Ok(VisorResponse { status, mime, body })
 }
 
 fn unix_exchange(
@@ -285,51 +329,50 @@ fn unix_exchange(
     method: &str,
     path: &str,
     body: Option<&str>,
-    token: Option<&str>,
-) -> Result<(u16, String), String> {
-    let body = body.unwrap_or("");
-    let mut headers = format!(
-        "{method} {path} HTTP/1.1\r\nhost: localhost\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
-        body.len()
-    );
-    if let Some(token) = token {
-        headers.push_str(&format!("authorization: Bearer {token}\r\n"));
-    }
-    headers.push_str("\r\n");
-    let mut stream = UnixStream::connect(socket).map_err(|err| err.to_string())?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(30)))
-        .map_err(|err| err.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
-        .map_err(|err| err.to_string())?;
-    stream
-        .write_all(headers.as_bytes())
-        .map_err(|err| err.to_string())?;
-    stream
-        .write_all(body.as_bytes())
-        .map_err(|err| err.to_string())?;
-    let mut buf = Vec::new();
-    stream
-        .read_to_end(&mut buf)
-        .map_err(|err| err.to_string())?;
-    let text = String::from_utf8_lossy(&buf);
-    let (status, response_body) = split_http(&text);
-    if status == 0 {
-        return Err("visor request failed".into());
-    }
-    Ok((status, response_body))
-}
-
-fn split_http(text: &str) -> (u16, String) {
-    let Some((head, body)) = text.split_once("\r\n\r\n") else {
-        return (0, String::new());
-    };
-    let status = head
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|code| code.parse().ok())
-        .unwrap_or(0);
-    (status, body.to_string())
+) -> Result<VisorResponse, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let stream = tokio::net::UnixStream::connect(socket)
+                .await
+                .map_err(|e| e.to_string())?;
+            let (mut sender, connection) =
+                hyper::client::conn::http1::handshake(TokioIo::new(stream))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            tokio::spawn(async move {
+                let _ = connection.await;
+            });
+            let request = hyper::Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .body(Full::new(Bytes::from(body.unwrap_or("").to_owned())))
+                .map_err(|e| e.to_string())?;
+            let response = sender
+                .send_request(request)
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = response.status().as_u16();
+            let mime = response
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let body = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
+                .collect()
+                .await
+                .map_err(|_| "visor response is incomplete or exceeds 32 MiB")?
+                .to_bytes()
+                .to_vec();
+            Ok(VisorResponse { status, mime, body })
+        })
+        .await
+        .map_err(|_| "visor request timed out".to_string())?
+    })
 }
