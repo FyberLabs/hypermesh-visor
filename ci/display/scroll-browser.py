@@ -14,6 +14,7 @@ manager.connect("script-message-received::position",
                 lambda manager, result: print(result.get_js_value().to_string(), flush=True))
 assert manager.register_script_message_handler("position")
 view = WebKit2.WebView(user_content_manager=manager)
+view.get_settings().set_hardware_acceleration_policy(WebKit2.HardwareAccelerationPolicy.NEVER)
 window.add(view)
 view.load_html("""<!doctype html><meta charset=utf-8>
 <style>html {scroll-behavior: auto} body {margin:0}
@@ -28,7 +29,8 @@ addEventListener('scroll', () => {
     clearTimeout(settled);
     settled = setTimeout(report, 250);
 });
-addEventListener('load', report);
+addEventListener('load', () => requestAnimationFrame(() => requestAnimationFrame(report)));
+addEventListener('mousemove', () => window.webkit.messageHandlers.position.postMessage('POINTER'), {once:true});
 </script>""", "about:blank")
 window.show_all()
 Gtk.main()

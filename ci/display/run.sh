@@ -2083,6 +2083,16 @@ scenario_scroll_browser() {
   done
   xwininfo -name 'Visor scroll browser' >/dev/null 2>&1 || die "browser did not open: $(cat "$log")"
   grep -q '^POSITION 0 0$' "$log" || die "browser did not load: $(cat "$log")"
+  # A load event can precede the first composited frame and its hit-test data.
+  # Require input delivery to the actual page before sending wheel events.
+  for i in $(seq 1 50); do
+    http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" \
+      "{\"action\":\"move\",\"x\":$((650 + i % 2)),\"y\":120}"
+    [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "browser readiness move failed"
+    grep -q '^POINTER$' "$log" && break
+    sleep 0.1
+  done
+  grep -q '^POINTER$' "$log" || die "browser is not receiving pointer input: $(cat "$log")"
   # Exercise axes independently; the untouched axis must remain at zero.
   for delta in '0 3' '0 -3' '3 0' '-3 0'; do
     local dx dy matched=0
