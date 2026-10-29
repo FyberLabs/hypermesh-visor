@@ -137,7 +137,7 @@ Task lifecycle, cancellation, and broader tool parity remain in #32.
 | Container bots | No supported production deployment yet | #27/#35 |
 | Conventional AI client | Five inverse MCP tools; binary-image and validation transport tests | Broader parity and lifecycle: #32 |
 
-The live X11 harness covers 16 scenarios: uinput channel, key state, TCP startup,
+The live X11 harness covers 17 scenarios: uinput channel, key state, TCP startup,
 injection, wheel press/release balance, real editor scrolling, stop/resume ordering, physical key/motion pause, pausing-click behavior,
 menu behavior, synthetic-click rejection, watchdog, held-input release,
 auto-resume, and cross-user denial. These are primitive and security checks,
@@ -147,3 +147,5 @@ Issue #28 remains open until its application-level acceptance matrix is exercise
 The shared vault (#37) must define read/use/execute distinctions before secret
 files and executable skills become shared resources. A generic shell verb is not
 an implicit fallback for missing desktop capabilities.
+
+Browser scroll acceptance uses a real WebKitGTK viewport. Visor wheel requests move each axis forward and back to the origin while the other axis stays fixed. The page reports offsets through an in-process script-message handler; it does not inject input or open a debugging port.

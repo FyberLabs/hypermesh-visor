@@ -2067,6 +2067,41 @@ scenario_scroll_editor() {
   wait_for_exit "$editor_pid" "$python" "$root/ci/display/scroll-editor.py"
 }
 
+# Observe page offsets from the browser engine; never synthesize input in JS.
+scenario_scroll_browser() {
+  ensure_companion
+  ensure_running
+  local python browser_pid i delta log=$DISPLAY_LOG_DIR/scroll-browser.log
+  python=$(readlink -f "$(command -v python3)")
+  allow_write "$log"
+  GDK_BACKEND=x11 "$python" "$root/ci/display/scroll-browser.py" >"$log" 2>&1 &
+  browser_pid=$!
+  note_started "$browser_pid" "$python" "$root/ci/display/scroll-browser.py"
+  for i in $(seq 1 100); do
+    if xwininfo -name 'Visor scroll browser' >/dev/null 2>&1 && grep -q '^POSITION 0 0$' "$log"; then break; fi
+    sleep 0.1
+  done
+  xwininfo -name 'Visor scroll browser' >/dev/null 2>&1 || die "browser did not open: $(cat "$log")"
+  grep -q '^POSITION 0 0$' "$log" || die "browser did not load: $(cat "$log")"
+  # Exercise axes independently; the untouched axis must remain at zero.
+  for delta in '0 3' '0 -3' '3 0' '-3 0'; do
+    local dx dy matched=0
+    read -r dx dy <<<"$delta"
+    http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" "{\"action\":\"scroll\",\"x\":650,\"y\":120,\"delta_x\":$dx,\"delta_y\":$dy}"
+    [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "browser scroll $delta: $(cat "$HTTP_BODY")"
+    for i in $(seq 1 100); do
+      if grep '^POSITION ' "$log" | tail -n 1 | awk -v dx="$dx" -v dy="$dy" '
+        { if (dx > 0) ok=($2>0 && $3==0);
+          else if (dy > 0) ok=($2==0 && $3>0);
+          else ok=($2==0 && $3==0); }
+        END {exit !ok}'; then matched=1; break; fi
+      sleep 0.1
+    done
+    [[ $matched == 1 ]] || die "browser viewport did not follow $delta: $(cat "$log")"
+  done
+  wait_for_exit "$browser_pid" "$python" "$root/ci/display/scroll-browser.py"
+}
+
 scenario_uinput_channel() {
   ensure_companion
   ensure_running
@@ -2474,6 +2509,7 @@ X11_SCENARIOS=(
   inject-lands
   scroll-lands
   scroll-editor
+  scroll-browser
   stop-resume-during-type
   uinput-key-pauses-type
   uinput-move-pauses
