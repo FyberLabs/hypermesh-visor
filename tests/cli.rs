@@ -56,6 +56,9 @@ fn listens_on_the_control_socket_and_not_tcp() {
         let mut reader = BufReader::new(stdout);
         let _ = reader.read_line(&mut line);
         let _ = tx.send(line);
+        // The daemon prints more startup lines. Keep its pipe open and drained
+        // until shutdown so a broken stdout pipe cannot terminate it mid-check.
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
     });
     let line = rx
         .recv_timeout(Duration::from_secs(5))
@@ -68,9 +71,17 @@ fn listens_on_the_control_socket_and_not_tcp() {
         ))
         .status()
         .unwrap();
+    let exited = child.try_wait().unwrap();
     let _ = child.kill();
     let _ = child.wait();
     let _ = std::fs::remove_dir_all(&runtime);
     assert!(line.starts_with("control socket "), "stdout was {line:?}");
-    assert!(listening.success(), "the daemon opened a TCP listener");
+    assert!(
+        exited.is_none(),
+        "daemon exited before socket inspection: {exited:?}"
+    );
+    assert!(
+        listening.success(),
+        "TCP listener inspection failed (listener found or /proc unavailable)"
+    );
 }
