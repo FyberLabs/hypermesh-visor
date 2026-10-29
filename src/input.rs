@@ -28,6 +28,12 @@ pub fn mouse_activity(op: &MouseOp) -> String {
     match op {
         MouseOp::Move { x, y, .. } => format!("move {x},{y}"),
         MouseOp::Click { x, y, button } => format!("click {x},{y} {}", button.as_str()),
+        MouseOp::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => format!("scroll {x},{y} by {delta_x},{delta_y} ticks"),
         MouseOp::Drag {
             x,
             y,
@@ -92,6 +98,12 @@ pub enum MouseOp {
         y: i32,
         #[serde(default)]
         button: Button,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+        delta_x: i32,
+        delta_y: i32,
     },
     Drag {
         x: i32,
@@ -193,7 +205,9 @@ pub fn pointer_axis_in_bounds(backend: &str, value: i32) -> bool {
 pub fn mouse_in_bounds(backend: &str, op: &MouseOp) -> bool {
     let axis = |value| pointer_axis_in_bounds(backend, value);
     match *op {
-        MouseOp::Move { x, y, .. } | MouseOp::Click { x, y, .. } => axis(x) && axis(y),
+        MouseOp::Move { x, y, .. } | MouseOp::Click { x, y, .. } | MouseOp::Scroll { x, y, .. } => {
+            axis(x) && axis(y)
+        }
         MouseOp::Drag {
             x, y, to_x, to_y, ..
         } => axis(x) && axis(y) && axis(to_x) && axis(to_y),
@@ -205,7 +219,45 @@ pub fn mouse_in_bounds(backend: &str, op: &MouseOp) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PointerStep {
     Move { x: i32, y: i32 },
+    Scroll { direction: ScrollDirection },
     Button { button: Button, down: bool },
+}
+
+/// Discrete wheel ticks, never pixels. Bound the combined axes before allocation.
+pub const SCROLL_MAX_TICKS: i64 = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+pub fn scroll_tick_count(dx: i32, dy: i32) -> Option<usize> {
+    let total = i64::from(dx).abs() + i64::from(dy).abs();
+    (1..=SCROLL_MAX_TICKS)
+        .contains(&total)
+        .then_some(total as usize)
+}
+
+pub fn scroll_steps(x: i32, y: i32, dx: i32, dy: i32) -> Option<Vec<PointerStep>> {
+    let count = scroll_tick_count(dx, dy)?;
+    let mut steps = Vec::with_capacity(count + 1);
+    steps.push(PointerStep::Move { x, y });
+    for (delta, negative, positive) in [
+        (dx, ScrollDirection::Left, ScrollDirection::Right),
+        (dy, ScrollDirection::Up, ScrollDirection::Down),
+    ] {
+        steps.extend(
+            std::iter::repeat(PointerStep::Scroll {
+                direction: if delta < 0 { negative } else { positive },
+            })
+            .take(i64::from(delta).abs() as usize),
+        );
+    }
+    Some(steps)
 }
 
 /// How many strokes belong to the next keystroke. A press and its matching
@@ -478,6 +530,36 @@ fn function_key(name: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_plans_are_bounded_and_directional() {
+        use ScrollDirection::*;
+        for (dx, dy, direction) in [(-2, 0, Left), (2, 0, Right), (0, -2, Up), (0, 2, Down)] {
+            let steps = scroll_steps(3, 4, dx, dy).unwrap();
+            assert_eq!(
+                steps,
+                vec![
+                    PointerStep::Move { x: 3, y: 4 },
+                    PointerStep::Scroll { direction },
+                    PointerStep::Scroll { direction }
+                ]
+            );
+        }
+        assert_eq!(scroll_steps(0, 0, 64, -64).unwrap().len(), 129);
+        for (dx, dy) in [
+            (0, 0),
+            (129, 0),
+            (64, 65),
+            (i32::MIN, 0),
+            (i32::MAX, i32::MAX),
+        ] {
+            assert!(scroll_steps(0, 0, dx, dy).is_none());
+        }
+        assert!(
+            serde_json::from_str::<MouseOp>(r#"{"action":"scroll","x":0,"y":0,"delta_x":1}"#)
+                .is_err()
+        );
+    }
 
     #[test]
     fn text_and_named_keys_become_strokes() {

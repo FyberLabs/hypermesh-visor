@@ -94,6 +94,9 @@ impl Desktop for FixtureDesktop {
     fn pointer_steps(&self, steps: &[PointerStep]) -> Result<(), DesktopError> {
         for step in steps {
             let value = match *step {
+                PointerStep::Scroll { direction } => {
+                    serde_json::json!({"kind":"pointer","action":"scroll","direction":direction})
+                }
                 PointerStep::Move { x, y } => serde_json::json!({
                     "kind": "pointer",
                     "action": "move",
@@ -134,6 +137,14 @@ impl KeyboardPipe for FixtureKeys<'_> {
 
 fn mouse_event(op: &MouseOp) -> serde_json::Value {
     match op {
+        MouseOp::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => {
+            serde_json::json!({"kind":"mouse","action":"scroll","x":x,"y":y,"delta_x":delta_x,"delta_y":delta_y})
+        }
         MouseOp::Move { x, y, .. } => serde_json::json!({
             "kind": "mouse",
             "action": "move",

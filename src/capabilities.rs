@@ -24,11 +24,11 @@ pub(crate) fn describe(backend: &str) -> Value {
             "input_disabled_reason": if backend == "wayland" {
                 Some(crate::desktop::WAYLAND_AUTOMATION)
             } else { None },
-            "mouse_actions": ["move", "click", "drag"],
+            "mouse_actions": ["move", "click", "drag", "scroll"],
             "mouse_buttons": ["left", "right", "middle"],
             "type_fields": ["text", "keys", "secret"],
             "key_actions": ["tap", "down", "up"],
-            "unsupported": ["scroll", "clipboard", "display_enumeration", "accessibility_tree", "audio_playback"],
+            "unsupported": ["clipboard", "display_enumeration", "accessibility_tree", "audio_playback"],
             "coordinates": {
                 "space": if backend == "x11" { "root_window_pixels" } else { "unspecified" },
                 "display_selection": false,
@@ -38,7 +38,8 @@ pub(crate) fn describe(backend: &str) -> Value {
         },
         "limits": {
             "type_max_keystrokes": crate::input::TYPE_MAX_KEYSTROKES,
-            "stream_max_bytes": crate::stream::MAX_STREAM_BYTES
+            "stream_max_bytes": crate::stream::MAX_STREAM_BYTES,
+            "scroll_max_total_ticks": crate::input::SCROLL_MAX_TICKS
         },
         "requirements": {
             "desktop_verbs_require_session": true,
@@ -47,7 +48,7 @@ pub(crate) fn describe(backend: &str) -> Value {
         },
         "mcp": {
             "attached_tools": "/session/{id}/mcp",
-            "inverse_tools": ["view", "mouse_move", "mouse_click", "type_text"]
+            "inverse_tools": ["view", "mouse_move", "mouse_click", "mouse_scroll", "type_text"]
         }
     })
 }
