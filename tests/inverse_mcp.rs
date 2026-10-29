@@ -225,6 +225,21 @@ fn invalid_arguments_never_reach_the_transport() {
     for text in [json!(null), json!(1), json!(""), json!("a".repeat(4097))] {
         requests.push(call("type_text", json!({"text":text})));
     }
+    for (dx, dy) in [
+        (json!(0), json!(0)),
+        (json!(129), json!(0)),
+        (json!(64), json!(65)),
+        (json!(null), json!(1)),
+        (json!(1.5), json!(0)),
+        (json!("2"), json!(0)),
+        (json!(-9223372036854775808i64), json!(0)),
+    ] {
+        requests.push(call(
+            "mouse_scroll",
+            json!({"x":1,"y":2,"delta_x":dx,"delta_y":dy}),
+        ));
+    }
+    requests.push(call("mouse_scroll", json!({"x":1,"y":2,"delta_y":1})));
     requests.extend([
         call("type_text", json!({})),
         call("view", json!({"extra":true})),
@@ -253,6 +268,23 @@ fn invalid_arguments_never_reach_the_transport() {
 #[test]
 fn valid_arguments_and_tool_failures_preserve_semantics() {
     for unix in [false, true] {
+        let (response, wire) = roundtrip(
+            unix,
+            204,
+            "application/json",
+            vec![],
+            false,
+            call(
+                "mouse_scroll",
+                json!({"x":3,"y":4,"delta_x":-64,"delta_y":64}),
+            ),
+        );
+        assert_eq!(response["result"]["isError"], false);
+        let body: Value = serde_json::from_str(wire.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            json!({"action":"scroll","x":3,"y":4,"delta_x":-64,"delta_y":64})
+        );
         for (tool, args) in [
             ("mouse_move", json!({"x":32767,"y":0})),
             ("mouse_click", json!({"x":1,"y":2,"button":"right"})),
@@ -322,14 +354,14 @@ fn tool_notifications_cannot_execute_and_schema_matches_validation() {
     let responses = run("http://127.0.0.1:0", false, SESSION, &messages);
     assert_eq!(responses.len(), 1);
     let tools = responses[0]["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 4);
+    assert_eq!(tools.len(), 5);
     assert_eq!(tools[1]["inputSchema"]["properties"]["x"]["maximum"], 32767);
     assert_eq!(
         tools[2]["inputSchema"]["properties"]["button"]["enum"],
         json!(["left", "right", "middle"])
     );
     assert_eq!(
-        tools[3]["inputSchema"]["properties"]["text"]["maxLength"],
+        tools[4]["inputSchema"]["properties"]["text"]["maxLength"],
         4096
     );
     assert!(tools

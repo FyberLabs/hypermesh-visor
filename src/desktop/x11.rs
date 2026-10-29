@@ -151,6 +151,17 @@ pub fn mouse(display: Option<&str>, op: &MouseOp) -> Result<(), DesktopError> {
     ensure_xtest(&conn)?;
     let root = conn.setup().roots[screen_num].root;
     let pressed = match *op {
+        MouseOp::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => {
+            let steps = crate::input::scroll_steps(x, y, delta_x, delta_y).ok_or_else(|| {
+                DesktopError::Input("scroll must contain 1 to 128 total ticks".into())
+            })?;
+            return pointer_steps(display, &steps);
+        }
         MouseOp::Move { x, y, .. } => {
             move_abs(&conn, root, x, y)?;
             None
@@ -243,6 +254,7 @@ fn apply_step(
 ) -> Result<(), DesktopError> {
     match step {
         crate::input::PointerStep::Move { x, y } => move_abs(conn, root, x, y),
+        crate::input::PointerStep::Scroll { direction } => wheel_tick(conn, root, direction),
         crate::input::PointerStep::Button { button, down } => {
             button_event(conn, root, button, down)
         }
@@ -444,6 +456,29 @@ fn load_map(conn: &RustConnection) -> Result<KeyMap, DesktopError> {
 
 fn move_abs(conn: &RustConnection, root: u32, x: i32, y: i32) -> Result<(), DesktopError> {
     fake(conn, MOTION_NOTIFY, 0, root, i16_coord(x)?, i16_coord(y)?)
+}
+
+// Each tick is a complete press/release before the next cancellation boundary.
+// Always attempt the release, even if the press failed after reaching Xorg.
+fn wheel_tick(
+    conn: &RustConnection,
+    root: u32,
+    direction: crate::input::ScrollDirection,
+) -> Result<(), DesktopError> {
+    use crate::input::ScrollDirection::*;
+    let detail = match direction {
+        Up => 4,
+        Down => 5,
+        Left => 6,
+        Right => 7,
+    };
+    let pressed = fake(conn, BUTTON_PRESS, detail, root, 0, 0);
+    let released = fake(conn, BUTTON_RELEASE, detail, root, 0, 0);
+    if pressed.is_err() || released.is_err() {
+        let _ = fake(conn, BUTTON_RELEASE, detail, root, 0, 0);
+        let _ = conn.flush();
+    }
+    pressed.and(released)
 }
 
 fn button_event(

@@ -773,6 +773,10 @@ impl Gate {
                 let (from_x, from_y) = from.or(self.pointer).unwrap_or((x, y));
                 (DriveKind::Move, x, y, from_x, from_y, clickable)
             }
+            MouseOp::Scroll { x, y, .. } => {
+                let (from_x, from_y) = from.or(self.pointer).unwrap_or((x, y));
+                (DriveKind::Move, x, y, from_x, from_y, false)
+            }
             MouseOp::Click { x, y, .. } => {
                 let (from_x, from_y) = from.or(self.pointer).unwrap_or((x, y));
                 (DriveKind::Click, x, y, from_x, from_y, false)

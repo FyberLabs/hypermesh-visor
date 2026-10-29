@@ -1,6 +1,6 @@
 //! Inverse MCP: expose visor desktop verbs as MCP tools for external agents.
 //!
-//! Stdio JSON-RPC. Tools: view, mouse_move, mouse_click, type_text.
+//! Stdio JSON-RPC. Tools: view, mouse_move, mouse_click, mouse_scroll, type_text.
 //! Talks to the visor's control socket by default. `HYPERMESH_VISOR_URL` selects
 //! the opt-in TCP listener, with `HYPERMESH_VISOR_TOKEN` or the `api.token` file.
 
@@ -12,6 +12,7 @@ use base64::Engine;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::rt::TokioIo;
+use hypermesh_visor::SCROLL_MAX_TICKS;
 use serde_json::{json, Value};
 
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
@@ -137,6 +138,7 @@ fn reply(stdout: &mut impl Write, id: Option<Value>, result: Value) {
 
 fn tool_list() -> Value {
     let coordinate = json!({"type":"integer", "minimum":0, "maximum":MAX_COORD});
+    let delta = json!({"type":"integer","minimum":-SCROLL_MAX_TICKS,"maximum":SCROLL_MAX_TICKS});
     json!({"tools":[
         {"name":"view", "description":"Capture the desktop as a PNG image", "inputSchema":
             {"type":"object", "properties":{}, "additionalProperties":false}},
@@ -146,6 +148,9 @@ fn tool_list() -> Value {
             {"type":"object", "properties":{"x":coordinate,"y":coordinate,
                 "button":{"type":"string","enum":["left","right","middle"],"default":"left"}},
              "required":["x","y"],"additionalProperties":false}},
+        {"name":"mouse_scroll", "description":"Scroll at root-window x/y in wheel ticks: positive right/down; 1 to 128 total ticks, horizontal then vertical", "inputSchema":
+            {"type":"object", "properties":{"x":coordinate,"y":coordinate,"delta_x":delta,"delta_y":delta},
+             "required":["x","y","delta_x","delta_y"],"additionalProperties":false}},
         {"name":"type_text", "description":"Type text; the visor also validates key support and the planned keystroke limit", "inputSchema":
             {"type":"object", "properties":{"text":{"type":"string","minLength":1,"maxLength":MAX_TEXT_CHARS}},
              "required":["text"],"additionalProperties":false}}
@@ -192,6 +197,7 @@ fn tool_request(
         "view" => &[],
         "mouse_move" => &["x", "y"],
         "mouse_click" => &["x", "y", "button"],
+        "mouse_scroll" => &["x", "y", "delta_x", "delta_y"],
         "type_text" => &["text"],
         _ => return Err("unknown tool".into()),
     };
@@ -228,6 +234,24 @@ fn tool_request(
                 "POST",
                 format!("/session/{session}/mouse"),
                 Some(body.to_string()),
+            ))
+        }
+        "mouse_scroll" => {
+            let x = coord("x")?;
+            let y = coord("y")?;
+            let delta = |name: &str| -> Result<i64, String> {
+                args.get(name).and_then(Value::as_i64).filter(|n| (-SCROLL_MAX_TICKS..=SCROLL_MAX_TICKS).contains(n))
+                    .ok_or_else(|| format!("{name} must be an integer from -{SCROLL_MAX_TICKS} to {SCROLL_MAX_TICKS}"))
+            };
+            let dx = delta("delta_x")?;
+            let dy = delta("delta_y")?;
+            if !(1..=SCROLL_MAX_TICKS).contains(&(dx.abs() + dy.abs())) {
+                return Err("scroll must contain 1 to 128 total ticks".into());
+            }
+            Ok((
+                "POST",
+                format!("/session/{session}/mouse"),
+                Some(json!({"action":"scroll","x":x,"y":y,"delta_x":dx,"delta_y":dy}).to_string()),
             ))
         }
         "type_text" => {
@@ -280,6 +304,7 @@ fn tool_result(tool: &str, response: VisorResponse) -> Value {
     let text = match tool {
         "mouse_move" => "moved",
         "mouse_click" => "clicked",
+        "mouse_scroll" => "scrolled",
         "type_text" => "typed",
         _ => "done",
     };

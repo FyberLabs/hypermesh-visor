@@ -34,7 +34,7 @@ the deserializers in `src/api.rs`, `src/input.rs`, `src/harness.rs`, and
 | `POST …/view` | No body; PNG bytes | Live session and capture backend |
 | `GET …/watch` | SSE capture updates; optional `mode` | Live session; disconnect/close ends streaming |
 | `GET …/listen` | PCM audio stream | Live session; PulseAudio-compatible service; s16le, 48 kHz, mono |
-| `POST …/mouse` | `action`: move/click/drag; `x`,`y`; drag adds `to_x`,`to_y`; optional left/right/middle `button`; move accepts `clickable` | X11 automation gate; no wheel/scroll action |
+| `POST …/mouse` | `action`: move/click/drag/scroll; `x`,`y`; drag adds `to_x`,`to_y`; optional left/right/middle `button`; move accepts `clickable` | X11 automation gate; scroll adds required `delta_x`,`delta_y` in wheel ticks |
 | `POST …/type` | `text`, `keys:[{key,action}]`, or secret handle `secret`; actions tap/down/up | At most 4096 planned keystrokes; X11 automation gate |
 | `GET …/feed` | Activity and latest snapshot handle | Does not return secret values or file bytes |
 | `GET …/feed/snapshot` | Cached PNG | Does not capture a new frame |
@@ -74,6 +74,25 @@ can be retried. Watch/listen clients should bound their own consumption time.
 MCP HTTP transport currently has a 15-second timeout; this is not a global API
 execution deadline. Cancellation and structured progress need further work in #32.
 
+## Scrolling
+
+HTTP example: `POST /session/{id}/mouse` with
+`{"action":"scroll","x":650,"y":120,"delta_x":0,"delta_y":3}`.
+Inverse MCP exposes `mouse_scroll` with the same fields except `action`.
+Coordinates target the root-window pixel under the pointer; scrolling does not
+activate or focus a window. Deltas are discrete wheel ticks, not pixel distances.
+Positive X scrolls right; positive Y scrolls down. Horizontal ticks precede
+vertical ticks. All four fields are required integers, and the sum of the absolute
+deltas must be 1–128. Application settings determine the distance per tick.
+
+The automation gate, session ownership, coordinate checks, physical-input pause,
+and Wayland refusal apply exactly as for other pointer operations. Each tick
+finishes its press/release pair before the next batch cancellation check.
+Interrupted requests report completed pointer steps: one initial target move plus
+one step per wheel tick. Do not replay a partial scroll automatically. A physical
+pointer move during a request can affect where already in-flight events land;
+pause takes effect at a batch boundary, not retroactively.
+
 ## MCP preference and inverse adapter
 
 `GET /companion` reports a preferred healthy configured binding for the focused
@@ -82,14 +101,14 @@ Clients should inspect `GET …/mcp`, choose an appropriate tool, and retain the
 same authorization/approval boundary. A failed non-idempotent MCP call must not
 silently trigger desktop replay. Discovery and stale-binding work is #29.
 
-The inverse stdio adapter advertises only `view`, `mouse_move`, `mouse_click`,
+The inverse stdio adapter advertises `view`, `mouse_move`, `mouse_click`, `mouse_scroll`,
 and `type_text`. It needs an existing session. It does not yet expose watch,
 listen, drag, named keys, secret handles, capability discovery, or session/task
 lifecycle. `view` returns a base64 PNG MCP image block, preserving the captured bytes over
 both Unix and TCP transports (including chunked HTTP). Responses are bounded to
 32 MiB; transport operations time out after 30 seconds. TCP redirects are refused.
 
-The four tool schemas reject extra arguments. Coordinates are required integers
+The five tool schemas reject extra arguments. Coordinates are required integers
 from 0 to 32767; the visor still checks live root geometry and the automation
 gate. Click buttons are exactly `left`, `right`, or `middle` (omission means
 `left`). Text is a required nonempty string of at most 4096 Unicode characters;
@@ -106,7 +125,7 @@ Task lifecycle, cancellation, and broader tool parity remain in #32.
 | Task | Current implementation evidence | Gap / next acceptance |
 | --- | --- | --- |
 | Browser/editor/terminal interaction | X11 capture, typing and pointer primitives; live xev injection tests | App-specific end-to-end tasks remain unverified in #28 |
-| Scroll a document | No scroll verb | #38 defines bounded scroll and MCP parity |
+| Scroll a document | Bounded HTTP/MCP scroll; X11 wheel and Tk editor scenarios | Browser-specific acceptance remains #38 |
 | Drag and keyboard chords | Live held-release/interruption tests; named-key planner | Application-specific shortcuts/layouts need acceptance |
 | Multiple windows | Root coordinates and best-effort focused-app identity | No semantic window enumeration/activation API |
 | Multiple displays / DPI | Root geometry validation | Display enumeration and explicit coordinate transforms absent |
@@ -116,10 +135,10 @@ Task lifecycle, cancellation, and broader tool parity remain in #32.
 | Native Wayland | Refusal/access-control scenarios | Portal/libei scenario is skipped; #17 |
 | Windows/macOS | Linux compile guard | #18/#25/#26 |
 | Container bots | No supported production deployment yet | #27/#35 |
-| Conventional AI client | Four inverse MCP tools; binary-image and validation transport tests | Broader parity and lifecycle: #32 |
+| Conventional AI client | Five inverse MCP tools; binary-image and validation transport tests | Broader parity and lifecycle: #32 |
 
-The live X11 harness covers 14 scenarios: uinput channel, key state, TCP startup,
-injection, stop/resume ordering, physical key/motion pause, pausing-click behavior,
+The live X11 harness covers 16 scenarios: uinput channel, key state, TCP startup,
+injection, wheel press/release balance, real editor scrolling, stop/resume ordering, physical key/motion pause, pausing-click behavior,
 menu behavior, synthetic-click rejection, watchdog, held-input release,
 auto-resume, and cross-user denial. These are primitive and security checks,
 not evidence that browser/editor task suites or all desktop platforms work.

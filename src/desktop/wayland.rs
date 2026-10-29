@@ -75,6 +75,9 @@ impl WaylandInput {
 
     pub fn mouse(&self, op: &MouseOp) -> Result<(), DesktopError> {
         match *op {
+            MouseOp::Scroll { .. } => Err(DesktopError::Unavailable(
+                crate::desktop::WAYLAND_AUTOMATION.into(),
+            )),
             MouseOp::Move { x, y, .. } => self.move_abs(x, y),
             MouseOp::Click { x, y, button } => {
                 self.move_abs(x, y)?;

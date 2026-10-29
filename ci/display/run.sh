@@ -2001,6 +2001,72 @@ scenario_inject_lands() {
   [[ $(phase) == running ]] || die "injected input paused automation ($(phase))"
 }
 
+scenario_scroll_lands() {
+  ensure_companion
+  ensure_running
+  focus_xev
+  xev_mark
+  local delta code i log button
+  for delta in '-2,-3' '2,3'; do
+    http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" \
+      "{\"action\":\"scroll\",\"x\":100,\"y\":120,\"delta_x\":${delta%,*},\"delta_y\":${delta#*,}}"
+    [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "scroll $(cat "$HTTP_BODY")"
+  done
+  # Wait for the X event stream, then verify both press and release counts.
+  for i in $(seq 1 40); do
+    log=$(xev_since)
+    if [[ $(grep -c 'ButtonRelease' <<<"$log" || true) -ge 10 ]]; then break; fi
+    sleep 0.1
+  done
+  for button in 4 5 6 7; do
+    local expected=2
+    [[ $button == 4 || $button == 5 ]] && expected=3
+    local kind count
+    for kind in ButtonPress ButtonRelease; do
+      count=$(awk -v kind="$kind" -v button="$button" '
+        /^[A-Za-z]+ event/ { wanted = ($1 == kind) }
+        wanted && $0 ~ "button " button "," { n++; wanted=0 }
+        END { print n+0 }
+      ' <<<"$log")
+      [[ $count == "$expected" ]] || die "$kind button $button: $count, expected $expected"
+    done
+  done
+  [[ $(phase) == running ]] || die "synthetic scroll paused automation"
+}
+
+scenario_scroll_editor() {
+  ensure_companion
+  ensure_running
+  local python editor_pid i fraction log=$DISPLAY_LOG_DIR/scroll-editor.log
+  python=$(readlink -f "$(command -v python3)")
+  allow_write "$log"
+  "$python" "$root/ci/display/scroll-editor.py" >"$log" 2>&1 &
+  editor_pid=$!
+  note_started "$editor_pid" "$python" "$root/ci/display/scroll-editor.py"
+  for i in $(seq 1 40); do
+    if xwininfo -name 'Visor scroll editor' >/dev/null 2>&1 && grep -q '^0.0$' "$log"; then break; fi
+    sleep 0.1
+  done
+  xwininfo -name 'Visor scroll editor' >/dev/null 2>&1 || die "scroll editor did not open"
+  http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"scroll","x":650,"y":120,"delta_x":0,"delta_y":3}'
+  [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "editor scroll down $(cat "$HTTP_BODY")"
+  local moved=0
+  for i in $(seq 1 40); do
+    fraction=$(tail -n 1 "$log")
+    if awk -v value="$fraction" 'BEGIN { exit !(value+0 > 0) }'; then moved=1; break; fi
+    sleep 0.1
+  done
+  [[ $moved == 1 ]] || die "editor did not scroll down: $(cat "$log")"
+  http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"scroll","x":650,"y":120,"delta_x":0,"delta_y":-3}'
+  [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "editor scroll up $(cat "$HTTP_BODY")"
+  for i in $(seq 1 40); do
+    [[ $(tail -n 1 "$log") == 0.0 ]] && break
+    sleep 0.1
+  done
+  [[ $(tail -n 1 "$log") == 0.0 ]] || die "editor did not return to the top"
+  wait_for_exit "$editor_pid" "$python" "$root/ci/display/scroll-editor.py"
+}
+
 scenario_uinput_channel() {
   ensure_companion
   ensure_running
@@ -2406,6 +2472,8 @@ X11_SCENARIOS=(
   key-down-detects
   tcp-start-without-poll
   inject-lands
+  scroll-lands
+  scroll-editor
   stop-resume-during-type
   uinput-key-pauses-type
   uinput-move-pauses

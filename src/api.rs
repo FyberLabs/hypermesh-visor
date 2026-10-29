@@ -1434,7 +1434,9 @@ fn lock_for<'a, T>(mutex: &'a Mutex<T>, bound: Duration) -> Option<std::sync::Mu
 fn coords_on_root(width: u16, height: u16, op: &MouseOp) -> bool {
     let inside = |x: i32, y: i32| x >= 0 && y >= 0 && x < i32::from(width) && y < i32::from(height);
     match *op {
-        MouseOp::Move { x, y, .. } | MouseOp::Click { x, y, .. } => inside(x, y),
+        MouseOp::Move { x, y, .. } | MouseOp::Click { x, y, .. } | MouseOp::Scroll { x, y, .. } => {
+            inside(x, y)
+        }
         MouseOp::Drag {
             x, y, to_x, to_y, ..
         } => inside(x, y) && inside(to_x, to_y),
@@ -1447,6 +1449,14 @@ fn with_reached(op: &MouseOp, at: Option<(i32, i32)>) -> MouseOp {
     };
     match *op {
         MouseOp::Move { clickable, .. } => MouseOp::Move { x, y, clickable },
+        MouseOp::Scroll {
+            delta_x, delta_y, ..
+        } => MouseOp::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        },
         MouseOp::Click { button, .. } => MouseOp::Click { x, y, button },
         MouseOp::Drag {
             x: from_x,
@@ -1559,29 +1569,44 @@ fn inject_mouse(
     cancelled: &dyn Fn() -> bool,
     release: &mut ReleaseGuard<'_>,
 ) -> Result<(), ApiError> {
-    let MouseOp::Drag {
-        x,
-        y,
-        to_x,
-        to_y,
-        button,
-    } = *op
-    else {
-        if cancelled() {
-            return Err(paused_after(0, "pointer steps"));
+    let mut steps: Box<dyn Iterator<Item = PointerStep>> = match *op {
+        MouseOp::Scroll {
+            x,
+            y,
+            delta_x,
+            delta_y,
+        } => Box::new(
+            crate::input::scroll_steps(x, y, delta_x, delta_y)
+                .ok_or_else(|| ApiError::bad("scroll must contain 1 to 128 total ticks"))?
+                .into_iter(),
+        ),
+        MouseOp::Drag {
+            x,
+            y,
+            to_x,
+            to_y,
+            button,
+        } => {
+            let points = drag_point_count(x, y, to_x, to_y)
+                .map_err(|_| ApiError::bad("drag is too long"))?;
+            if points <= 1 {
+                if cancelled() {
+                    return Err(paused_after(0, "pointer steps"));
+                }
+                return inject_short_mouse(desktop, op, release);
+            }
+            Box::new(
+                drag_steps(x, y, to_x, to_y, button)
+                    .map_err(|_| ApiError::bad("drag is too long"))?,
+            )
         }
-        return inject_short_mouse(desktop, op, release);
+        _ => {
+            if cancelled() {
+                return Err(paused_after(0, "pointer steps"));
+            }
+            return inject_short_mouse(desktop, op, release);
+        }
     };
-    let points =
-        drag_point_count(x, y, to_x, to_y).map_err(|_| ApiError::bad("drag is too long"))?;
-    if points <= 1 {
-        if cancelled() {
-            return Err(paused_after(0, "pointer steps"));
-        }
-        return inject_short_mouse(desktop, op, release);
-    }
-    let mut steps =
-        drag_steps(x, y, to_x, to_y, button).map_err(|_| ApiError::bad("drag is too long"))?;
     let mut pipe = desktop.open_pointer().map_err(ApiError::from_desktop)?;
     let mut done = 0usize;
     loop {
@@ -1617,7 +1642,7 @@ fn inject_short_mouse(
 ) -> Result<(), ApiError> {
     let button = match *op {
         MouseOp::Click { button, .. } | MouseOp::Drag { button, .. } => Some(button),
-        MouseOp::Move { .. } => None,
+        MouseOp::Move { .. } | MouseOp::Scroll { .. } => None,
     };
     if let Some(button) = button {
         release.note_step(PointerStep::Button { button, down: true });
@@ -1677,6 +1702,14 @@ async fn mouse(
     } = op
     {
         drag_point_count(x, y, to_x, to_y).map_err(|_| ApiError::bad("drag is too long"))?;
+    }
+    if let MouseOp::Scroll {
+        delta_x, delta_y, ..
+    } = op
+    {
+        if crate::input::scroll_tick_count(delta_x, delta_y).is_none() {
+            return Err(ApiError::bad("scroll must contain 1 to 128 total ticks"));
+        }
     }
     lock(&state.automation).watchdog(Instant::now(), state.companion_poll_timeout);
     // Captured before the phase check. A pause that publishes a new epoch
@@ -3593,6 +3626,98 @@ while True:
         assert_eq!(status, 400, "{text}");
         assert!(text.contains("too large"), "{text}");
         assert!(lock(&desktop.typed).is_empty());
+    }
+
+    #[test]
+    fn scroll_cancellation_stops_at_a_batch_boundary() {
+        let desktop = FakeDesktop::new();
+        let op = MouseOp::Scroll {
+            x: 3,
+            y: 4,
+            delta_x: 64,
+            delta_y: -64,
+        };
+        let checks = std::cell::Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            checks.get() >= 2
+        };
+        let mut release = ReleaseGuard::arm(&*desktop);
+        let error = inject_mouse(&*desktop, &op, &cancelled, &mut release).unwrap_err();
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(error.message.contains("after 16 pointer steps"));
+        drop(release);
+        assert_eq!(desktop.pointer_sessions.load(Ordering::SeqCst), 1);
+        let steps = lock(&desktop.pointer_log);
+        assert_eq!(steps.len(), POINTER_BATCH);
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| matches!(s, PointerStep::Scroll { .. }))
+                .count(),
+            15
+        );
+        assert!(!steps
+            .iter()
+            .any(|s| matches!(s, PointerStep::Button { .. })));
+    }
+
+    #[tokio::test]
+    async fn scroll_validates_limits_geometry_and_the_existing_gate() {
+        let desktop = FakeDesktop::new();
+        *lock(&desktop.root_size) = Some((100, 100));
+        let addr = spawn(desktop.clone()).await;
+        let (_, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        let path = format!("/session/{id}/mouse");
+        for (x, dx, dy) in [
+            (0, 0, 0),
+            (0, 129, 0),
+            (0, 64, 65),
+            (0, i32::MIN, 0),
+            (100, 1, 0),
+        ] {
+            let (status, _, _) = send(
+                addr,
+                "POST",
+                &path,
+                Some(
+                    serde_json::json!({"action":"scroll","x":x,"y":0,"delta_x":dx,"delta_y":dy})
+                        .to_string(),
+                ),
+            )
+            .await;
+            assert_eq!(status, 400);
+        }
+        assert!(lock(&desktop.pointer_log).is_empty());
+        let payload =
+            serde_json::json!({"action":"scroll","x":3,"y":4,"delta_x":-2,"delta_y":3}).to_string();
+        let (status, _, _) = send(addr, "POST", &path, Some(payload.clone())).await;
+        assert_eq!(status, 204);
+        assert_eq!(lock(&desktop.pointer_log).len(), 6);
+        desktop.wayland.store(true, Ordering::SeqCst);
+        let (status, _, _) = send(addr, "POST", &path, Some(payload.clone())).await;
+        assert_eq!(status, 501);
+        desktop.wayland.store(false, Ordering::SeqCst);
+        send(addr, "DELETE", &format!("/session/{id}"), None).await;
+        let (status, _, _) = send(addr, "POST", &path, Some(payload.clone())).await;
+        assert_eq!(status, 404);
+        let (_, _, new_id) = open_session_id(addr, serde_json::json!([])).await;
+        send(
+            addr,
+            "POST",
+            "/companion/automation",
+            Some(r#"{"action":"pause"}"#.into()),
+        )
+        .await;
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{new_id}/mouse"),
+            Some(payload),
+        )
+        .await;
+        assert_eq!(status, 409);
+        assert_eq!(lock(&desktop.pointer_log).len(), 6);
     }
 
     #[tokio::test]
