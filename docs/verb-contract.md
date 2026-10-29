@@ -45,7 +45,7 @@ the deserializers in `src/api.rs`, `src/input.rs`, `src/harness.rs`, and
 | `GET /companion` | Desktop/session state, focus and preferred MCP binding | Does not grant execution permission |
 | `POST /companion/automation` | `action` | Trusted companion link required to lift a user pause |
 | `POST /companion/interrupt`, `/companion/notice` | Companion control messages | See API request types; not task submission APIs |
-| `POST /prompt` | Prompt and optional model | `X-Api-Key`, configured routing and model validation |
+| `POST /prompt` | JSON `prompt`, `api_key`, and optional `model` | API key is in the JSON body (not `X-Api-Key`); configured routing and model validation |
 | `GET /audit`, `/mcp-audit` | Operation metadata | Not secret storage |
 
 Invalid/closed sessions return 404; malformed semantic input generally returns
