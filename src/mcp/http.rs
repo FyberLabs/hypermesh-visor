@@ -27,7 +27,12 @@ impl HttpClient {
             "method": method,
             "params": params,
         });
-        post_json(&self.url, &self.headers, &body)
+        let response = post_json(&self.url, &self.headers, &body)?;
+        if response.get("id") != Some(&json!(id)) || response.get("jsonrpc") != Some(&json!("2.0"))
+        {
+            return Err(McpError::message("MCP HTTP response id/version mismatch"));
+        }
+        Ok(response)
     }
 }
 
@@ -43,11 +48,17 @@ pub fn handshake_http(
         .ok_or_else(|| McpError::message(format!("mcp server \"{name}\": http requires url")))?
         .to_string();
     let mut headers = spec.headers.clone();
-    if !headers.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+    if !headers
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("content-type"))
+    {
         headers.insert("Content-Type".into(), "application/json".into());
     }
     if !headers.keys().any(|k| k.eq_ignore_ascii_case("accept")) {
-        headers.insert("Accept".into(), "application/json, text/event-stream".into());
+        headers.insert(
+            "Accept".into(),
+            "application/json, text/event-stream".into(),
+        );
     }
     let mut client = HttpClient {
         url,
@@ -64,7 +75,7 @@ pub fn handshake_http(
     )?;
     if init.get("error").is_some() {
         return Err(McpError::message(format!(
-            "mcp server \"{name}\": initialize failed: {init}"
+            "mcp server \"{name}\": initialize failed"
         )));
     }
     let _ = post_json(
@@ -75,38 +86,8 @@ pub fn handshake_http(
             "method": "notifications/initialized"
         }),
     );
-    let listed = client.call("tools/list", json!({}))?;
-    if let Some(err) = listed.get("error") {
-        return Err(McpError::message(format!(
-            "mcp server \"{name}\": tools/list failed: {err}"
-        )));
-    }
-    let tools = parse_tools(&listed)?;
+    let tools = super::discovery::list_tools(|params| client.call("tools/list", params))?;
     Ok((tools, client))
-}
-
-fn parse_tools(listed: &Value) -> Result<Vec<ToolInfo>, McpError> {
-    let tools = listed
-        .pointer("/result/tools")
-        .and_then(Value::as_array)
-        .ok_or_else(|| McpError::message("tools/list missing tools"))?;
-    let mut out = Vec::new();
-    for tool in tools {
-        let name = tool
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if name.is_empty() {
-            continue;
-        }
-        let description = tool
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        out.push(ToolInfo { name, description });
-    }
-    Ok(out)
 }
 
 fn post_json(
@@ -123,10 +104,11 @@ fn post_json(
     let resp = req
         .timeout(Duration::from_secs(15))
         .send_string(&raw)
-        .map_err(|e| McpError::message(format!("mcp http post: {e}")))?;
+        .map_err(|_| McpError::message("MCP HTTP request failed"))?;
     let status = resp.status();
     let mut text = String::new();
     resp.into_reader()
+        .take(8 * 1024 * 1024 + 1)
         .read_to_string(&mut text)
         .map_err(|e| McpError::message(format!("mcp http read: {e}")))?;
     if !(200..300).contains(&status) {
@@ -135,22 +117,35 @@ fn post_json(
             truncate(&text, 200)
         )));
     }
-    // SSE: take the last data: JSON line if present.
-    let payload = if text.contains("data:") {
-        text.lines()
-            .filter_map(|line| line.strip_prefix("data:"))
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && *s != "[DONE]")
-            .last()
-            .unwrap_or(text.trim())
-    } else {
-        text.trim()
-    };
-    if payload.is_empty() {
+    if text.len() > 8 * 1024 * 1024 {
+        return Err(McpError::message("MCP HTTP response too large"));
+    }
+    let expected = body.get("id");
+    if text.trim().is_empty() {
         return Ok(json!({}));
     }
-    serde_json::from_str(payload)
-        .map_err(|e| McpError::message(format!("mcp http bad json: {e}")))
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        return Ok(value);
+    }
+    // Select the matching response, not a trailing list-changed notification.
+    let normalized = text.replace("\r\n", "\n");
+    for event in normalized.split("\n\n") {
+        let payload = event
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:"))
+            .map(|s| s.strip_prefix(' ').unwrap_or(s))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if payload.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(&payload)
+            .map_err(|_| McpError::message("MCP invalid SSE JSON"))?;
+        if expected.is_some() && value.get("id") == expected {
+            return Ok(value);
+        }
+    }
+    Err(McpError::message("MCP HTTP response missing matching id"))
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -167,6 +162,90 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
+
+    #[test]
+    fn http_refresh_paginates_and_reconnects_without_replaying_lost_call() {
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let done = Arc::clone(&stop);
+        let called = Arc::clone(&calls);
+        let worker = thread::spawn(move || {
+            let mut generation = 0;
+            while !done.load(Ordering::SeqCst) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(s) => s,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(e) => panic!("{e}"),
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let raw = read_http_request(&mut stream);
+                let req: Value =
+                    serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                let method = req["method"].as_str().unwrap();
+                if method == "tools/call" {
+                    called.fetch_add(1, Ordering::SeqCst);
+                    continue;
+                }
+                let result = match method {
+                    "initialize" => {
+                        json!({"protocolVersion":"2024-11-05","capabilities":{"tools":{}}})
+                    }
+                    "tools/list" => {
+                        if req["params"].get("cursor").is_none() {
+                            generation += 1;
+                            json!({"tools":[{"name":format!("{generation}-a")}],"nextCursor":" +/= "})
+                        } else {
+                            assert_eq!(req["params"]["cursor"], " +/= ");
+                            json!({"tools":[{"name":format!("{generation}-b")}]})
+                        }
+                    }
+                    _ => json!({}),
+                };
+                let body = if let Some(id) = req.get("id") {
+                    // A response followed by a notification must still correlate.
+                    format!("data: {}\n\ndata: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\n", json!({"jsonrpc":"2.0","id":id,"result":result}))
+                } else {
+                    String::new()
+                };
+                write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
+            }
+        });
+        let spec = ServerSpec {
+            r#type: Some("http".into()),
+            command: None,
+            args: vec![],
+            env: BTreeMap::new(),
+            url: Some(format!("http://{addr}/mcp")),
+            headers: BTreeMap::new(),
+            cwd: None,
+            enabled: None,
+        };
+        let mut server = super::super::stdio::attach_one_server("http", &spec).unwrap();
+        assert_eq!(server.tools[1].name, "1-b");
+        server.refresh(false).unwrap();
+        assert_eq!(server.tools[0].name, "2-a");
+        assert!(server.call_tool("2-a", json!({})).is_err());
+        assert!(server.tools.is_empty());
+        assert!(!server.is_healthy());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        server.refresh(true).unwrap();
+        assert_eq!(server.tools[1].name, "3-b");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        stop.store(true, Ordering::SeqCst);
+        worker.join().unwrap();
+    }
 
     #[test]
     fn attaches_http_fixture_and_lists_tools() {
