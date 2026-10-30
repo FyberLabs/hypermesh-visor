@@ -8,6 +8,8 @@ mod bindings;
 mod config;
 mod discovery;
 mod http;
+mod protocol;
+mod subscription;
 mod secret_fetch;
 mod stdio;
 

@@ -1,6 +1,8 @@
+use super::subscription::Changes;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{atomic::Ordering, mpsc, Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -16,26 +18,103 @@ pub struct ToolInfo {
 }
 
 struct StdioClient {
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    responses: mpsc::Receiver<Value>,
+    changes: Arc<Changes>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    supports_tools: bool,
+    listed_generation: u64,
     next_id: u64,
 }
 
 impl StdioClient {
-    fn call(&mut self, name: &str, method: &str, params: Value) -> Result<Value, McpError> {
+    fn call(&mut self, _name: &str, method: &str, params: Value) -> Result<Value, McpError> {
         let id = self.next_id;
         self.next_id += 1;
         write_msg(
-            &mut self.stdin,
+            &self.stdin,
             json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+            &self.changes,
         )?;
-        let response = read_msg(name, &mut self.stdout)?;
+        let response = self
+            .responses
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| McpError::message("MCP response timeout or reader disconnected"))?;
         if response.get("id") != Some(&json!(id)) || response.get("jsonrpc") != Some(&json!("2.0"))
         {
             return Err(McpError::message("MCP stdio response id/version mismatch"));
         }
         Ok(response)
     }
+}
+
+impl Drop for StdioClient {
+    fn drop(&mut self) {
+        self.changes.stopped.store(true, Ordering::Release);
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
+}
+
+// A single reader owns stdout for the entire connection, including idle periods.
+fn read_background(
+    mut stdout: BufReader<ChildStdout>,
+    stdin: Arc<Mutex<ChildStdin>>,
+    tx: mpsc::SyncSender<Value>,
+    changes: Arc<Changes>,
+    frame_timeout: std::time::Duration,
+) {
+    use std::time::{Duration, Instant};
+    let mut line = Vec::new();
+    let mut started = Instant::now();
+    while !changes.stopped.load(Ordering::Acquire) {
+        if !line.is_empty() && started.elapsed() > frame_timeout {
+            break;
+        }
+        match stdout.fill_buf() {
+            Ok([]) => break,
+            Ok(buf) => {
+                if line.is_empty() {
+                    started = Instant::now();
+                }
+                let n = buf
+                    .iter()
+                    .position(|b| *b == b'\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(buf.len());
+                if line.len() + n > 8 * 1024 * 1024 {
+                    break;
+                }
+                line.extend_from_slice(&buf[..n]);
+                stdout.consume(n);
+                if line.last() != Some(&b'\n') {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_slice::<Value>(&line) else {
+                    break;
+                };
+                line.clear();
+                if let Some(reply) = super::protocol::server_reply(&value) {
+                    if write_msg(&stdin, reply, &changes).is_err() {
+                        break;
+                    }
+                } else if value.get("id").is_some() {
+                    // Bounded channel: unsolicited response floods terminate the reader.
+                    if tx.try_send(value).is_err() {
+                        break;
+                    }
+                } else {
+                    changes.notify(&value);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(_) => break,
+        }
+    }
+    changes.failed.store(true, Ordering::Release);
 }
 
 pub struct AttachedServer {
@@ -47,6 +126,7 @@ pub struct AttachedServer {
     http: Option<HttpClient>,
     spec: ServerSpec,
     pub refreshing: bool,
+    listed_generation: u64,
 }
 
 impl AttachedServer {
@@ -57,6 +137,7 @@ impl AttachedServer {
         http: HttpClient,
         spec: ServerSpec,
     ) -> Self {
+        let listed_generation = http.listed_generation;
         Self {
             name,
             transport,
@@ -66,6 +147,7 @@ impl AttachedServer {
             http: Some(http),
             spec,
             refreshing: false,
+            listed_generation,
         }
     }
 }
@@ -93,7 +175,30 @@ impl Drop for AttachedServer {
 }
 
 impl AttachedServer {
+    fn changes(&self) -> Option<&Changes> {
+        self.client
+            .as_ref()
+            .map(|c| c.changes.as_ref())
+            .or_else(|| self.http.as_ref().map(|c| c.changes.as_ref()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn http_changes_for_test(&self) -> u64 {
+        self.changes().unwrap().generation()
+    }
+
+    pub fn needs_refresh(&self) -> bool {
+        !self.refreshing
+            && self.changes().is_some_and(|c| {
+                c.failed.load(Ordering::Acquire) || c.generation() != self.listed_generation
+            })
+    }
+
     pub fn is_healthy(&self) -> bool {
+        if self.needs_refresh() {
+            return false;
+        }
+
         if self.tools.is_empty() {
             return false;
         }
@@ -160,9 +265,27 @@ impl AttachedServer {
             *self = replacement;
             return Ok(());
         }
+        if self
+            .changes()
+            .is_some_and(|c| c.failed.load(Ordering::Acquire))
+        {
+            self.disconnect();
+            return Err(McpError::message(
+                "MCP subscription disconnected; reconnect explicitly",
+            ));
+        }
+        if self.client.as_ref().is_some_and(|c| !c.supports_tools)
+            || self.http.as_ref().is_some_and(|c| !c.supports_tools)
+        {
+            self.tools.clear();
+            return Ok(());
+        }
+        // Keep invalidations received during pagination pending for another refresh.
+        let generation = self.changes().map(Changes::generation).unwrap_or(0);
         match super::discovery::list_tools(|params| self.request("tools/list", params)) {
             Ok(tools) => {
                 self.tools = tools;
+                self.listed_generation = generation;
                 Ok(())
             }
             Err(error) => {
@@ -173,6 +296,11 @@ impl AttachedServer {
     }
 
     pub fn call_tool(&mut self, tool: &str, arguments: Value) -> Result<Value, McpError> {
+        if self.needs_refresh() {
+            return Err(McpError::message(
+                "MCP catalog invalidated; wait for refresh or reconnect",
+            ));
+        }
         let response = self.request("tools/call", json!({"name":tool,"arguments":arguments}))?;
         if response.get("error").is_some() {
             return Err(McpError::message("MCP tool call rejected"));
@@ -210,6 +338,7 @@ impl McpBundle {
             http: None,
             spec: server.spec.clone(),
             refreshing: true,
+            listed_generation: 0,
         };
         Ok(std::mem::replace(server, placeholder))
     }
@@ -341,6 +470,7 @@ fn attach_stdio(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpErro
         }
     };
 
+    let listed_generation = client.listed_generation;
     Ok(AttachedServer {
         name: name.to_string(),
         transport: "stdio".into(),
@@ -350,6 +480,7 @@ fn attach_stdio(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpErro
         http: None,
         spec: spec.clone(),
         refreshing: false,
+        listed_generation,
     })
 }
 
@@ -376,88 +507,83 @@ fn handshake(
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(McpError::message("MCP cannot configure stdout"));
     }
+    let flags = unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(stdin.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return Err(McpError::message("MCP cannot configure stdin"));
+    }
+    let stdin = Arc::new(Mutex::new(stdin));
+    let writer = Arc::clone(&stdin);
+    let changes = Arc::new(Changes::default());
+    let (tx, responses) = mpsc::sync_channel(2);
+    let shared = Arc::clone(&changes);
+    let reader = std::thread::spawn(move || {
+        read_background(
+            BufReader::new(stdout),
+            writer,
+            tx,
+            shared,
+            std::time::Duration::from_secs(15),
+        )
+    });
     let mut client = StdioClient {
         stdin,
-        stdout: BufReader::new(stdout),
+        responses,
+        changes,
+        reader: Some(reader),
+        supports_tools: false,
+        listed_generation: 0,
         next_id: 1,
     };
-    let init = client.call(name, "initialize", json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"hypermesh-visor","version":"0.1.0"}}))?;
-    if init.get("error").is_some() {
-        return Err(McpError::message("MCP initialize rejected"));
-    }
+    let init = client.call(name, "initialize", json!({"protocolVersion":super::protocol::VERSION,"capabilities":{},"clientInfo":{"name":"hypermesh-visor","version":"0.1.0"}}))?;
+    let negotiated = super::protocol::negotiate(&init)?;
+    client.supports_tools = negotiated.tools;
+    client
+        .changes
+        .enabled
+        .store(negotiated.list_changed, Ordering::Release);
     write_msg(
-        &mut client.stdin,
+        &client.stdin,
         json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        &client.changes,
     )?;
-    let tools = super::discovery::list_tools(|params| client.call(name, "tools/list", params))?;
+    let generation = client.changes.generation();
+    let tools = if client.supports_tools {
+        super::discovery::list_tools(|params| client.call(name, "tools/list", params))?
+    } else {
+        Vec::new()
+    };
+    client.listed_generation = generation;
     Ok((tools, client))
 }
 
-fn write_msg(stdin: &mut ChildStdin, value: Value) -> Result<(), McpError> {
-    let raw = serde_json::to_string(&value)
-        .map_err(|e| McpError::message(format!("encode mcp message: {e}")))?;
-    writeln!(stdin, "{raw}").map_err(|e| McpError::message(format!("write mcp: {e}")))?;
-    stdin
-        .flush()
-        .map_err(|e| McpError::message(format!("flush mcp: {e}")))
-}
-
-fn read_msg(_name: &str, reader: &mut BufReader<ChildStdout>) -> Result<Value, McpError> {
-    read_msg_with_timeout(reader, std::time::Duration::from_secs(15))
-}
-
-fn read_msg_with_timeout(
-    reader: &mut BufReader<ChildStdout>,
-    timeout: std::time::Duration,
-) -> Result<Value, McpError> {
-    use std::os::fd::AsRawFd;
-    use std::time::Instant;
-    let deadline = Instant::now() + timeout;
-    for _ in 0..32 {
-        let mut line = Vec::new();
-        loop {
-            if Instant::now() >= deadline {
-                return Err(McpError::message("MCP response timeout"));
-            }
-            // fill_buf bounds allocation; never read an unbounded line.
-            match reader.fill_buf() {
-                Ok([]) => return Err(McpError::message("MCP closed stdout")),
-                Ok(buf) => {
-                    let n = buf
-                        .iter()
-                        .position(|b| *b == b'\n')
-                        .map(|i| i + 1)
-                        .unwrap_or(buf.len());
-                    if line.len() + n > 8 * 1024 * 1024 {
-                        return Err(McpError::message("MCP response too large"));
-                    }
-                    line.extend_from_slice(&buf[..n]);
-                    reader.consume(n);
-                    if line.last() == Some(&b'\n') {
-                        break;
-                    }
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    let mut poll = libc::pollfd {
-                        fd: reader.get_ref().as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    unsafe {
-                        libc::poll(&mut poll, 1, 50);
-                    }
-                }
-                Err(_) => return Err(McpError::message("MCP response read failed")),
-            }
-        }
-        let value: Value = serde_json::from_slice(&line)
-            .map_err(|_| McpError::message("MCP invalid JSON response"))?;
-        if value.get("id").is_some() {
-            return Ok(value);
-        }
-        // Notifications, including tools/list_changed, do not satisfy a request.
+fn write_msg(stdin: &Mutex<ChildStdin>, value: Value, changes: &Changes) -> Result<(), McpError> {
+    use std::time::{Duration, Instant};
+    let mut raw = serde_json::to_vec(&value).map_err(|_| McpError::message("MCP encode failed"))?;
+    if raw.len() > 8 * 1024 * 1024 {
+        return Err(McpError::message("MCP request too large"));
     }
-    Err(McpError::message("MCP notification limit exceeded"))
+    raw.push(b'\n');
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut writer = stdin
+        .lock()
+        .map_err(|_| McpError::message("MCP writer unavailable"))?;
+    let mut offset = 0;
+    while offset < raw.len() {
+        if changes.stopped.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(McpError::message("MCP write stopped or timed out"));
+        }
+        match writer.write(&raw[offset..]) {
+            Ok(0) => return Err(McpError::message("MCP stdin closed")),
+            Ok(n) => offset += n,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(10))
+            }
+            Err(_) => return Err(McpError::message("MCP write failed")),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -522,6 +648,65 @@ while True:
         })
     }
 
+    fn python_spec(script: &str) -> ServerSpec {
+        ServerSpec {
+            r#type: Some("stdio".into()),
+            command: Some("python3".into()),
+            args: vec!["-u".into(), "-c".into(), script.into()],
+            env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            cwd: None,
+            enabled: None,
+        }
+    }
+
+    #[test]
+    fn no_tools_capability_skips_discovery_and_refresh() {
+        let spec = python_spec(
+            r#"
+import sys,json
+for line in sys.stdin:
+ m=json.loads(line)
+ assert m['method'] in ['initialize','notifications/initialized']
+ if 'id' in m: print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'protocolVersion':'2025-06-18','capabilities':{}}}),flush=True)
+"#,
+        );
+        let mut server = attach_one("empty", &spec).unwrap();
+        server.refresh(false).unwrap();
+        assert!(server.tools.is_empty());
+        assert!(!server.needs_refresh());
+        assert!(!server.is_healthy());
+    }
+
+    #[test]
+    fn notifications_during_pagination_remain_pending_until_next_pass() {
+        let spec = python_spec(
+            r#"
+import sys,json
+lists=0
+for line in sys.stdin:
+ m=json.loads(line)
+ if 'id' not in m: continue
+ if m['method']=='initialize': result={'protocolVersion':'2025-06-18','capabilities':{'tools':{'listChanged':True}}}
+ else:
+  lists+=1
+  if lists in [1,4]: print(json.dumps({'jsonrpc':'2.0','method':'notifications/tools/list_changed'}),flush=True)
+  result={'tools':[{'name':'b' if 'cursor' in m['params'] else 'a'}]}
+  if 'cursor' not in m['params']: result['nextCursor']='page2'
+ print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+"#,
+        );
+        let mut server = attach_one("changing", &spec).unwrap();
+        assert!(server.needs_refresh());
+        assert!(server.call_tool("a", json!({})).is_err());
+        server.refresh(false).unwrap();
+        assert!(server.needs_refresh(), "in-flight change was lost");
+        server.refresh(false).unwrap();
+        assert!(!server.needs_refresh());
+        assert!(server.is_healthy());
+    }
+
     #[test]
     fn unterminated_stdio_response_has_a_deadline() {
         use std::os::fd::AsRawFd;
@@ -531,21 +716,35 @@ while True:
                 "-c",
                 "import sys,time; sys.stdout.write('{'); sys.stdout.flush(); time.sleep(5)",
             ])
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
         let stdout = child.stdout.take().unwrap();
-        let fd = stdout.as_raw_fd();
         unsafe {
-            libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
         }
-        let result = read_msg_with_timeout(
-            &mut BufReader::new(stdout),
-            std::time::Duration::from_millis(100),
-        );
+        let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+        let changes = Arc::new(Changes::default());
+        let shared = Arc::clone(&changes);
+        let (tx, rx) = mpsc::sync_channel(2);
+        let reader = std::thread::spawn(move || {
+            read_background(
+                BufReader::new(stdout),
+                stdin,
+                tx,
+                shared,
+                std::time::Duration::from_millis(100),
+            )
+        });
+        assert!(matches!(
+            rx.recv_timeout(std::time::Duration::from_secs(1)),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        ));
+        reader.join().unwrap();
+        assert!(changes.failed.load(Ordering::Acquire));
         let _ = child.kill();
         let _ = child.wait();
-        assert!(result.unwrap_err().to_string().contains("timeout"));
     }
 
     #[test]
@@ -562,7 +761,7 @@ for line in sys.stdin:
  m=json.loads(line); method=m['method']
  if 'id' not in m: continue
  result={}
- if method=='initialize': result={'protocolVersion':'2024-11-05','capabilities':{'tools':{'listChanged':True}}}
+ if method=='initialize': result={'protocolVersion':'2024-11-05','capabilities':{'tools':{'listChanged':False}}}
  elif method=='tools/list':
   v=version.read_text()
   if v=='fail':
@@ -660,8 +859,8 @@ for line in sys.stdin:
             "fixture".into(),
             ServerSpec {
                 r#type: Some("stdio".into()),
-                command: Some(script.to_string_lossy().into_owned()),
-                args: Vec::new(),
+                command: Some("python3".into()),
+                args: vec![script.to_string_lossy().into_owned()],
                 env: BTreeMap::new(),
                 url: None,
                 headers: BTreeMap::new(),
