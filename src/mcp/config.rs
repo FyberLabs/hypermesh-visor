@@ -102,31 +102,43 @@ pub fn load_named_server(dir: &Path, id: &str) -> Result<ServerSpec, McpError> {
         return Err(McpError::message("mcp server id is required"));
     }
     let servers = read_servers(&dir.join("mcp.json"))?;
-    let spec = servers.servers.get(id).cloned().ok_or_else(|| {
-        McpError::message(format!("mcp server \"{id}\" not found in mcp.json"))
-    })?;
+    let spec =
+        servers.servers.get(id).cloned().ok_or_else(|| {
+            McpError::message(format!("mcp server \"{id}\" not found in mcp.json"))
+        })?;
     if !spec.is_enabled() {
-        return Err(McpError::message(format!("mcp server \"{id}\" is disabled")));
+        return Err(McpError::message(format!(
+            "mcp server \"{id}\" is disabled"
+        )));
     }
     Ok(spec)
 }
 
 /// Load enabled servers for `profile_name` (or the active profile when empty).
 /// Missing config files yield an empty map (no attach).
-/// Merges project-local `mcp.json` (`.hypermesh/` or `.cursor/`) when present.
+/// Project config is imported only through an explicit HYPERMESH_MCP_PROJECT selection.
 pub fn load_profile_servers(
     dir: &Path,
     profile_name: Option<&str>,
 ) -> Result<(String, BTreeMap<String, ServerSpec>), McpError> {
+    let project = selected_project_path(std::env::var_os("HYPERMESH_MCP_PROJECT"))?;
+    load_profile_servers_from(dir, profile_name, project.as_deref())
+}
+
+fn load_profile_servers_from(
+    dir: &Path,
+    profile_name: Option<&str>,
+    project: Option<&Path>,
+) -> Result<(String, BTreeMap<String, ServerSpec>), McpError> {
     let servers_path = dir.join("mcp.json");
     let profiles_path = dir.join("mcp-profiles.json");
-    if !servers_path.exists() && !profiles_path.exists() && project_mcp_path().is_none() {
+    if !servers_path.exists() && !profiles_path.exists() && project.is_none() {
         let name = profile_name.unwrap_or("default").to_string();
         return Ok((name, BTreeMap::new()));
     }
     let mut servers = read_servers(&servers_path)?;
-    if let Some(project) = project_mcp_path() {
-        let project_servers = read_servers(&project)?;
+    if let Some(project) = project {
+        let project_servers = read_servers_required(project)?;
         for (id, spec) in project_servers.servers {
             servers.servers.entry(id).or_insert(spec);
         }
@@ -137,9 +149,10 @@ pub fn load_profile_servers(
         .filter(|s| !s.is_empty())
         .unwrap_or(profiles.active.as_str())
         .to_string();
-    let profile = profiles.profiles.get(&name).ok_or_else(|| {
-        McpError::message(format!("mcp profile \"{name}\" not found"))
-    })?;
+    let profile = profiles
+        .profiles
+        .get(&name)
+        .ok_or_else(|| McpError::message(format!("mcp profile \"{name}\" not found")))?;
 
     if profile.gateway {
         let id = "docker-gateway";
@@ -181,31 +194,31 @@ pub fn load_profile_servers(
     Ok((name, out))
 }
 
-/// Walk cwd (and parents) for project MCP config, or `HYPERMESH_MCP_PROJECT`.
-pub fn project_mcp_path() -> Option<PathBuf> {
-    if let Ok(explicit) = std::env::var("HYPERMESH_MCP_PROJECT") {
-        let p = PathBuf::from(explicit.trim());
-        if p.is_file() {
-            return Some(p);
-        }
-        let nested = p.join("mcp.json");
-        if nested.is_file() {
-            return Some(nested);
-        }
+/// An explicit selection authorizes loading commands from this file. Never scan
+/// cwd or parent directories: opening a project is not permission to run its MCP.
+fn selected_project_path(
+    explicit: Option<std::ffi::OsString>,
+) -> Result<Option<PathBuf>, McpError> {
+    let Some(explicit) = explicit else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(explicit);
+    if !path.is_absolute() {
+        return Err(McpError::message(
+            "HYPERMESH_MCP_PROJECT must be an absolute file or directory path",
+        ));
     }
-    let mut dir = std::env::current_dir().ok()?;
-    for _ in 0..8 {
-        for rel in [".hypermesh/mcp.json", ".cursor/mcp.json"] {
-            let candidate = dir.join(rel);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        if !dir.pop() {
-            break;
-        }
+    let path = if path.is_dir() {
+        path.join("mcp.json")
+    } else {
+        path
+    };
+    if !path.is_file() {
+        return Err(McpError::message(
+            "HYPERMESH_MCP_PROJECT must select an existing MCP config file",
+        ));
     }
-    None
+    Ok(Some(path))
 }
 
 fn read_servers(path: &Path) -> Result<ServersFile, McpError> {
@@ -214,6 +227,10 @@ fn read_servers(path: &Path) -> Result<ServersFile, McpError> {
             servers: BTreeMap::new(),
         });
     }
+    read_servers_required(path)
+}
+
+fn read_servers_required(path: &Path) -> Result<ServersFile, McpError> {
     let raw = fs::read_to_string(path)
         .map_err(|e| McpError::message(format!("read {}: {e}", path.display())))?;
     serde_json::from_str(&raw)
@@ -224,10 +241,7 @@ fn read_profiles(path: &Path) -> Result<ProfilesFile, McpError> {
     if !path.exists() {
         return Ok(ProfilesFile {
             active: "default".into(),
-            profiles: BTreeMap::from([(
-                "default".into(),
-                Profile::default(),
-            )]),
+            profiles: BTreeMap::from([("default".into(), Profile::default())]),
         });
     }
     let raw = fs::read_to_string(path)
@@ -278,7 +292,7 @@ mod tests {
             &dir.join("mcp-profiles.json"),
             r#"{"active":"default","profiles":{"default":{"servers":["fixture","skip"]}}}"#,
         );
-        let (name, servers) = load_profile_servers(&dir, None).unwrap();
+        let (name, servers) = load_profile_servers_from(&dir, None, None).unwrap();
         assert_eq!(name, "default");
         assert!(servers.contains_key("fixture"));
         assert!(!servers.contains_key("skip"));
@@ -309,10 +323,101 @@ mod tests {
             &dir.join("mcp-profiles.json"),
             r#"{"active":"default","profiles":{"default":{"servers":["filesystem"],"gateway":true}}}"#,
         );
-        let (name, servers) = load_profile_servers(&dir, None).unwrap();
+        let (name, servers) = load_profile_servers_from(&dir, None, None).unwrap();
         assert_eq!(name, "default");
         assert_eq!(servers.len(), 1);
         assert!(servers.contains_key("docker-gateway"));
+    }
+
+    #[test]
+    fn explicit_project_selection_is_required_and_fail_closed() {
+        let dir = tempfile_dir();
+        write(&dir.join("mcp.json"), r#"{"mcpServers":{}}"#);
+        assert!(selected_project_path(None).unwrap().is_none());
+        for invalid in [
+            PathBuf::new(),
+            PathBuf::from(".cursor/mcp.json"),
+            dir.join("missing"),
+        ] {
+            assert!(selected_project_path(Some(invalid.into_os_string())).is_err());
+        }
+        for path in [dir.clone(), dir.join("mcp.json")] {
+            assert_eq!(
+                selected_project_path(Some(path.into_os_string())).unwrap(),
+                Some(dir.join("mcp.json"))
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn selected_project_preserves_user_precedence_and_profile_membership() {
+        let dir = tempfile_dir();
+        let project = dir.join("project.json");
+        write(
+            &project,
+            r#"{"mcpServers":{"shared":{"command":"project"},"blocked":{"command":"project"},"extra":{"command":"extra"},"unused":{"command":"unused"}}}"#,
+        );
+        write(
+            &dir.join("mcp.json"),
+            r#"{"mcpServers":{"shared":{"command":"user"},"blocked":{"command":"user","enabled":false}}}"#,
+        );
+        write(
+            &dir.join("mcp-profiles.json"),
+            r#"{"profiles":{"default":{"servers":["shared","blocked","extra"],"config":{"extra":{"command":"override"}}}}}"#,
+        );
+        let (_, servers) = load_profile_servers_from(&dir, None, Some(&project)).unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers["shared"].command.as_deref(), Some("user"));
+        assert_eq!(servers["extra"].command.as_deref(), Some("override"));
+        assert!(!servers.contains_key("blocked"));
+        assert!(!servers.contains_key("unused"));
+        assert!(load_profile_servers_from(&dir, None, None).is_err());
+        write(&project, "not json");
+        assert!(load_profile_servers_from(&dir, None, Some(&project)).is_err());
+        fs::remove_file(&project).unwrap();
+        assert!(load_profile_servers_from(&dir, None, Some(&project)).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ambient_project_is_ignored_in_subprocess() {
+        const CHILD: &str = "VISOR_MCP_CONFIG_TEST_CHILD";
+        if let Some(dir) = std::env::var_os(CHILD) {
+            let error = load_profile_servers(Path::new(&dir), None).unwrap_err();
+            assert!(error.to_string().contains("unknown server"), "{error}");
+            return;
+        }
+        let dir = tempfile_dir();
+        let user = dir.join("user");
+        fs::create_dir_all(&user).unwrap();
+        write(
+            &user.join("mcp-profiles.json"),
+            r#"{"profiles":{"default":{"servers":["project-only"]}}}"#,
+        );
+        for location in [".hypermesh", ".cursor"] {
+            fs::create_dir_all(dir.join(location)).unwrap();
+            write(
+                &dir.join(location).join("mcp.json"),
+                r#"{"mcpServers":{"project-only":{"command":"must-not-run"}}}"#,
+            );
+        }
+        let nested = dir.join("nested");
+        fs::create_dir(&nested).unwrap();
+        for cwd in [&dir, &nested] {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mcp::config::tests::ambient_project_is_ignored_in_subprocess",
+                ])
+                .current_dir(cwd)
+                .env(CHILD, &user)
+                .env_remove("HYPERMESH_MCP_PROJECT")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn write(path: &Path, body: &str) {
