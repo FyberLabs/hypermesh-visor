@@ -620,6 +620,7 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .route("/mcp/discovery", post(mcp_discovery))
         .route("/mcp/trust", get(mcp_trusted).post(mcp_trust_decision))
         .route("/mcp/sources", get(mcp_sources))
+        .route("/mcp/profiles", get(mcp_profiles).post(mcp_profile_edit))
         .route("/session/:id/stream", post(session_stream))
         .route("/session/:id/inbox", get(session_inbox))
         .route("/session/:id/mcp", get(session_mcp))
@@ -671,6 +672,42 @@ async fn mcp_discovery(
     })
     .await
     .map_err(|_| ApiError::internal("MCP discovery task failed"))?
+}
+
+async fn mcp_profiles(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+) -> Result<Json<mcp::profiles::Snapshot>, ApiError> {
+    if !link.0 {
+        return Err(ApiError::forbidden(
+            "MCP profiles require the local companion socket",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        mcp::profiles::list(&state.mcp_dir)
+            .map(Json)
+            .map_err(ApiError::from_mcp)
+    })
+    .await
+    .map_err(|_| ApiError::internal("Profile read failed"))?
+}
+async fn mcp_profile_edit(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+    Json(edit): Json<mcp::profiles::Edit>,
+) -> Result<Json<mcp::profiles::Snapshot>, ApiError> {
+    if !link.0 {
+        return Err(ApiError::forbidden(
+            "MCP profiles require the local companion socket",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        mcp::profiles::edit(&state.mcp_dir, &mut lock(&state.mcp_trust), edit)
+            .map(Json)
+            .map_err(|e| ApiError::conflict(e.to_string()))
+    })
+    .await
+    .map_err(|_| ApiError::internal("Profile save failed"))?
 }
 
 async fn mcp_sources(
@@ -3382,6 +3419,45 @@ for line in sys.stdin:
             serde_json::json!({}),
         )
         .await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graphical_profiles_are_companion_only_and_saves_block_new_profiles() {
+        let dir = std::env::temp_dir().join(format!("visor-profile-api-{}", Uuid::new_v4()));
+        let mut state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        state.mcp_dir = dir.clone();
+        let state = Arc::new(state);
+        for app in [
+            router(Arc::clone(&state)),
+            tcp_router(Arc::clone(&state), "fixture-token".into()),
+        ] {
+            assert_eq!(
+                trust_test_request(app.clone(), "GET", "/mcp/profiles", serde_json::json!({}))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(trust_test_request(app,"POST","/mcp/profiles",serde_json::json!({"action":"save","revision":"missing","name":"new","servers":[],"gateway":false,"create":true})).await.0,StatusCode::FORBIDDEN);
+        }
+        assert!(!dir.exists());
+        let app = companion_router(Arc::clone(&state));
+        let (status, body) =
+            trust_test_request(app.clone(), "GET", "/mcp/profiles", serde_json::json!({})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["revision"], "missing");
+        assert!(!dir.exists());
+        let (status,_)=trust_test_request(app,"POST","/mcp/profiles",serde_json::json!({"action":"save","revision":"missing","name":"new","servers":[],"gateway":false,"create":true})).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(lock(&state.mcp_trust).is_revoked("new"));
+        let body: serde_json::Value =
+            serde_json::from_str(&session_body("profile-editor")).unwrap();
+        assert_eq!(
+            trust_test_request(router(state), "POST", "/session", body)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

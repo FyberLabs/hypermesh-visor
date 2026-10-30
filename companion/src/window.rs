@@ -743,9 +743,12 @@ fn on_click(
         }
         Action::McpProfiles => {
             app.menu = false;
-            if let Err(err) = open_hypermesh_args(&["mcp", "profile", "ls"]) {
-                *app.status.lock().unwrap() = err.to_string();
-            }
+            let status = Arc::clone(&app.status);
+            std::thread::spawn(move || {
+                if let Err(err) = crate::mcp_profiles::run() {
+                    *status.lock().unwrap() = err;
+                }
+            });
         }
         Action::McpDoctor => {
             app.menu = false;

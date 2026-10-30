@@ -14,6 +14,8 @@ priority: optional
 maintainer: Fyber Labs <github@fyberlabs.com>
 description: Linux desktop visor, CLI, and companion for Hypermesh
 homepage: https://github.com/FyberLabs/hypermesh-visor
+depends:
+  - zenity
 contents:
   - src: ${VISOR_BIN}
     dst: /usr/bin/hypermesh-visor

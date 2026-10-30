@@ -384,6 +384,40 @@ impl TrustStore {
         }
         Ok(())
     }
+    /// Profile edits never confer trust, including newly created profiles.
+    pub fn block_for_edit(&mut self, profile: &str) -> Result<(), McpError> {
+        let base = self
+            .storage
+            .as_ref()
+            .ok_or_else(|| McpError::message("Load trust before editing profiles"))?;
+        if !self.receipts.contains_key(profile) && self.receipts.len() >= MAX_REVIEWS {
+            return Err(McpError::message(
+                "Trust profile limit reached; profile edit not saved",
+            ));
+        }
+        let mut next = self.receipts.clone();
+        let receipt = next.entry(profile.into()).or_insert_with(|| Receipt {
+            review_id: Uuid::new_v4(),
+            revoked: true,
+            source_kind: "selected_project".into(),
+            sources: vec![
+                Fingerprint {
+                    path: base.join("mcp.json"),
+                    sha256: None,
+                },
+                Fingerprint {
+                    path: base.join("mcp-profiles.json"),
+                    sha256: None,
+                },
+            ],
+        });
+        receipt.revoked = true;
+        self.persist(next)?;
+        self.grants.remove(profile);
+        self.revoked.insert(profile.into());
+        self.pending.retain(|_, p| p.resolution.profile != profile);
+        Ok(())
+    }
     pub fn is_revoked(&self, profile: &str) -> bool {
         self.revoked.contains(profile)
     }

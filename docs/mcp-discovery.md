@@ -38,6 +38,47 @@ project is writable by others. Do not put credentials in issue reports or logs.
 Vault MCP retrieval remains separate and uses named servers from user `mcp.json`;
 it does not import project config or require session profile membership.
 
+## Graphical profile editing
+
+Choose **MCP profiles** in the companion menu, or run
+`hypermesh-companion --mcp-profiles` from your desktop session. Linux packages
+include the Zenity runtime dependency; source installations need `zenity`
+installed. The dialogs create profiles, edit server IDs (one per line), switch
+between individual servers and Docker gateway mode, select the active profile,
+and delete inactive profiles. Choose another active profile before deleting the
+current one. Canceling a dialog before confirmation sends no write.
+
+The editor changes membership and gateway selection, not server definitions or
+credentials. Existing private per-server overrides and unknown profile fields
+are preserved without being sent to the UI. Server IDs can refer to user config
+or a source you will select during trust review. Gateway mode keeps the saved
+membership list but attaches only the gateway under the normal resolver rules.
+Creating the first profile also makes it active.
+
+Saving membership/gateway changes (even unchanged values) or deleting a profile
+persistently blocks that profile before replacing the file. Use **MCP trust** to
+review a saved profile before opening new sessions. Saving never approves or
+starts a server; activation does not lift an existing block. Running sessions
+keep their attachments. A failed save can leave the profile blocked; reopen the
+editor, verify the file, and review again. Changes to the shared profiles file
+also require revalidation of other receipts after daemon restart.
+
+The companion-only `GET /mcp/profiles` returns metadata and a file revision;
+`POST /mcp/profiles` accepts `save`, `activate`, or `delete` with that revision.
+Stale revisions are rejected. Cooperative editors serialize with a private lock,
+write a mode-0600 temporary file, and atomically replace `mcp-profiles.json`.
+External tools should use the API or the same lock; arbitrary writers that ignore
+the lock cannot receive an atomic compare-and-swap guarantee. Symlink, hardlink,
+foreign-owner, nonregular, malformed, or oversized profile files are refused.
+Reads do not create configuration files.
+
+The graphical editor creates at most eight profiles, with at most 128 server IDs
+per edited profile. Persistent trust currently retains up to eight profile
+decisions, including deleted/revoked names; reuse an existing name when that
+limit is reached. These limits and preserved overrides are visible in errors or
+the save confirmation. Graphical server-definition/secret editing is outside
+this screen.
+
 ## Review discovery sources in the companion
 
 Open the bug menu and choose **MCP trust**, or run `hypermesh-companion --mcp-trust`
@@ -46,8 +87,7 @@ terminal emulator, alongside the existing MCP profile and doctor actions.
 
 1. Choose **Review a profile** and enter its name, or leave it blank for the active
    user profile. The profile must already exist in `mcp-profiles.json`; its server
-   list remains the selection boundary. Use the existing profile tools or edit
-   that file to change membership.
+   list remains the selection boundary. Use **MCP profiles** or edit that file to change membership.
 2. Select a listed Cursor or VS Code source ID, or enter an absolute MCP JSON
    file or directory containing `mcp.json`.
    This previews the file without setting `HYPERMESH_MCP_PROJECT`, editing user
@@ -175,7 +215,7 @@ terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
   authorization and physical-user pause still apply.
 
 Issue #29 remains open for additional documented discovery sources, richer graphical
-profile editing, native stable
+server-definition editing, native stable
 identity coverage beyond the current Linux probes, automatic server reconnect
 policy, and native Windows/macOS discovery. The implemented protocol surface and
 remaining compatibility limits are described below.
