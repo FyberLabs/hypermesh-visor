@@ -619,6 +619,7 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .route("/session/:id/inbox", get(session_inbox))
         .route("/session/:id/mcp", get(session_mcp))
         .route("/session/:id/mcp/call", post(mcp_call))
+        .route("/session/:id/mcp/refresh", post(mcp_refresh))
         .layer(Extension(CompanionLink(from_companion)))
         .with_state(state)
 }
@@ -854,6 +855,7 @@ struct SessionMcpBody {
 
 #[derive(Serialize)]
 struct SessionMcpServer {
+    refreshing: bool,
     name: String,
     transport: String,
     healthy: bool,
@@ -945,6 +947,7 @@ async fn session_mcp(
         .servers
         .iter()
         .map(|server| SessionMcpServer {
+            refreshing: server.refreshing,
             name: server.name.clone(),
             transport: server.transport.clone(),
             healthy: server.is_healthy(),
@@ -955,6 +958,69 @@ async fn session_mcp(
         profile: session.mcp().profile.clone(),
         servers,
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpRefreshRequest {
+    server: String,
+    action: McpRefreshAction,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum McpRefreshAction {
+    Refresh,
+    Reconnect,
+}
+
+async fn mcp_refresh(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<McpRefreshRequest>,
+) -> Result<StatusCode, ApiError> {
+    let id = parse_id(&id)?;
+    let name = body.server.trim().to_string();
+    if name.is_empty() || name.len() > 512 {
+        return Err(ApiError::bad("server must contain 1 to 512 bytes"));
+    }
+    let reconnect = matches!(body.action, McpRefreshAction::Reconnect);
+    tokio::task::spawn_blocking(move || {
+        let mut server = {
+            let mut sessions = lock(&state.sessions);
+            let session = sessions.get_mut(&id).ok_or_else(ApiError::missing)?;
+            if session
+                .mcp()
+                .servers
+                .iter()
+                .any(|s| s.name == name && s.refreshing)
+            {
+                return Err(ApiError::conflict("MCP server refresh in progress"));
+            }
+            session
+                .mcp_mut()
+                .take_for_refresh(&name)
+                .map_err(ApiError::from_mcp)?
+        };
+        // No session/global mutex is held during process or network I/O.
+        let result = server.refresh(reconnect);
+        {
+            let mut sessions = lock(&state.sessions);
+            // If closed during I/O, dropping the owned server terminates its child.
+            let session = sessions.get_mut(&id).ok_or_else(ApiError::missing)?;
+            session.mcp_mut().restore_after_refresh(server);
+        }
+        lock(&state.mcp_audit).record(McpAuditRow {
+            server: name,
+            tool: if reconnect { "@reconnect" } else { "@refresh" }.into(),
+            decision: "approve".into(),
+            outcome: if result.is_ok() { "ok" } else { "failed" }.into(),
+        });
+        result.map_err(ApiError::from_mcp)?;
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+    .map_err(|_| ApiError::internal("MCP refresh task failed"))?
 }
 
 async fn mcp_call(
@@ -2988,6 +3054,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn closing_session_during_refresh_drops_child_without_locking_polls() {
+        let dir = std::env::temp_dir().join(format!("hm-refresh-api-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = r#"
+import sys,json,pathlib,time,os
+p=pathlib.Path(sys.argv[1]); (p/'pid').write_text(str(os.getpid()))
+for line in sys.stdin:
+ m=json.loads(line)
+ if 'id' not in m: continue
+ if m['method']=='initialize': result={'protocolVersion':'2024-11-05','capabilities':{'tools':{}}}
+ else:
+  if (p/'block').exists():
+   (p/'ready').touch()
+   while not (p/'release').exists(): time.sleep(.01)
+  result={'tools':[{'name':'ping'}]}
+ print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+"#;
+        std::fs::write(dir.join("mcp.json"), serde_json::json!({"mcpServers":{"fixture":{"command":"python3","args":["-u","-c",script,dir.to_string_lossy()]}}}).to_string()).unwrap();
+        std::fs::write(
+            dir.join("mcp-profiles.json"),
+            r#"{"profiles":{"default":{"servers":["fixture"]}}}"#,
+        )
+        .unwrap();
+        let addr = spawn_with_mcp_dir(FakeDesktop::new(), dir.clone()).await;
+        let (status, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        assert_eq!(status, 201);
+        std::fs::write(dir.join("block"), "").unwrap();
+        let path = format!("/session/{id}/mcp/refresh");
+        let task = tokio::spawn(async move {
+            send(
+                addr,
+                "POST",
+                &path,
+                Some(r#"{"server":"fixture","action":"refresh"}"#.into()),
+            )
+            .await
+        });
+        let start = Instant::now();
+        while !dir.join("ready").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "refresh did not reach server"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (status, _, body) = tokio::time::timeout(
+            Duration::from_secs(2),
+            send(addr, "GET", &format!("/session/{id}/mcp"), None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(status, 200);
+        let snapshot: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(snapshot["servers"][0]["refreshing"], true);
+        assert_eq!(snapshot["servers"][0]["healthy"], false);
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mcp/refresh"),
+            Some(r#"{"server":"fixture","action":"reconnect"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 409);
+        let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
+        assert_eq!(status, 204);
+        std::fs::write(dir.join("release"), "").unwrap();
+        let (status, _, _) = task.await.unwrap();
+        assert_eq!(status, 404);
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "closed session retained child"
+        );
+        let (status, _, _) = send(
+            addr,
+            "POST",
+            &format!("/session/{id}/mcp/refresh"),
+            Some(r#"{"server":"fixture","action":"refresh"}"#.into()),
+        )
+        .await;
+        assert_eq!(status, 404);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
     async fn session_attaches_stdio_mcp_from_config_dir() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -3063,6 +3214,13 @@ while True:
         assert_eq!(mcp["servers"][0]["name"], "fixture");
         assert_eq!(mcp["servers"][0]["healthy"], true);
         assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
+        for action in ["refresh", "reconnect"] {
+            let (status, _, _) = send(addr, "POST", &format!("/session/{id}/mcp/refresh"), Some(serde_json::json!({"server":"fixture","action":action}).to_string())).await;
+            assert_eq!(status, 204);
+        }
+        let (status, _, _) = send(addr, "POST", &format!("/session/{id}/mcp/refresh"), Some(r#"{"server":"fixture","action":"retry-call"}"#.into())).await;
+        assert_eq!(status, 422);
+
 
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -3147,12 +3305,14 @@ while True:
         let audit_text = String::from_utf8_lossy(&body);
         assert!(!audit_text.contains("should-not-be-audited"));
         assert!(!audit_text.contains("secret"));
-        assert_eq!(audit.as_array().unwrap().len(), 2);
-        assert_eq!(audit[0]["decision"], "deny");
-        assert_eq!(audit[0]["tool"], "ping");
-        assert_eq!(audit[0]["server"], "fixture");
-        assert_eq!(audit[1]["decision"], "approve");
-        assert_eq!(audit[1]["outcome"], "ok");
+        assert_eq!(audit.as_array().unwrap().len(), 4);
+        assert_eq!(audit[0]["tool"], "@refresh");
+        assert_eq!(audit[1]["tool"], "@reconnect");
+        assert_eq!(audit[2]["decision"], "deny");
+        assert_eq!(audit[2]["tool"], "ping");
+        assert_eq!(audit[2]["server"], "fixture");
+        assert_eq!(audit[3]["decision"], "approve");
+        assert_eq!(audit[3]["outcome"], "ok");
 
         let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
         assert_eq!(status, 204);

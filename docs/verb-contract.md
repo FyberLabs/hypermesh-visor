@@ -149,3 +149,5 @@ files and executable skills become shared resources. A generic shell verb is not
 an implicit fallback for missing desktop capabilities.
 
 Browser scroll acceptance uses a real WebKitGTK viewport. Visor wheel requests move each axis forward and back to the origin while the other axis stays fixed. The page reports offsets through an in-process script-message handler; it does not inject input or open a debugging port.
+
+MCP catalog lifecycle: `POST /session/{id}/mcp/refresh` accepts `server` and `action` (`refresh` or `reconnect`). It returns 204 on success, 409 for a concurrent refresh, 404 for a closed session, and 502 on discovery/transport failure. See [MCP discovery](mcp-discovery.md#pagination-refresh-and-reconnect) for bounds, catalog invalidation, and no-replay semantics.
