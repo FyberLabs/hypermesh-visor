@@ -51,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
 
     server = threading.Thread(target=serve)
     server.start()
-    env = dict(os.environ, HYPERMESH_RUNTIME_DIR=runtime, GDK_BACKEND="x11")
+    env = dict(os.environ, HYPERMESH_RUNTIME_DIR=runtime, GDK_BACKEND="x11", GSK_RENDERER="cairo")
     process = subprocess.Popen([sys.argv[1], "--mcp-profiles"], env=env)
     try:
         deadline = time.monotonic() + 15
@@ -66,6 +66,10 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
             if process.poll() is not None:
                 raise RuntimeError("profile editor exited before rendering")
             time.sleep(0.1)
+        if not window:
+            print("requests:", calls, flush=True)
+            subprocess.run(["xwininfo", "-root", "-tree"], check=False)
+            subprocess.run(["ps", "-o", "pid,ppid,args", "-C", "zenity"], check=False)
         assert window, "graphical profile chooser did not render"
         subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
         subprocess.run(["xdotool", "key", "Escape"], check=True)

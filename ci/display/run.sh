@@ -2476,7 +2476,7 @@ PY
 }
 
 scenario_mcp_profiles() {
-  python3 "$root/ci/display/mcp-profiles.py" "$COMPANION_BIN"
+  dbus-run-session -- python3 "$root/ci/display/mcp-profiles.py" "$COMPANION_BIN"
 }
 
 X11_SCENARIOS=(

@@ -1097,35 +1097,65 @@ async fn open_session(
         .await
         .map_err(|_| ApiError::internal("MCP profile lookup failed"))?
         .map_err(ApiError::from_mcp)?;
-    sync_mcp_trust(&state).await?;
-    let approved = {
-        let trust = lock(&state.mcp_trust);
-        if trust.is_revoked(&profile_name) {
+    let snapshot_state = Arc::clone(&state);
+    let profile = profile_name.clone();
+    // Capture permitted configuration under the same gate used by profile edits.
+    // No mutable profile file is read again after a slow vault fetch.
+    let (resolution, grant_id) = tokio::task::spawn_blocking(move || {
+        let mut trust = lock(&snapshot_state.mcp_trust);
+        trust
+            .sync(&snapshot_state.mcp_dir)
+            .map_err(ApiError::from_mcp)?;
+        if trust.is_revoked(&profile) {
             return Err(ApiError::forbidden(
                 "MCP profile trust revoked; review again",
             ));
         }
-        trust.approved(&profile_name)
-    };
-    let mcp_dir = state.mcp_dir.clone();
-    let vault_dir = mcp_dir.clone();
+        let (resolution, grant_id) = if let Some(grant) = trust.approved(&profile) {
+            (grant.resolution, Some(grant.id))
+        } else {
+            (
+                mcp::load_profile_resolution(&snapshot_state.mcp_dir, Some(&profile))
+                    .map_err(ApiError::from_mcp)?,
+                None,
+            )
+        };
+        // Also observe edits by another daemon while the files were read.
+        trust
+            .sync(&snapshot_state.mcp_dir)
+            .map_err(ApiError::from_mcp)?;
+        if trust.is_revoked(&profile) || trust.approved(&profile).map(|g| g.id) != grant_id {
+            return Err(ApiError::conflict(
+                "MCP trust changed during profile lookup",
+            ));
+        }
+        Ok((resolution, grant_id))
+    })
+    .await
+    .map_err(|_| ApiError::internal("MCP profile snapshot failed"))??;
+    let vault_dir = state.mcp_dir.clone();
     let secrets = req.secrets;
     // Vault source mcp (role B) is a short-lived fetch; session tool attach (role A) follows.
     let vault = tokio::task::spawn_blocking(move || Vault::open(&secrets, vault_dir))
         .await
         .map_err(|_| ApiError::internal("vault open task failed"))?
         .map_err(ApiError::from_vault)?;
-    let grant_id = approved.as_ref().map(|g| g.id);
-    let profile = profile_name.clone();
-    let mcp = tokio::task::spawn_blocking(move || {
-        if let Some(grant) = approved {
-            let mut bundle = mcp::attach_specs(grant.resolution.profile, grant.resolution.servers)?;
-            bundle.provenance = grant.resolution.provenance;
-            bundle.trust_review = Some(grant.id);
-            Ok(bundle)
-        } else {
-            mcp::attach_profile(&mcp_dir, Some(&profile))
+    sync_mcp_trust(&state).await?;
+    {
+        let trust = lock(&state.mcp_trust);
+        if trust.is_revoked(&profile_name)
+            || trust.approved(&profile_name).map(|g| g.id) != grant_id
+        {
+            return Err(ApiError::conflict(
+                "MCP trust changed before attachment; open the session again",
+            ));
         }
+    }
+    let mcp = tokio::task::spawn_blocking(move || {
+        let mut bundle = mcp::attach_specs(resolution.profile, resolution.servers)?;
+        bundle.provenance = resolution.provenance;
+        bundle.trust_review = grant_id;
+        Ok::<_, mcp::McpError>(bundle)
     })
     .await
     .map_err(|_| ApiError::internal("mcp attach task failed"))?
@@ -3419,6 +3449,78 @@ for line in sys.stdin:
             serde_json::json!({}),
         )
         .await;
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn profile_edit_during_vault_fetch_never_spawns_new_membership() {
+        let dir = std::env::temp_dir().join(format!("hm-trust-race-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = r#"
+import sys,json,pathlib,time
+p=pathlib.Path(sys.argv[1])
+for line in sys.stdin:
+ m=json.loads(line)
+ if 'id' not in m: continue
+ if m['method']=='initialize': result={'protocolVersion':'2025-11-25','capabilities':{'tools':{}}}
+ elif m['method']=='tools/list': result={'tools':[{'name':'secret'}]}
+ elif m['method']=='tools/call':
+  (p/'waiting').touch()
+  while not (p/'release').exists(): time.sleep(.01)
+  result={'content':[{'type':'text','text':'fixture-secret'}]}
+ print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+"#;
+        std::fs::write(dir.join("mcp.json"),serde_json::json!({"mcpServers":{"vault":{"command":"python3","args":["-u","-c",script,dir]},"forbidden":{"command":"python3","args":["-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",dir.join("forbidden-started")] }}}).to_string()).unwrap();
+        let profiles = serde_json::json!({"active":"a","profiles":{"a":{"servers":[]},"b":{"servers":["forbidden"]}}});
+        std::fs::write(dir.join("mcp-profiles.json"), profiles.to_string()).unwrap();
+        let mut state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        state.mcp_dir = dir.clone();
+        let state = Arc::new(state);
+        lock(&state.mcp_trust).sync(&dir).unwrap();
+        let review = mcp::trust::inspect(&dir, Some("b"), None).unwrap();
+        let id = lock(&state.mcp_trust).stage(review).unwrap().review_id;
+        lock(&state.mcp_trust).approve(id).unwrap();
+        lock(&state.mcp_trust).revoke("b").unwrap();
+        let mut body: serde_json::Value =
+            serde_json::from_str(&session_body("trust-race")).unwrap();
+        body["secrets"] =
+            serde_json::json!([{"name":"token","source":"mcp","locator":"vault/secret"}]);
+        let app = router(Arc::clone(&state));
+        let open =
+            tokio::spawn(async move { trust_test_request(app, "POST", "/session", body).await });
+        let start = Instant::now();
+        while !dir.join("waiting").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "vault never reached wait"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let revision = mcp::profiles::list(&dir).unwrap();
+        let revision = serde_json::to_value(revision).unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp::profiles::edit(
+            &dir,
+            &mut lock(&state.mcp_trust),
+            mcp::profiles::Edit::Save {
+                revision,
+                name: "a".into(),
+                servers: vec!["forbidden".into()],
+                gateway: false,
+                create: false,
+            },
+        )
+        .unwrap();
+        std::fs::write(dir.join("release"), "").unwrap();
+        let (status, opened) = open.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{opened}");
+        assert!(
+            !dir.join("forbidden-started").exists(),
+            "unreviewed server executed"
+        );
+        assert!(lock(&state.sessions).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
 

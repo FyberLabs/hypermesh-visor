@@ -14,7 +14,7 @@ fn dialog(args: &[String], input: Option<&str>) -> Result<Option<String>, String
             Stdio::null()
         })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .map_err(|_| "Cannot open MCP profiles. Install zenity and run in your desktop session.")?;
     if let Some(input) = input {
