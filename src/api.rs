@@ -32,8 +32,8 @@ use crate::input::{
     POINTER_BATCH, TYPE_CHUNK_KEYSTROKES, TYPE_MAX_KEYSTROKES,
 };
 use crate::mcp::{
-    self, companion_mode, resolve_preferred, BindingCache, FocusedApp, McpAuditRow, McpAuditor,
-    McpError, ToolInfo,
+    self, companion_mode, explain_preferred, BindingCache, FocusedApp, MatchDecision, McpAuditRow,
+    McpAuditor, McpError, ToolInfo,
 };
 use crate::prompt::{self, AuditRecord, PromptError};
 use crate::session::{Session, Verb};
@@ -303,9 +303,8 @@ impl AppState {
         };
         let focused = self.cached_focus();
         let bindings = lock(&self.bindings).current(&self.mcp_dir, Instant::now());
-        let preferred = focused
-            .as_ref()
-            .and_then(|app| resolve_preferred(app, &bindings, &chosen.healthy));
+        let mcp_match = explain_preferred(focused.as_ref(), &bindings, &chosen.healthy);
+        let preferred = mcp_match.preferred.clone();
         let mode = companion_mode(preferred.as_deref(), chosen.verb)
             .map(|mode| clip_text(&mode, SESSION_TEXT_MAX));
         let prefer_mcp = preferred.is_some();
@@ -333,15 +332,17 @@ impl AppState {
             mcp_servers,
             focused,
             prefer_mcp,
+            mcp_match,
             idle_ms: chosen.idle_ms,
         })
     }
 
     /// The last focused app, refreshing it off the request worker when the
-    /// sample is missing or older than [`FOCUS_TTL`]. The poll returns the
-    /// previous sample immediately.
+    /// sample is missing or older than [`FOCUS_TTL`]. The poll returns
+    /// no sample while an expired identity refreshes, so stale app identity
+    /// cannot keep selecting an MCP server indefinitely.
     fn cached_focus(&self) -> Option<FocusedApp> {
-        let cached = {
+        {
             let cache = lock(&self.focus_cache);
             let fresh = cache
                 .fetched_at
@@ -349,10 +350,9 @@ impl AppState {
             if fresh {
                 return cache.value.clone().filter(|app| !app.is_empty());
             }
-            cache.value.clone()
-        };
+        }
         self.spawn_focus_refresh();
-        cached.filter(|app| !app.is_empty())
+        None
     }
 
     fn spawn_focus_refresh(&self) {
@@ -551,6 +551,7 @@ struct CompanionSession {
     #[serde(skip_serializing_if = "Option::is_none")]
     focused: Option<FocusedApp>,
     prefer_mcp: bool,
+    mcp_match: MatchDecision,
     /// Milliseconds since this session was last used.
     idle_ms: u64,
 }
@@ -3066,6 +3067,7 @@ while True:
         let (_, _, body) = send(addr, "GET", "/companion", None).await;
         let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(companion["session"]["prefer_mcp"], false);
+        assert_eq!(companion["session"]["mcp_match"]["reason"], "focus_unavailable");
         assert!(companion["session"].get("mcp").is_none() || companion["session"]["mcp"].is_null());
 
         desktop.set_focus(Some(FocusedApp {
@@ -3088,6 +3090,8 @@ while True:
             let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
             if companion["session"]["prefer_mcp"] == true {
                 assert_eq!(companion["session"]["mcp"], "fixture");
+                assert_eq!(companion["session"]["mcp_match"]["reason"], "matched");
+                assert_eq!(companion["session"]["mcp_match"]["binding_index"], 0);
                 assert_eq!(companion["session"]["mode"], "mcp:fixture");
                 assert_eq!(companion["session"]["verb"], "mouse");
                 preferred = true;
@@ -3192,6 +3196,24 @@ while True:
         let closed: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(closed["open"], false);
         assert_eq!(closed["automation"]["phase"], "off");
+    }
+
+    #[test]
+    fn expired_focus_does_not_route_while_refresh_is_pending() {
+        let state = AppState::new(FakeDesktop::new(), Duration::from_millis(10));
+        let focus = FocusedApp {
+            wm_class: Some("OldApp".into()),
+            ..FocusedApp::default()
+        };
+        {
+            let mut cache = lock(&state.focus_cache);
+            cache.value = Some(focus.clone());
+            cache.fetched_at = Some(Instant::now());
+        }
+        assert_eq!(state.cached_focus(), Some(focus));
+        state.focus_refreshing.store(true, Ordering::SeqCst);
+        lock(&state.focus_cache).fetched_at = Some(Instant::now() - FOCUS_TTL);
+        assert!(state.cached_focus().is_none());
     }
 
     #[test]

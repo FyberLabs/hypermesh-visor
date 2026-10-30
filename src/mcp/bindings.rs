@@ -107,24 +107,80 @@ pub fn load_bindings(dir: &Path) -> Result<BindingsFile, McpError> {
         .map_err(|e| McpError::message(format!("parse {}: {e}", path.display())))
 }
 
-/// First binding that matches the focused app and names an attached healthy server.
-pub fn resolve_preferred(
+/// A bounded explanation of routing. No config values, credentials, or titles.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MatchDecision {
+    #[serde(skip)]
+    pub preferred: Option<String>,
+    pub reason: MatchReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding_index: Option<usize>,
+    pub identity_matches: usize,
+    pub healthy_matches: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchReason {
+    FocusUnavailable,
+    NoBindings,
+    IdentityMismatch,
+    ServerUnavailable,
+    Matched,
+}
+
+/// Binding order is the user's explicit precedence. All selectors must match;
+/// an unavailable server never prevents a later healthy binding from winning.
+pub fn explain_preferred(
+    focus: Option<&FocusedApp>,
+    bindings: &[Binding],
+    healthy_servers: &[String],
+) -> MatchDecision {
+    let mut decision = MatchDecision {
+        preferred: None,
+        reason: MatchReason::FocusUnavailable,
+        binding_index: None,
+        identity_matches: 0,
+        healthy_matches: 0,
+    };
+    let Some(focus) = focus.filter(|app| !app.is_empty()) else {
+        return decision;
+    };
+    decision.reason = if bindings.is_empty() {
+        MatchReason::NoBindings
+    } else {
+        MatchReason::IdentityMismatch
+    };
+    for (index, binding) in bindings.iter().enumerate() {
+        if !matches_focus(focus, binding) {
+            continue;
+        }
+        decision.identity_matches += 1;
+        if !binding.server.trim().is_empty()
+            && healthy_servers.iter().any(|id| id == &binding.server)
+        {
+            decision.healthy_matches += 1;
+            if decision.preferred.is_none() {
+                decision.preferred = Some(binding.server.clone());
+                decision.binding_index = Some(index);
+            }
+        }
+    }
+    if decision.preferred.is_some() {
+        decision.reason = MatchReason::Matched;
+    } else if decision.identity_matches > 0 {
+        decision.reason = MatchReason::ServerUnavailable;
+    }
+    decision
+}
+
+#[cfg(test)]
+fn resolve_preferred(
     focus: &FocusedApp,
     bindings: &[Binding],
     healthy_servers: &[String],
 ) -> Option<String> {
-    if focus.is_empty() {
-        return None;
-    }
-    for binding in bindings {
-        if !matches_focus(focus, binding) {
-            continue;
-        }
-        if healthy_servers.iter().any(|id| id == &binding.server) {
-            return Some(binding.server.clone());
-        }
-    }
-    None
+    explain_preferred(Some(focus), bindings, healthy_servers).preferred
 }
 
 fn matches_focus(focus: &FocusedApp, binding: &Binding) -> bool {
@@ -158,7 +214,7 @@ fn matches_focus(focus: &FocusedApp, binding: &Binding) -> bool {
         .filter(|s| !s.is_empty())
     {
         any = true;
-        if !eq_ignore_case(focus.executable.as_deref(), want) {
+        if focus.executable.as_deref() != Some(want) {
             return false;
         }
     }
@@ -180,6 +236,76 @@ pub fn companion_mode(preferred_mcp: Option<&str>, verb: Option<&str>) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_explain_precedence_and_health_fallback() {
+        let focus = FocusedApp {
+            wm_class: Some("Editor".into()),
+            ..FocusedApp::default()
+        };
+        let bindings: Vec<Binding> = serde_json::from_value(serde_json::json!([
+            {"server":"offline", "wm_class":"Editor"},
+            {"server":"first", "wm_class":"Editor"},
+            {"server":"second", "wm_class":"Editor"}
+        ]))
+        .unwrap();
+        let chosen = explain_preferred(Some(&focus), &bindings, &["second".into(), "first".into()]);
+        assert_eq!(chosen.preferred.as_deref(), Some("first"));
+        assert_eq!(chosen.binding_index, Some(1));
+        assert_eq!(chosen.identity_matches, 3);
+        assert_eq!(chosen.healthy_matches, 2);
+        assert_eq!(chosen.reason, MatchReason::Matched);
+        let fallback = explain_preferred(Some(&focus), &bindings, &["second".into()]);
+        assert_eq!(fallback.binding_index, Some(2));
+        assert_eq!(
+            explain_preferred(Some(&focus), &bindings, &[]).reason,
+            MatchReason::ServerUnavailable
+        );
+        assert_eq!(
+            explain_preferred(None, &bindings, &[]).reason,
+            MatchReason::FocusUnavailable
+        );
+        assert_eq!(
+            explain_preferred(Some(&focus), &[], &[]).reason,
+            MatchReason::NoBindings
+        );
+        let unrelated = FocusedApp {
+            wm_class: Some("Browser".into()),
+            ..FocusedApp::default()
+        };
+        assert_eq!(
+            explain_preferred(Some(&unrelated), &bindings, &[]).reason,
+            MatchReason::IdentityMismatch
+        );
+        // Only bounded counters/reason/index are serialized, not even server IDs.
+        assert_eq!(
+            serde_json::to_value(chosen).unwrap(),
+            serde_json::json!({
+                "reason":"matched", "binding_index":1, "identity_matches":3, "healthy_matches":2
+            })
+        );
+    }
+
+    #[test]
+    fn executable_match_is_exact_and_all_selectors_are_required() {
+        let binding: Binding = serde_json::from_value(serde_json::json!({
+            "server":"editor", "wm_class":"Editor", "executable":"/opt/Editor"
+        }))
+        .unwrap();
+        let mut focus = FocusedApp {
+            wm_class: Some("editor".into()),
+            executable: Some("/opt/editor".into()),
+            ..FocusedApp::default()
+        };
+        assert!(!matches_focus(&focus, &binding));
+        focus.executable = Some("/opt/Editor".into());
+        assert!(matches_focus(&focus, &binding));
+        focus.wm_class = None;
+        assert!(!matches_focus(&focus, &binding));
+        let empty: Binding =
+            serde_json::from_value(serde_json::json!({"server":"editor"})).unwrap();
+        assert!(!matches_focus(&focus, &empty));
+    }
 
     #[test]
     fn prefers_bound_healthy_server() {

@@ -12,7 +12,9 @@ mod stdio;
 
 pub use audit::{McpAuditRow, McpAuditor};
 #[allow(unused_imports)] // `load_bindings` stays public; the poll path uses `BindingCache`.
-pub use bindings::{companion_mode, load_bindings, resolve_preferred, BindingCache, FocusedApp};
+pub use bindings::{
+    companion_mode, explain_preferred, load_bindings, BindingCache, FocusedApp, MatchDecision,
+};
 pub use config::config_dir;
 pub use secret_fetch::fetch_secret_bytes;
 pub use stdio::{attach_profile, McpBundle, ToolInfo};

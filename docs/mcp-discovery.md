@@ -45,15 +45,44 @@ it does not import project config or require session profile membership.
 - `GET /session/{id}/mcp` reports attached servers, health, and tools.
 - `mcp-bindings.json` matches focused identity fields, not window titles, against
   attached healthy server IDs. The first matching healthy binding wins; all
-  populated selectors must match. Current comparisons are case-insensitive.
+  populated selectors must match. Class/app-ID comparisons retain case-insensitive compatibility. Executable
+  paths match exactly, including case; use the resolved absolute path.
 - X11 uses `WM_CLASS`; Wayland probes Hyprland, Sway, and KWin on a best-effort
-  basis. These are routing hints, not authenticated application identities.
+  basis. Hyprland and Sway resolve the reported positive PID through `/proc/<pid>/exe`
+  for the same user; missing, inaccessible, deleted, or foreign-user processes
+  contribute no executable. Titles and command lines are never executable
+  identities. These are routing hints, not authenticated application identities.
 - Bindings are cached with a one-second metadata refresh; focus has its own
-  short cache. Failure to find a healthy match retains desktop mode. Input
+  short cache. Expired focus is withheld while refreshing, so a stalled probe
+  cannot preserve a stale match. Failure to find a healthy match retains desktop mode. Input
   authorization and physical-user pause still apply.
 
-Issue #29 remains open for a reviewable discovery/provenance UI, stronger stable
-identity matching (including fixing Hyprland's legacy title-as-executable probe),
-match diagnostics, capability negotiation/pagination, tool-list refresh,
+Issue #29 remains open for a reviewable discovery/provenance UI, native stable
+identity coverage beyond the current Linux probes, capability negotiation/pagination, tool-list refresh,
 reconnect behavior, and native Windows/macOS discovery. This change establishes
 explicit project trust without claiming those discovery features are complete.
+
+## Match diagnostics
+
+`GET /companion` includes `session.mcp_match` alongside the existing `mcp`,
+`mode`, `prefer_mcp`, and `focused` fields. It does not attach or start servers.
+
+- `reason`: `focus_unavailable`, `no_bindings`, `identity_mismatch`,
+  `server_unavailable`, or `matched`.
+- `binding_index`: zero-based index in `mcp-bindings.json` of the winning binding,
+  present only for a match. Reorder bindings to set explicit precedence.
+- `identity_matches`: number of bindings matching every populated selector.
+- `healthy_matches`: number of those bindings naming an attached healthy server.
+  More than one exposes overlapping rules; the first healthy binding wins.
+
+`server_unavailable` means the identity matched but none of its servers is
+attached and healthy. `no_bindings` means no usable bindings were loaded; missing
+or malformed files currently both yield an empty set. `focus_unavailable` also
+covers an expired sample while its refresh is pending. Counters describe the
+current attachment health snapshot, not a new network probe, permanent app
+capability, or authorization. HTTP health currently means an attached client;
+liveness/reconnect checks remain follow-up work. Diagnostics
+contain no raw config, environment, headers, command arguments, or titles.
+
+Compositor field references: [Sway IPC](https://github.com/swaywm/sway/blob/master/sway/sway-ipc.7.scd)
+and [Hyprland JSON output](https://github.com/hyprwm/Hyprland/blob/v0.52.0/src/debug/HyprCtl.cpp).
