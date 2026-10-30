@@ -69,13 +69,11 @@ RUNTIME=$(mktemp -d "${TMPDIR:-/tmp}/hm-display.XXXXXX")
 CONFIG=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-config.XXXXXX")
 STATE=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-state.XXXXXX")
 DATA=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-data.XXXXXX")
-MCP_PROJECT=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-mcp.XXXXXX")
 HARNESS_RUNTIME_DIR=$RUNTIME
 HARNESS_CONFIG_DIR=$CONFIG
 HARNESS_STATE_DIR=$STATE
 HARNESS_DATA_DIR=$DATA
-HARNESS_MCP_DIR=$MCP_PROJECT
-HARNESS_ROOTS+=("$RUNTIME" "$CONFIG" "$STATE" "$DATA" "$MCP_PROJECT")
+HARNESS_ROOTS+=("$RUNTIME" "$CONFIG" "$STATE" "$DATA")
 if [[ -z ${XDG_RUNTIME_DIR:-} ]]; then
   HARNESS_XDG=$(mktemp -d "${TMPDIR:-/tmp}/hm-display-xdg.XXXXXX")
   export XDG_RUNTIME_DIR=$HARNESS_XDG
@@ -121,7 +119,8 @@ export HYPERMESH_RUNTIME_DIR=$RUNTIME
 export HYPERMESH_CONFIG_DIR=$CONFIG
 export HYPERMESH_STATE_DIR=$STATE
 export HYPERMESH_DATA_DIR=$DATA
-export HYPERMESH_MCP_PROJECT=$MCP_PROJECT
+# Project discovery is opt-in. Keep caller project configuration out of CI.
+unset HYPERMESH_MCP_PROJECT || true
 unset HYPERMESH_AUTOMATION_RESUME_SECS || true
 
 die() {
@@ -654,7 +653,6 @@ cleanup() {
     "${HARNESS_CONFIG_DIR:-}" \
     "${HARNESS_STATE_DIR:-}" \
     "${HARNESS_DATA_DIR:-}" \
-    "${HARNESS_MCP_DIR:-}" \
     "${HARNESS_XDG:-}"
   exit "$status"
 }

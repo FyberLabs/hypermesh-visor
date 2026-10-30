@@ -1,6 +1,7 @@
 # MCP configuration and trust
 
-Visor attaches a profile only when a session explicitly requests `mcp_profile`.
+Each session attaches its requested `mcp_profile`, or the active user profile
+when none is specified. Missing configuration yields no attached servers.
 Treat MCP configuration as executable configuration: a stdio entry starts a
 process with the configured arguments/environment, and an HTTP entry connects
 to its endpoint with configured headers. Review the complete file before use.
