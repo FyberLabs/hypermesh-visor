@@ -202,6 +202,7 @@ impl Default for Events {
 impl Events {
     fn next(&mut self, reader: &mut impl BufRead) -> Result<Option<Value>, McpError> {
         let mut payload = String::new();
+        let mut pending_id = None;
         let mut bytes = 0;
         loop {
             let mut line = Vec::new();
@@ -220,6 +221,9 @@ impl Events {
                 .map_err(|_| McpError::message("MCP invalid SSE UTF-8"))?
                 .trim_end_matches(['\r', '\n']);
             if line.is_empty() {
+                if let Some(id) = pending_id.take() {
+                    self.id = Some(id);
+                }
                 if payload.is_empty() {
                     bytes = 0;
                     continue;
@@ -245,7 +249,7 @@ impl Events {
                 if id.len() > 1024 || !id.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
                     return Err(McpError::message("MCP invalid SSE event id"));
                 }
-                self.id = Some(id.into());
+                pending_id = Some(id.to_string());
             }
         }
     }
@@ -261,7 +265,8 @@ fn subscribe(
         let mut ready = Some(ready_tx);
         let mut events = Events::default();
         while !changes.stopped.load(Ordering::Acquire) {
-            if let Some(id) = &events.id {
+            headers.remove("Last-Event-ID");
+            if let Some(id) = events.id.as_ref().filter(|id| !id.is_empty()) {
                 headers.insert("Last-Event-ID".into(), id.clone());
             }
             let resp = match request(&agent(), "GET", &url, &headers).call() {
@@ -531,6 +536,20 @@ mod tests {
             .is_none());
         assert_eq!(events.id.as_deref(), Some("event-1"));
         assert_eq!(events.retry_ms, 2500);
+        assert!(events
+            .next(&mut std::io::Cursor::new("id: incomplete\ndata: {"))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            events.id.as_deref(),
+            Some("event-1"),
+            "incomplete events must not advance resumption"
+        );
+        assert!(events
+            .next(&mut std::io::Cursor::new("id:\n\n"))
+            .unwrap()
+            .is_none());
+        assert_eq!(events.id.as_deref(), Some(""));
         let oversized = format!("data: {}", "x".repeat(8 * 1024 * 1024));
         assert!(Events::default()
             .next(&mut std::io::Cursor::new(oversized))
