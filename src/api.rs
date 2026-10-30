@@ -1042,7 +1042,7 @@ async fn open_session(
         .map_err(|_| ApiError::internal("vault open task failed"))?
         .map_err(ApiError::from_vault)?;
     let grant_id = approved.as_ref().map(|g| g.id);
-    let profile = req.mcp_profile.clone();
+    let profile = profile_name.clone();
     let mcp = tokio::task::spawn_blocking(move || {
         if let Some(grant) = approved {
             let mut bundle = mcp::attach_specs(grant.resolution.profile, grant.resolution.servers)?;
@@ -1050,7 +1050,7 @@ async fn open_session(
             bundle.trust_review = Some(grant.id);
             Ok(bundle)
         } else {
-            mcp::attach_profile(&mcp_dir, profile.as_deref())
+            mcp::attach_profile(&mcp_dir, Some(&profile))
         }
     })
     .await
@@ -3277,6 +3277,67 @@ mod tests {
             status,
             serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
         )
+    }
+
+    #[tokio::test]
+    async fn mcp_trust_uses_the_profile_checked_before_a_slow_vault_fetch() {
+        let dir = std::env::temp_dir().join(format!("hm-trust-race-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = r#"
+import sys,json,pathlib,time
+p=pathlib.Path(sys.argv[1])
+for line in sys.stdin:
+ m=json.loads(line)
+ if 'id' not in m: continue
+ if m['method']=='initialize': result={'protocolVersion':'2025-11-25','capabilities':{'tools':{}}}
+ elif m['method']=='tools/list': result={'tools':[{'name':'secret'}]}
+ elif m['method']=='tools/call':
+  (p/'waiting').touch()
+  while not (p/'release').exists(): time.sleep(.01)
+  result={'content':[{'type':'text','text':'fixture-secret'}]}
+ print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+"#;
+        std::fs::write(dir.join("mcp.json"),serde_json::json!({"mcpServers":{"vault":{"command":"python3","args":["-u","-c",script,dir]},"forbidden":{"command":"must-not-run"}}}).to_string()).unwrap();
+        let mut profiles = serde_json::json!({"active":"a","profiles":{"a":{"servers":[]},"b":{"servers":["forbidden"]}}});
+        std::fs::write(dir.join("mcp-profiles.json"), profiles.to_string()).unwrap();
+        let mut state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        state.mcp_dir = dir.clone();
+        let state = Arc::new(state);
+        let review = mcp::trust::inspect(&dir, Some("b"), None).unwrap();
+        let id = lock(&state.mcp_trust).stage(review).unwrap().review_id;
+        lock(&state.mcp_trust).approve(id).unwrap();
+        lock(&state.mcp_trust).revoke("b");
+        let mut body: serde_json::Value =
+            serde_json::from_str(&session_body("trust-race")).unwrap();
+        body["secrets"] =
+            serde_json::json!([{"name":"token","source":"mcp","locator":"vault/secret"}]);
+        let app = router(Arc::clone(&state));
+        let open =
+            tokio::spawn(async move { trust_test_request(app, "POST", "/session", body).await });
+        let start = Instant::now();
+        while !dir.join("waiting").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "vault never reached wait"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        profiles["active"] = serde_json::json!("b");
+        std::fs::write(dir.join("mcp-profiles.json"), profiles.to_string()).unwrap();
+        std::fs::write(dir.join("release"), "").unwrap();
+        let (status, opened) = open.await.unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{opened}");
+        assert_eq!(opened["mcp_profile"], "a");
+        assert_eq!(opened["mcp_servers"], serde_json::json!([]));
+        let id = opened["id"].as_str().unwrap();
+        trust_test_request(
+            router(state),
+            "DELETE",
+            &format!("/session/{id}"),
+            serde_json::json!({}),
+        )
+        .await;
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
