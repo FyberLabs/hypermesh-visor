@@ -31,6 +31,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal
 tokio-stream = "0.1"
 tower = { version = "0.5", features = ["util"] }
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
+url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 x11rb = { version = "0.13", features = ["xtest"] }
 zbus = "4.4"

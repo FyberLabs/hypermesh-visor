@@ -48,6 +48,7 @@ pub struct AppState {
     /// Directory for mcp.json / mcp-profiles.json. Defaults to the Hypermesh config dir.
     mcp_dir: PathBuf,
     mcp_audit: Mutex<McpAuditor>,
+    mcp_trust: Mutex<mcp::trust::TrustStore>,
     /// Latest view/watch frame per session. The feed serves this cache.
     /// It does not call `Desktop::view` again.
     frames: Mutex<HashMap<Uuid, CachedFrame>>,
@@ -162,6 +163,7 @@ impl AppState {
             prompts,
             mcp_dir,
             mcp_audit: Mutex::new(McpAuditor::default()),
+            mcp_trust: Mutex::new(mcp::trust::TrustStore::default()),
             frames: Mutex::new(HashMap::new()),
             automation: Mutex::new(gate),
             injection: Mutex::new(()),
@@ -615,6 +617,8 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .route("/prompt", post(submit_prompt))
         .route("/audit", get(list_audit))
         .route("/mcp-audit", get(list_mcp_audit))
+        .route("/mcp/discovery", post(mcp_discovery))
+        .route("/mcp/trust", get(mcp_trusted).post(mcp_trust_decision))
         .route("/session/:id/stream", post(session_stream))
         .route("/session/:id/inbox", get(session_inbox))
         .route("/session/:id/mcp", get(session_mcp))
@@ -622,6 +626,105 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .route("/session/:id/mcp/refresh", post(mcp_refresh))
         .layer(Extension(CompanionLink(from_companion)))
         .with_state(state)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct McpDiscoveryRequest {
+    profile: Option<String>,
+    project_path: Option<String>,
+}
+
+async fn mcp_discovery(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+    Json(body): Json<McpDiscoveryRequest>,
+) -> Result<Json<mcp::trust::Preview>, ApiError> {
+    if !link.0 {
+        return Err(ApiError::forbidden(
+            "MCP trust requires the local companion socket",
+        ));
+    }
+    if body.profile.as_ref().is_some_and(|s| s.len() > 512)
+        || body.project_path.as_ref().is_some_and(|s| s.len() > 4096)
+    {
+        return Err(ApiError::bad("MCP selection too long"));
+    }
+    tokio::task::spawn_blocking(move || {
+        let review = mcp::trust::inspect(
+            &state.mcp_dir,
+            body.profile.as_deref(),
+            body.project_path.as_deref(),
+        )
+        .map_err(ApiError::from_mcp)?;
+        lock(&state.mcp_trust)
+            .stage(review)
+            .map(Json)
+            .map_err(ApiError::from_mcp)
+    })
+    .await
+    .map_err(|_| ApiError::internal("MCP discovery task failed"))?
+}
+
+async fn mcp_trusted(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+) -> Result<Json<Vec<mcp::trust::TrustedProfile>>, ApiError> {
+    if !link.0 {
+        return Err(ApiError::forbidden(
+            "MCP trust requires the local companion socket",
+        ));
+    }
+    Ok(Json(lock(&state.mcp_trust).list()))
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+enum McpTrustDecision {
+    Approve { review_id: Uuid },
+    Cancel { review_id: Uuid },
+    Revoke { profile: String },
+}
+async fn mcp_trust_decision(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+    Json(body): Json<McpTrustDecision>,
+) -> Result<StatusCode, ApiError> {
+    if !link.0 {
+        return Err(ApiError::forbidden(
+            "MCP trust requires the local companion socket",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        let (profile, decision) = match body {
+            McpTrustDecision::Approve { review_id } => (
+                lock(&state.mcp_trust).approve(review_id).map_err(|_| {
+                    ApiError::conflict("MCP review expired, changed, or unavailable; review again")
+                })?,
+                "approve",
+            ),
+            McpTrustDecision::Cancel { review_id } => {
+                lock(&state.mcp_trust).cancel(review_id);
+                (String::new(), "cancel")
+            }
+            McpTrustDecision::Revoke { profile } => {
+                if profile.len() > 512 {
+                    return Err(ApiError::bad("MCP profile too long"));
+                }
+                lock(&state.mcp_trust).revoke(&profile);
+                (profile, "revoke")
+            }
+        };
+        lock(&state.mcp_audit).record(McpAuditRow {
+            server: profile,
+            tool: "@trust".into(),
+            decision: decision.into(),
+            outcome: "ok".into(),
+        });
+        Ok(StatusCode::NO_CONTENT)
+    })
+    .await
+    .map_err(|_| ApiError::internal("MCP trust task failed"))?
 }
 
 /// Reports implementation support without capturing a screen, opening audio,
@@ -851,6 +954,8 @@ struct OpenedSession {
 struct SessionMcpBody {
     profile: String,
     servers: Vec<SessionMcpServer>,
+    provenance: Vec<mcp::trust::Provenance>,
+    trust_review: Option<Uuid>,
 }
 
 #[derive(Serialize)]
@@ -907,6 +1012,27 @@ async fn open_session(
     {
         return Err(ApiError::bad("mcp profile is too long"));
     }
+    let profile_name = req.mcp_profile.clone();
+    let lookup_dir = state.mcp_dir.clone();
+    let profile_name =
+        tokio::task::spawn_blocking(
+            move || match profile_name.filter(|s| !s.trim().is_empty()) {
+                Some(name) => Ok(name.trim().to_string()),
+                None => mcp::active_profile(&lookup_dir),
+            },
+        )
+        .await
+        .map_err(|_| ApiError::internal("MCP profile lookup failed"))?
+        .map_err(ApiError::from_mcp)?;
+    let approved = {
+        let trust = lock(&state.mcp_trust);
+        if trust.is_revoked(&profile_name) {
+            return Err(ApiError::forbidden(
+                "MCP profile trust revoked; review again",
+            ));
+        }
+        trust.approved(&profile_name)
+    };
     let mcp_dir = state.mcp_dir.clone();
     let vault_dir = mcp_dir.clone();
     let secrets = req.secrets;
@@ -915,12 +1041,21 @@ async fn open_session(
         .await
         .map_err(|_| ApiError::internal("vault open task failed"))?
         .map_err(ApiError::from_vault)?;
+    let grant_id = approved.as_ref().map(|g| g.id);
     let profile = req.mcp_profile.clone();
-    let mcp =
-        tokio::task::spawn_blocking(move || mcp::attach_profile(&mcp_dir, profile.as_deref()))
-            .await
-            .map_err(|_| ApiError::internal("mcp attach task failed"))?
-            .map_err(ApiError::from_mcp)?;
+    let mcp = tokio::task::spawn_blocking(move || {
+        if let Some(grant) = approved {
+            let mut bundle = mcp::attach_specs(grant.resolution.profile, grant.resolution.servers)?;
+            bundle.provenance = grant.resolution.provenance;
+            bundle.trust_review = Some(grant.id);
+            Ok(bundle)
+        } else {
+            mcp::attach_profile(&mcp_dir, profile.as_deref())
+        }
+    })
+    .await
+    .map_err(|_| ApiError::internal("mcp attach task failed"))?
+    .map_err(ApiError::from_mcp)?;
     let id = Uuid::new_v4();
     let opened = OpenedSession {
         id,
@@ -931,7 +1066,17 @@ async fn open_session(
         mcp_profile: mcp.profile.clone(),
         mcp_servers: mcp.server_names(),
     };
-    lock(&state.sessions).insert(id, Session::create(id, harness, vault, mcp));
+    {
+        let trust = lock(&state.mcp_trust);
+        if trust.is_revoked(&profile_name)
+            || trust.approved(&profile_name).map(|g| g.id) != grant_id
+        {
+            return Err(ApiError::conflict(
+                "MCP trust changed during attachment; open the session again",
+            ));
+        }
+        lock(&state.sessions).insert(id, Session::create(id, harness, vault, mcp));
+    }
     spawn_mcp_watch(&state, id);
     Ok((StatusCode::CREATED, Json(opened)))
 }
@@ -957,6 +1102,8 @@ async fn session_mcp(
         .collect();
     Ok(Json(SessionMcpBody {
         profile: session.mcp().profile.clone(),
+        provenance: session.mcp().provenance.clone(),
+        trust_review: session.mcp().trust_review,
         servers,
     }))
 }
@@ -3107,6 +3254,171 @@ mod tests {
         assert!(body.len() < 64 * 1024, "poll is {} bytes", body.len());
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["session"]["purpose"], purpose);
+    }
+
+    async fn trust_test_request(
+        app: Router,
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer fixture-token")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn mcp_trust_is_companion_only_and_snapshots_gate_future_sessions() {
+        let dir = std::env::temp_dir().join(format!("hm-trust-api-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let marker = dir.join("started");
+        let script = r#"
+import sys,json,pathlib
+pathlib.Path(sys.argv[1]).touch()
+for line in sys.stdin:
+ m=json.loads(line)
+ if m.get('method')=='initialize': print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{'protocolVersion':'2025-11-25','capabilities':{}}}),flush=True)
+"#;
+        let project = dir.join("project.json");
+        std::fs::write(&project,serde_json::json!({"mcpServers":{"new":{"command":"python3","args":["-u","-c",script,marker]}}}).to_string()).unwrap();
+        std::fs::write(
+            dir.join("mcp-profiles.json"),
+            r#"{"profiles":{"default":{"servers":["new"]}}}"#,
+        )
+        .unwrap();
+        let mut state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        state.mcp_dir = dir.clone();
+        let state = Arc::new(state);
+        let selection = serde_json::json!({"project_path":project});
+        for app in [
+            router(Arc::clone(&state)),
+            tcp_router(Arc::clone(&state), "fixture-token".into()),
+        ] {
+            assert_eq!(
+                trust_test_request(app.clone(), "POST", "/mcp/discovery", selection.clone())
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                trust_test_request(app.clone(), "GET", "/mcp/trust", serde_json::json!({}))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                trust_test_request(
+                    app,
+                    "POST",
+                    "/mcp/trust",
+                    serde_json::json!({"action":"revoke","profile":"default"})
+                )
+                .await
+                .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        let app = companion_router(Arc::clone(&state));
+        let (status, preview) =
+            trust_test_request(app.clone(), "POST", "/mcp/discovery", selection).await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        assert!(!marker.exists());
+        assert_eq!(preview["servers"][0]["source"], "selected_project");
+        let body: serde_json::Value = serde_json::from_str(&session_body("trust-test")).unwrap();
+        assert_eq!(
+            trust_test_request(router(Arc::clone(&state)), "POST", "/session", body.clone())
+                .await
+                .0,
+            StatusCode::BAD_GATEWAY
+        );
+        let approval = serde_json::json!({"action":"approve","review_id":preview["review_id"]});
+        let mut tampered = approval.clone();
+        tampered["command"] = serde_json::json!("must-not-run");
+        assert_eq!(trust_test_request(app.clone(), "POST", "/mcp/trust", tampered).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            trust_test_request(app.clone(), "POST", "/mcp/trust", approval.clone())
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert!(!marker.exists(), "approval must not start a server");
+        assert_eq!(
+            trust_test_request(app.clone(), "POST", "/mcp/trust", approval)
+                .await
+                .0,
+            StatusCode::CONFLICT
+        );
+        std::fs::write(
+            &project,
+            r#"{"mcpServers":{"new":{"command":"must-not-run-changed-config"}}}"#,
+        )
+        .unwrap();
+        let (status, opened) =
+            trust_test_request(router(Arc::clone(&state)), "POST", "/session", body.clone()).await;
+        assert_eq!(status, StatusCode::CREATED, "{opened}");
+        assert!(marker.exists());
+        let id = opened["id"].as_str().unwrap();
+        let (_, snapshot) = trust_test_request(
+            app.clone(),
+            "GET",
+            &format!("/session/{id}/mcp"),
+            serde_json::json!({}),
+        )
+        .await;
+        assert_eq!(snapshot["trust_review"], preview["review_id"]);
+        assert_eq!(snapshot["provenance"][0]["command"], "python3");
+        assert_eq!(
+            trust_test_request(
+                app.clone(),
+                "POST",
+                "/mcp/trust",
+                serde_json::json!({"action":"revoke","profile":"default"})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            trust_test_request(router(Arc::clone(&state)), "POST", "/session", body)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            trust_test_request(
+                app.clone(),
+                "GET",
+                &format!("/session/{id}/mcp"),
+                serde_json::json!({})
+            )
+            .await
+            .0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            trust_test_request(
+                app,
+                "DELETE",
+                &format!("/session/{id}"),
+                serde_json::json!({})
+            )
+            .await
+            .0,
+            StatusCode::NO_CONTENT
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

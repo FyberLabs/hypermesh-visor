@@ -117,46 +117,138 @@ pub fn load_named_server(dir: &Path, id: &str) -> Result<ServerSpec, McpError> {
 /// Load enabled servers for `profile_name` (or the active profile when empty).
 /// Missing config files yield an empty map (no attach).
 /// Project config is imported only through an explicit HYPERMESH_MCP_PROJECT selection.
-pub fn load_profile_servers(
+pub fn load_profile_resolution(
+    dir: &Path,
+    profile_name: Option<&str>,
+) -> Result<Resolution, McpError> {
+    let project = selected_project_path(std::env::var_os("HYPERMESH_MCP_PROJECT"))?;
+    resolve_profile_from(dir, profile_name, project.as_deref())
+}
+
+#[cfg(test)]
+fn load_profile_servers(
     dir: &Path,
     profile_name: Option<&str>,
 ) -> Result<(String, BTreeMap<String, ServerSpec>), McpError> {
-    let project = selected_project_path(std::env::var_os("HYPERMESH_MCP_PROJECT"))?;
-    load_profile_servers_from(dir, profile_name, project.as_deref())
+    let resolved = load_profile_resolution(dir, profile_name)?;
+    Ok((resolved.profile, resolved.servers))
 }
-
+#[cfg(test)]
 fn load_profile_servers_from(
     dir: &Path,
     profile_name: Option<&str>,
     project: Option<&Path>,
 ) -> Result<(String, BTreeMap<String, ServerSpec>), McpError> {
+    let resolved = resolve_profile_from(dir, profile_name, project)?;
+    Ok((resolved.profile, resolved.servers))
+}
+fn resolve_profile_from(
+    dir: &Path,
+    profile_name: Option<&str>,
+    project: Option<&Path>,
+) -> Result<Resolution, McpError> {
     let servers_path = dir.join("mcp.json");
     let profiles_path = dir.join("mcp-profiles.json");
     if !servers_path.exists() && !profiles_path.exists() && project.is_none() {
         let name = profile_name.unwrap_or("default").to_string();
-        return Ok((name, BTreeMap::new()));
+        return Ok(Resolution {
+            profile: name,
+            servers: BTreeMap::new(),
+            provenance: Vec::new(),
+        });
     }
-    let mut servers = read_servers(&servers_path)?;
-    if let Some(project) = project {
-        let project_servers = read_servers_required(project)?;
-        for (id, spec) in project_servers.servers {
-            servers.servers.entry(id).or_insert(spec);
-        }
-    }
+    let user = read_servers(&servers_path)?;
+    let selected = project.map(read_servers_required).transpose()?;
     let profiles = read_profiles(&profiles_path)?;
-    let name = profile_name
+    let resolved = resolve(dir, profile_name, project, user, selected, profiles)?;
+    Ok(resolved)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Provenance {
+    pub name: String,
+    pub source: String,
+    pub path: String,
+    pub status: String,
+    pub transport: String,
+    pub enabled: bool,
+    pub cwd: Option<String>,
+    pub command: Option<String>,
+    pub argument_count: usize,
+    pub environment_names: Vec<String>,
+    pub header_names: Vec<String>,
+    pub endpoint: Option<String>,
+    pub overrides: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct Resolution {
+    pub profile: String,
+    pub servers: BTreeMap<String, ServerSpec>,
+    pub provenance: Vec<Provenance>,
+}
+
+pub(super) fn resolve_bytes(
+    dir: &Path,
+    profile: Option<&str>,
+    project: Option<&Path>,
+    user: Option<&str>,
+    selected: Option<&str>,
+    profiles: Option<&str>,
+) -> Result<Resolution, McpError> {
+    let user = serde_json::from_str(user.unwrap_or(r#"{"mcpServers":{}}"#))
+        .map_err(|_| McpError::message("Invalid user MCP configuration"))?;
+    let selected = selected
+        .map(serde_json::from_str)
+        .transpose()
+        .map_err(|_| McpError::message("Invalid selected MCP configuration"))?;
+    let profiles = serde_json::from_str(profiles.unwrap_or(r#"{"profiles":{"default":{}}}"#))
+        .map_err(|_| McpError::message("Invalid MCP profiles configuration"))?;
+    resolve(dir, profile, project, user, selected, profiles)
+}
+
+fn resolve(
+    dir: &Path,
+    requested: Option<&str>,
+    project: Option<&Path>,
+    user: ServersFile,
+    selected: Option<ServersFile>,
+    profiles: ProfilesFile,
+) -> Result<Resolution, McpError> {
+    let name = requested
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(profiles.active.as_str())
+        .unwrap_or(&profiles.active)
         .to_string();
     let profile = profiles
         .profiles
         .get(&name)
-        .ok_or_else(|| McpError::message(format!("mcp profile \"{name}\" not found")))?;
-
-    if profile.gateway {
-        let id = "docker-gateway";
-        let mut spec = servers.servers.get(id).cloned().unwrap_or(ServerSpec {
+        .ok_or_else(|| McpError::message("MCP profile not found"))?;
+    let mut candidates = Vec::new();
+    let mut winners = BTreeMap::new();
+    for (source, path, entries) in [
+        ("user", dir.join("mcp.json"), user.servers),
+        (
+            "selected_project",
+            project.unwrap_or(Path::new("")).to_path_buf(),
+            selected.map(|s| s.servers).unwrap_or_default(),
+        ),
+    ] {
+        for (id, spec) in entries {
+            let shadowed = winners.contains_key(&id);
+            if !shadowed {
+                winners.insert(id.clone(), spec.clone());
+            }
+            candidates.push((id, spec, source, path.clone(), shadowed));
+        }
+    }
+    let ids = if profile.gateway {
+        vec!["docker-gateway".to_string()]
+    } else {
+        profile.servers.clone()
+    };
+    if profile.gateway && !winners.contains_key("docker-gateway") {
+        let spec = ServerSpec {
             r#type: Some("stdio".into()),
             command: Some("docker".into()),
             args: vec!["mcp".into(), "gateway".into(), "run".into()],
@@ -165,38 +257,88 @@ fn load_profile_servers_from(
             headers: BTreeMap::new(),
             cwd: None,
             enabled: Some(true),
-        });
-        if let Some(cfg) = profile.config.get(id) {
-            apply_config(&mut spec, cfg);
-        }
-        let mut out = BTreeMap::new();
-        if spec.is_enabled() {
-            out.insert(id.to_string(), spec);
-        }
-        return Ok((name, out));
-    }
-
-    let mut out = BTreeMap::new();
-    for id in &profile.servers {
-        let Some(mut spec) = servers.servers.get(id).cloned() else {
-            return Err(McpError::message(format!(
-                "mcp profile \"{name}\" names unknown server \"{id}\""
-            )));
         };
+        winners.insert("docker-gateway".into(), spec.clone());
+        candidates.push((
+            "docker-gateway".into(),
+            spec,
+            "gateway_default",
+            dir.join("mcp-profiles.json"),
+            false,
+        ));
+    }
+    let mut servers = BTreeMap::new();
+    for id in &ids {
+        let mut spec = winners
+            .get(id)
+            .cloned()
+            .ok_or_else(|| McpError::message("MCP profile names unknown server"))?;
         if let Some(cfg) = profile.config.get(id) {
             apply_config(&mut spec, cfg);
         }
-        if !spec.is_enabled() {
-            continue;
+        if spec.is_enabled() {
+            servers.insert(id.clone(), spec);
         }
-        out.insert(id.clone(), spec);
     }
-    Ok((name, out))
+    let provenance = candidates
+        .into_iter()
+        .map(|(id, mut spec, source, path, shadowed)| {
+            let selected = ids.contains(&id);
+            let overrides = if !shadowed && selected {
+                if let Some(cfg) = profile.config.get(&id) {
+                    apply_config(&mut spec, cfg);
+                    cfg.keys().cloned().collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            };
+            let status = if shadowed {
+                "shadowed"
+            } else if !selected {
+                "not_in_profile"
+            } else if !spec.is_enabled() {
+                "disabled"
+            } else {
+                "selected"
+            };
+            let endpoint = spec
+                .url
+                .as_deref()
+                .and_then(|v| url::Url::parse(v).ok())
+                .map(|u| u.origin().ascii_serialization());
+            Provenance {
+                name: id,
+                source: source.into(),
+                path: path.to_string_lossy().into_owned(),
+                status: status.into(),
+                transport: spec.transport().into(),
+                enabled: spec.is_enabled(),
+                cwd: spec.cwd,
+                command: spec.command,
+                argument_count: spec.args.len(),
+                environment_names: spec.env.keys().cloned().collect(),
+                header_names: spec.headers.keys().cloned().collect(),
+                endpoint,
+                overrides,
+            }
+        })
+        .collect();
+    Ok(Resolution {
+        profile: name,
+        servers,
+        provenance,
+    })
+}
+
+pub fn active_profile(dir: &Path) -> Result<String, McpError> {
+    Ok(read_profiles(&dir.join("mcp-profiles.json"))?.active)
 }
 
 /// An explicit selection authorizes loading commands from this file. Never scan
 /// cwd or parent directories: opening a project is not permission to run its MCP.
-fn selected_project_path(
+pub(super) fn selected_project_path(
     explicit: Option<std::ffi::OsString>,
 ) -> Result<Option<PathBuf>, McpError> {
     let Some(explicit) = explicit else {

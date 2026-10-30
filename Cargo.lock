@@ -837,6 +837,7 @@ dependencies = [
  "tokio-stream",
  "tower",
  "ureq",
+ "url",
  "uuid",
  "x11rb",
  "zbus",

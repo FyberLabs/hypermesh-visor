@@ -732,6 +732,15 @@ fn on_click(
                 *app.status.lock().unwrap() = err;
             }
         }
+        Action::McpTrust => {
+            app.menu = false;
+            let result = std::env::current_exe().and_then(|exe| {
+                open_terminal_command(&[exe.to_string_lossy().into_owned(), "--mcp-trust".into()])
+            });
+            if let Err(err) = result {
+                *app.status.lock().unwrap() = err.to_string();
+            }
+        }
         Action::McpProfiles => {
             app.menu = false;
             if let Err(err) = open_hypermesh_args(&["mcp", "profile", "ls"]) {
@@ -809,7 +818,11 @@ fn open_hypermesh_args(extra: &[&str]) -> std::io::Result<()> {
     for a in extra {
         cmd.push((*a).to_string());
     }
-    let joined = shell_join(&cmd);
+    open_terminal_command(&cmd)
+}
+
+fn open_terminal_command(cmd: &[String]) -> std::io::Result<()> {
+    let joined = shell_join(cmd);
     let terminals: &[(&str, Vec<String>)] = &[
         (
             "x-terminal-emulator",

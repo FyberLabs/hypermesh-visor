@@ -6,7 +6,7 @@ use std::sync::{atomic::Ordering, mpsc, Arc, Mutex};
 
 use serde_json::{json, Value};
 
-use super::config::{load_profile_servers, ServerSpec};
+use super::config::{load_profile_resolution, ServerSpec};
 use super::http::{self, HttpClient};
 use super::McpError;
 
@@ -317,6 +317,8 @@ impl AttachedServer {
 pub struct McpBundle {
     pub profile: String,
     pub servers: Vec<AttachedServer>,
+    pub provenance: Vec<super::config::Provenance>,
+    pub trust_review: Option<uuid::Uuid>,
 }
 
 impl McpBundle {
@@ -388,18 +390,32 @@ impl McpBundle {
 /// Attach every enabled server in the profile. HTTP/SSE is recorded as
 /// not-yet-connected; stdio is spawned and tools/list is called.
 pub fn attach_profile(dir: &Path, profile_name: Option<&str>) -> Result<McpBundle, McpError> {
-    let (profile, specs) = load_profile_servers(dir, profile_name)?;
+    let resolved = load_profile_resolution(dir, profile_name)?;
+    let mut bundle = attach_specs(resolved.profile, resolved.servers)?;
+    bundle.provenance = resolved.provenance;
+    Ok(bundle)
+}
+
+pub fn attach_specs(
+    profile: String,
+    specs: std::collections::BTreeMap<String, ServerSpec>,
+) -> Result<McpBundle, McpError> {
     if specs.is_empty() {
         return Ok(McpBundle {
             profile,
             servers: Vec::new(),
+            ..Default::default()
         });
     }
     let mut servers = Vec::new();
     for (name, spec) in specs {
         servers.push(attach_one(&name, &spec)?);
     }
-    Ok(McpBundle { profile, servers })
+    Ok(McpBundle {
+        profile,
+        servers,
+        ..Default::default()
+    })
 }
 
 pub(crate) fn attach_one_server(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpError> {
@@ -645,6 +661,7 @@ while True:
         Ok(McpBundle {
             profile: profile.into(),
             servers,
+            ..Default::default()
         })
     }
 
@@ -820,6 +837,7 @@ for line in sys.stdin:
         let mut bundle = McpBundle {
             profile: "default".into(),
             servers: vec![server],
+            ..Default::default()
         };
         let owned = bundle.take_for_refresh("fixture").unwrap();
         assert!(bundle.take_for_refresh("fixture").is_err());
