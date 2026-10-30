@@ -575,6 +575,40 @@ mod tests {
     }
 
     #[test]
+    fn additional_editor_receipts_restore_provenance_and_pin_full_source() {
+        for (kind, raw) in [
+            (
+                "zed_user",
+                r#"{"theme":"reviewed","context_servers":{"new":{"command":"never-run"}}}"#,
+            ),
+            (
+                "devin_user",
+                r#"{/*reviewed*/"mcpServers":{"new":{"url":"https://example.com/mcp","transport":"http"}}}"#,
+            ),
+        ] {
+            let dir = fixture();
+            let path = dir.join("editor.json");
+            std::fs::write(&path, raw).unwrap();
+            let mut review = inspect(&dir, Some("default"), path.to_str()).unwrap();
+            review.source_kind = kind.into();
+            let mut first = TrustStore::default();
+            first.sync(&dir).unwrap();
+            let id = first.stage(review).unwrap().review_id;
+            first.approve(id).unwrap();
+            let mut restarted = TrustStore::default();
+            restarted.sync(&dir).unwrap();
+            let grant = restarted.approved("default").unwrap();
+            assert_eq!(grant.id, id);
+            assert!(grant.resolution.provenance.iter().any(|p| p.source == kind));
+            std::fs::write(&path, raw.replace("reviewed", "edited")).unwrap();
+            let mut changed = TrustStore::default();
+            changed.sync(&dir).unwrap();
+            assert_eq!(changed.list()[0].status, "needs_review");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
     fn changed_sources_require_review_after_restart_and_updates_do_not_clobber() {
         let dir = fixture();
         let mut first = TrustStore::default();
