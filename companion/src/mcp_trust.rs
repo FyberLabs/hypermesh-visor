@@ -58,18 +58,19 @@ fn screen(
     out: &mut impl Write,
     mut request: impl FnMut(&str, Option<Value>) -> Result<Value, String>,
 ) -> Result<(), String> {
-    writeln!(out,"MCP discovery and trust\nReview sources without starting servers. Approval lasts until this visor daemon stops.\nExisting sessions keep their attachments; close them to stop a previously trusted server.").map_err(|_| "Terminal output failed")?;
+    writeln!(out,"MCP discovery and trust\nReview sources without starting servers. Approvals and revocations persist across visor restarts; changed source files require review.\nExisting sessions keep their attachments; close them to stop a previously trusted server.").map_err(|_| "Terminal output failed")?;
     loop {
         let grants = request("/mcp/trust", None)?;
-        writeln!(out, "\nTrusted snapshots:").map_err(|_| "Terminal output failed")?;
+        writeln!(out, "\nTrust decisions:").map_err(|_| "Terminal output failed")?;
         for grant in grants
             .as_array()
             .ok_or("Invalid trusted-profile response")?
         {
             writeln!(
                 out,
-                "  {} ({} servers)",
+                "  {} — {} ({} servers)",
                 text(&grant["profile"]),
+                text(&grant["status"]),
                 text(&grant["server_count"])
             )
             .map_err(|_| "Terminal output failed")?;
@@ -118,11 +119,36 @@ fn screen(
                 else {
                     return Ok(());
                 };
-                let Some(path) = input(reader,out,"Selected MCP file/directory, absolute path (blank uses daemon configuration): ")? else { return Ok(()); };
+                let sources = request("/mcp/sources", None)?;
+                writeln!(out, "Available source locations (not yet trusted):")
+                    .map_err(|_| "Terminal output failed")?;
+                for source in sources.as_array().ok_or("Invalid sources response")? {
+                    writeln!(
+                        out,
+                        "  {}: {} [{}]",
+                        text(&source["id"]),
+                        text(&source["path"]),
+                        text(&source["status"])
+                    )
+                    .map_err(|_| "Terminal output failed")?;
+                }
+                let Some(path) = input(
+                    reader,
+                    out,
+                    "Source ID or absolute MCP file/directory (blank uses daemon configuration): ",
+                )?
+                else {
+                    return Ok(());
+                };
+                let source_id = if sources.as_array().unwrap().iter().any(|v| v["id"] == path) {
+                    Some(path.clone())
+                } else {
+                    None
+                };
                 let preview = request(
                     "/mcp/discovery",
                     Some(
-                        json!({"profile":if profile.is_empty(){None}else{Some(profile)},"project_path":if path.is_empty(){None}else{Some(path)}}),
+                        json!({"profile":if profile.is_empty(){None}else{Some(profile)},"source_id":source_id,"project_path":if path.is_empty() || source_id.is_some(){None}else{Some(path)}}),
                     ),
                 )?;
                 let id = preview
@@ -138,7 +164,7 @@ fn screen(
                 );
                 result?;
                 decision?;
-                writeln!(out,"{}",if approve {"Approved snapshot for future sessions using this profile. Config changes require another review."} else {"Cancelled. No trust change and no server started."}).map_err(|_| "Terminal output failed")?;
+                writeln!(out,"{}",if approve {"Approved snapshot for future sessions using this profile. The approval survives restart while source contents match. Revocation also persists."} else {"Cancelled. No trust change and no server started."}).map_err(|_| "Terminal output failed")?;
             }
             _ => {
                 writeln!(out, "Choose r, v, or q.").map_err(|_| "Terminal output failed")?;
@@ -191,6 +217,23 @@ mod tests {
             assert!(!calls.iter().flatten().any(|c| c["action"] == "approve"));
             assert!(!output.contains(&0x1b));
         }
+    }
+    #[test]
+    fn known_source_selection_and_blocked_status_are_visible() {
+        let mut selection = None;
+        let mut output = Vec::new();
+        screen(&mut io::Cursor::new("r\ndefault\nvscode_user\nTRUST\nq\n"), &mut output, |path, body| {
+            if path == "/mcp/discovery" {
+                selection = body;
+                return Ok(json!({"review_id":"opaque","profile":"default","servers":[]}));
+            }
+            if path == "/mcp/sources" {
+                return Ok(json!([{"id":"vscode_user","path":"/config/Code/User/mcp.json","status":"available_for_review"}]));
+            }
+            Ok(if body.is_none() {json!([{"profile":"default","status":"needs_review","server_count":0}])} else {json!({})})
+        }).unwrap();
+        assert_eq!(selection.unwrap()["source_id"], "vscode_user");
+        assert!(String::from_utf8(output).unwrap().contains("needs_review"));
     }
     #[test]
     fn explicit_confirmation_submits_only_the_review_id() {

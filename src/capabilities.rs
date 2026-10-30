@@ -47,6 +47,8 @@ pub(crate) fn describe(backend: &str) -> Value {
             "tcp_requires_bearer": true
         },
         "mcp": {
+            "discovery_sources": "/mcp/sources",
+            "persistent_trust": true,
             "discovery": "/mcp/discovery",
             "trust": "/mcp/trust",
             "trust_requires_companion_socket": true,

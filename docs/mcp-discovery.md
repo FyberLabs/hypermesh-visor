@@ -48,7 +48,8 @@ terminal emulator, alongside the existing MCP profile and doctor actions.
    user profile. The profile must already exist in `mcp-profiles.json`; its server
    list remains the selection boundary. Use the existing profile tools or edit
    that file to change membership.
-2. Optionally enter an absolute MCP JSON file or directory containing `mcp.json`.
+2. Select a listed Cursor or VS Code source ID, or enter an absolute MCP JSON
+   file or directory containing `mcp.json`.
    This previews the file without setting `HYPERMESH_MCP_PROJECT`, editing user
    configuration, starting a command, or connecting to an endpoint. Blank uses
    the daemon's existing configuration selection. No project scan occurs.
@@ -62,7 +63,7 @@ terminal emulator, alongside the existing MCP profile and doctor actions.
    **TRUST** to approve the snapshot. Any other response, cancellation, or EOF
    cancels; merely opening the screen never grants trust or starts a server.
 
-Approval is single-use, expires after five minutes, and checks that all source
+The pending review token is single-use, expires after five minutes, and checks that all source
 file contents still match the preview. A changed, removed, or newly created
 source requires another review. Future sessions selecting that profile (including
 when it remains the active profile) attach the captured effective configuration,
@@ -78,12 +79,44 @@ discarded if trust changes before it can be published as a session. Approval doe
 not pin executables, working directories, referenced files, or environment values
 resolved when a process starts. Keep those resources under your control.
 
-Snapshots, revocations, and pending reviews are daemon-local and disappear on
-restart; they do not change `mcp.json` or profiles on disk. Restart restores the
-normal file/environment configuration behavior. Vault MCP secret retrieval is a
-separate explicit operation and does not use these session-profile grants.
+Approvals and revocations survive restart. Private receipts in
+`<user-config-dir>/mcp-trust/approvals.json` store profile names, review IDs,
+source kinds, absolute paths, and SHA-256 content hashes, including absent optional
+files. They never copy server definitions, arguments, or secret values. The directory
+is mode 0700 and files are mode 0600, owned by the daemon user. Writes use a lock,
+revision comparison, and atomic replacement; conflicting updates require a retry.
 
-The UI uses `POST /mcp/discovery`, `GET /mcp/trust`, and `POST /mcp/trust` with
+A running daemon retains its approved in-memory snapshot. After restart, each
+receipt reconstructs that snapshot only if every source still matches. Changed,
+missing, unreadable, or newly created sources show `needs_review` and block new
+sessions until reapproved. Revocations remain blocked. Other daemon processes
+observe persisted decisions before opening sessions. Pending reviews do not
+survive restart. These decisions do not edit the source files.
+
+Unsafe permissions, malformed receipts, or a missing ledger in an existing trust
+directory fail closed. Stop the daemon and restore a known-good private backup
+before retrying; do not delete the ledger as a repair. Removal of the entire trust
+directory is detected by a running daemon, but a fresh process cannot distinguish
+it from a first installation. Back up this directory with the configuration.
+Vault MCP secret retrieval remains separate and does not use session-profile grants.
+
+Known locations on Linux are Cursor's `~/.cursor/mcp.json` and VS Code's default
+user `$XDG_CONFIG_HOME/Code/User/mcp.json` (otherwise
+`~/.config/Code/User/mcp.json`). Listing only checks file metadata. It never scans
+projects or imports a discovered file automatically. Portable installations,
+named editor profiles, and workspace configurations require an explicit path.
+Imports accept strict JSON with either `mcpServers` or `servers`, preserving
+visor's user-first precedence and profile membership. Comments/trailing commas,
+editor inputs, sandbox settings, env files, OAuth settings, and unsupported
+variable expansions are rejected; supply a privately reviewed compatible export.
+Exact `${env:NAME}` references in environment values remain supported. Editor
+security settings are never silently discarded.
+
+Source references: [Cursor MCP configuration](https://prod.cursor.com/help/customization/mcp)
+and [VS Code MCP configuration](https://code.visualstudio.com/docs/agents/reference/mcp-configuration).
+
+The UI uses `GET /mcp/sources`, `POST /mcp/discovery` (optional `source_id` or
+`project_path`, mutually exclusive), `GET /mcp/trust`, and `POST /mcp/trust` with
 `approve`, `cancel`, or `revoke`. These routes require the same-user companion
 socket; control-socket callers and TCP callers, including valid bearer holders,
 receive 403. This is a local account boundary, not protection against malicious
@@ -112,7 +145,7 @@ terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
   authorization and physical-user pause still apply.
 
 Issue #29 remains open for additional documented discovery sources, richer graphical
-profile editing/persistent approvals, native stable
+profile editing, native stable
 identity coverage beyond the current Linux probes, automatic server reconnect
 policy, and native Windows/macOS discovery. The implemented protocol surface and
 remaining compatibility limits are described below.

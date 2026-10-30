@@ -362,7 +362,7 @@ pub fn trust_request(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    if !matches!(path, "/mcp/trust" | "/mcp/discovery") {
+    if !matches!(path, "/mcp/trust" | "/mcp/discovery" | "/mcp/sources") {
         return Err("Invalid trust endpoint".into());
     }
     let method = if body.is_some() { "POST" } else { "GET" };

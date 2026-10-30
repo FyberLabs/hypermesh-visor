@@ -117,7 +117,7 @@ while True:
         fs::write(
             dir.join("mcp.json"),
             format!(
-                r#"{{"mcpServers":{{"vault-fixture":{{"command":"{}","type":"stdio"}}}}}}"#,
+                r#"{{"mcpServers":{{"vault-fixture":{{"command":"python3","args":["{}"],"type":"stdio"}}}}}}"#,
                 script.display()
             ),
         )
