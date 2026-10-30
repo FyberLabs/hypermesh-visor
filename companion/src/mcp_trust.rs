@@ -120,7 +120,7 @@ fn screen(
                     return Ok(());
                 };
                 let sources = request("/mcp/sources", None)?;
-                writeln!(out, "Available source locations (not yet trusted):")
+                writeln!(out, "Available source locations (not yet trusted; editor IDs are separate from visor profiles):")
                     .map_err(|_| "Terminal output failed")?;
                 for source in sources.as_array().ok_or("Invalid sources response")? {
                     writeln!(
@@ -140,7 +140,12 @@ fn screen(
                 else {
                     return Ok(());
                 };
-                let source_id = if sources.as_array().unwrap().iter().any(|v| v["id"] == path) {
+                let source_id = if sources
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["id"] == path && v["status"] != "use_explicit_path")
+                {
                     Some(path.clone())
                 } else {
                     None

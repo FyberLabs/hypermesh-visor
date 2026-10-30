@@ -94,10 +94,7 @@ pub fn decode(base: &Path, bytes: &[u8]) -> Result<Ledger, McpError> {
         if name.is_empty()
             || name.len() > 512
             || !(2..=3).contains(&r.sources.len())
-            || !matches!(
-                r.source_kind.as_str(),
-                "selected_project" | "cursor_global" | "vscode_user"
-            )
+            || !super::sources::valid_source_kind(&r.source_kind)
         {
             return Err(error());
         }

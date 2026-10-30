@@ -13,6 +13,7 @@ mod subscription;
 pub mod trust;
 mod trust_disk;
 pub mod sources;
+mod jsonc;
 mod secret_fetch;
 mod stdio;
 

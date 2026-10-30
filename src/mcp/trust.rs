@@ -502,6 +502,37 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn editor_profile_jsonc_receipts_restore_and_pin_comments() {
+        let dir = fixture();
+        let path = dir.join("editor.json");
+        let raw = r#"{ // reviewed editor source
+            "servers":{"new":{"command":"never-run",},},
+        }"#;
+        std::fs::write(&path, raw).unwrap();
+        let mut review = inspect(&dir, Some("default"), path.to_str()).unwrap();
+        review.source_kind = "vscode_insiders_profile:abc123".into();
+        let mut first = TrustStore::default();
+        first.sync(&dir).unwrap();
+        let id = first.stage(review).unwrap().review_id;
+        first.approve(id).unwrap();
+        let mut restarted = TrustStore::default();
+        restarted.sync(&dir).unwrap();
+        let grant = restarted.approved("default").unwrap();
+        assert_eq!(grant.id, id);
+        assert!(grant
+            .resolution
+            .provenance
+            .iter()
+            .any(|p| p.source == "vscode_insiders_profile:abc123"));
+        // A comment-only edit still changes the approved source bytes.
+        std::fs::write(&path, raw.replace("reviewed", "edited")).unwrap();
+        let mut changed = TrustStore::default();
+        changed.sync(&dir).unwrap();
+        assert_eq!(changed.list()[0].status, "needs_review");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn changed_sources_require_review_after_restart_and_updates_do_not_clobber() {
         let dir = fixture();
         let mut first = TrustStore::default();

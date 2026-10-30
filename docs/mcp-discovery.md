@@ -100,20 +100,50 @@ directory is detected by a running daemon, but a fresh process cannot distinguis
 it from a first installation. Back up this directory with the configuration.
 Vault MCP secret retrieval remains separate and does not use session-profile grants.
 
-Known locations on Linux are Cursor's `~/.cursor/mcp.json` and VS Code's default
-user `$XDG_CONFIG_HOME/Code/User/mcp.json` (otherwise
-`~/.config/Code/User/mcp.json`). Listing only checks file metadata. It never scans
-projects or imports a discovered file automatically. Portable installations,
-named editor profiles, and workspace configurations require an explicit path.
-Imports accept strict JSON with either `mcpServers` or `servers`, preserving
-visor's user-first precedence and profile membership. Comments/trailing commas,
-editor inputs, sandbox settings, env files, OAuth settings, and unsupported
-variable expansions are rejected; supply a privately reviewed compatible export.
-Exact `${env:NAME}` references in environment values remain supported. Editor
-security settings are never silently discarded.
+Known locations on Linux:
 
-Source references: [Cursor MCP configuration](https://prod.cursor.com/help/customization/mcp)
-and [VS Code MCP configuration](https://code.visualstudio.com/docs/agents/reference/mcp-configuration).
+| Source ID | MCP file |
+| --- | --- |
+| `cursor_global` | `~/.cursor/mcp.json` |
+| `vscode_user` | `<config>/Code/User/mcp.json` |
+| `vscode_insiders_user` | `<config>/Code - Insiders/User/mcp.json` |
+| `vscode_profile:<id>` | `<config>/Code/User/profiles/<id>/mcp.json` |
+| `vscode_insiders_profile:<id>` | `<config>/Code - Insiders/User/profiles/<id>/mcp.json` |
+
+`<config>` is absolute `$XDG_CONFIG_HOME`, otherwise `~/.config`.
+Listing checks metadata without reading configuration contents. Named profiles
+appear only when they contain a concrete MCP file. Their IDs are editor storage
+directory IDs, not display names or visor profile names. Visor does not consult
+the editor's active-profile registry, inherit default MCP settings, or reproduce
+workspace associations; choose the file you intend to approve. The visor profile
+still controls server membership.
+
+Enumeration reads one level of each known profiles directory, skips directory
+symlinks and IDs outside 1–40 ASCII letters/digits/underscore/hyphen, and returns
+at most 16 sorted profiles per editor. More than 128 directory entries, unreadable
+roots, or overflow produce a `use_explicit_path` notice. Select an absolute file
+path for omitted profiles, portable/custom user-data installations, or workspace
+configurations. Projects are never scanned or automatically imported.
+
+External imports accept JSON and JSONC (line/block comments and trailing commas)
+with either `mcpServers` or `servers`. JSON5 features such as single quotes,
+unquoted keys, and non-JSON numbers are unsupported. User/profile files belonging
+to visor itself still require strict JSON. Receipts hash the original external
+file bytes, so even comment-only edits require review after restart. Existing
+strict-JSON approvals retain their semantics.
+
+Imports preserve visor's user-first precedence and profile membership. Editor
+inputs, sandbox settings, env files, OAuth settings, and unsupported variable
+expansions remain rejected; supply a privately reviewed compatible export.
+Exact `${env:NAME}` references in environment values remain supported. Editor
+security settings are never silently discarded. Downgrading to a version without
+these source IDs rejects their receipts; keep backups and use a compatible
+version to review or revoke them.
+
+Source references: [Cursor MCP configuration](https://prod.cursor.com/help/customization/mcp),
+[VS Code MCP configuration](https://code.visualstudio.com/docs/agents/reference/mcp-configuration),
+[profile file layout](https://code.visualstudio.com/docs/configure/settings#_profile-settings),
+and [VS Code profile resource resolution](https://github.com/microsoft/vscode/blob/main/src/vs/platform/userDataProfile/common/userDataProfile.ts).
 
 The UI uses `GET /mcp/sources`, `POST /mcp/discovery` (optional `source_id` or
 `project_path`, mutually exclusive), `GET /mcp/trust`, and `POST /mcp/trust` with
