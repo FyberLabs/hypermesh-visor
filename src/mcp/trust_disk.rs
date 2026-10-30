@@ -117,6 +117,16 @@ pub fn decode(base: &Path, bytes: &[u8]) -> Result<Ledger, McpError> {
     }
     Ok(ledger)
 }
+// Explicit unlock matters even with CLOEXEC: another thread can fork while
+// this descriptor is open, temporarily retaining the same open-file description.
+pub(super) struct UnlockOnDrop<'a>(pub &'a File);
+impl Drop for UnlockOnDrop<'_> {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.0.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
 pub fn save(base: &Path, expected: Option<&[u8]>, ledger: &Ledger) -> Result<Vec<u8>, McpError> {
     let dir = directory(base);
     fs::create_dir_all(base).map_err(|_| error())?;
@@ -142,6 +152,7 @@ pub fn save(base: &Path, expected: Option<&[u8]>, ledger: &Ledger) -> Result<Vec
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(McpError::message("MCP trust is being updated; retry"));
     }
+    let _unlock = UnlockOnDrop(&lock);
     let current = if created { None } else { read(base)? };
     if current.as_deref() != expected {
         return Err(McpError::message(
@@ -174,4 +185,36 @@ pub fn save(base: &Path, expected: Option<&[u8]>, ledger: &Ledger) -> Result<Vec
         let _ = fs::remove_file(path);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn guard_releases_lock_even_while_an_inherited_descriptor_remains_open() {
+        let path = std::env::temp_dir().join(format!("visor-unlock-{}", Uuid::new_v4()));
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // dup shares the open-file description, just like a forked child.
+        let inherited = file.try_clone().unwrap();
+        let guard = UnlockOnDrop(&file);
+        drop(guard);
+        drop(file);
+        let contender = OpenOptions::new().write(true).open(&path).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let _unlock = UnlockOnDrop(&contender);
+        drop(inherited);
+        fs::remove_file(path).unwrap();
+    }
 }

@@ -173,6 +173,7 @@ pub fn edit(base: &Path, trust: &mut TrustStore, edit: Edit) -> Result<Snapshot,
     {
         return Err(error("MCP profiles are busy or their lock is unsafe"));
     }
+    let _unlock = trust_disk::UnlockOnDrop(&lock);
     let path = base.join("mcp-profiles.json");
     let raw = read(&path)?;
     let mut v = document(raw.as_deref())?;
@@ -416,6 +417,9 @@ mod tests {
             save(list(&dir).unwrap().revision, "default", false)
         )
         .is_err());
+        unsafe {
+            libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+        }
         drop(lock);
         let duplicate = Edit::Save {
             revision: list(&dir).unwrap().revision,
