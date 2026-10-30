@@ -58,9 +58,9 @@ it does not import project config or require session profile membership.
   authorization and physical-user pause still apply.
 
 Issue #29 remains open for a reviewable discovery/provenance UI, native stable
-identity coverage beyond the current Linux probes, capability negotiation, background change subscriptions, automatic reconnect
-policy, and native Windows/macOS discovery. This change establishes
-explicit project trust without claiming those discovery features are complete.
+identity coverage beyond the current Linux probes, automatic server reconnect
+policy, and native Windows/macOS discovery. The implemented protocol surface and
+remaining compatibility limits are described below.
 
 ## Match diagnostics
 
@@ -95,8 +95,8 @@ Both stdio and the existing HTTP POST/SSE-response transport follow opaque
 cursors are never carried across refreshes or connections. Duplicate tool names,
 repeated/invalid cursors, malformed pages, and limits fail the whole refresh.
 Limits are 32 pages, 4,096 tools, 8 MiB of catalog metadata, 1,024-byte tool names,
-and 4,096-byte cursors. Each response is capped at 8 MiB. Stdio responses and HTTP
-requests have a 15-second deadline; discovery stops starting new pages after
+and 4,096-byte cursors. Each response is capped at 8 MiB. Stdio writes and response waits each have a 15-second deadline; HTTP
+requests have a 15-second I/O deadline; discovery stops starting new pages after
 30 seconds (a final outstanding request can take another 15 seconds).
 
 Use the authenticated local control API, or opted-in bearer-authenticated TCP:
@@ -131,11 +131,53 @@ Transport failures clear stale tools and health. Stdio health excludes exited
 zombie children; HTTP failures invalidate the attached client. A valid
 application/tool error is not itself a transport failure.
 
-Responses must correlate to their request ID. Interleaved notifications do not
-satisfy requests; an SSE notification after a response cannot replace that
-response. This release uses explicit refresh: it does not maintain a background
-notification subscription or automatically reconnect. The HTTP transport remains
-the existing POST/SSE-response subset, not a legacy SSE endpoint-discovery or
-full modern Streamable HTTP session implementation.
+## Background catalog updates and protocol compatibility
+
+The client proposes MCP `2025-11-25` and accepts server-selected `2025-06-18`,
+`2025-03-26`, or `2024-11-05`. Missing/unsupported versions and malformed
+capabilities fail attachment. Servers without a `tools` capability attach with
+an empty catalog; no `tools/list` requests are sent. The client advertises no
+sampling, elicitation, roots, or task capabilities. It answers server pings and
+returns method-not-found for unsupported client requests.
+
+When a server advertises `tools.listChanged`, idle stdio notifications and
+Streamable HTTP GET/SSE notifications invalidate its catalog. A per-session
+worker coalesces notifications and refreshes at most once per second per server
+(with longer intervals while another refresh is pending). Invalidated catalogs
+are not healthy routing candidates or callable through the session API. Complete
+catalogs replace old ones atomically; a notification during pagination remains
+pending for another pass. Automatic catalog reads are audited as
+`@subscription_refresh`. No automatic action executes a tool or starts a new
+server process. A failed reader/refresh requires explicit reconnect.
+
+HTTP initialization captures `Mcp-Session-Id`; subsequent requests include it
+and the negotiated `MCP-Protocol-Version`. These connection-owned headers,
+Content-Type, and Accept override configured values. Redirects are disabled.
+A session-expired HTTP 404 invalidates the attachment without replaying the
+request. JSON and bounded incremental SSE responses are supported; a matching
+response completes without waiting for EOF. Notifications cannot satisfy a
+request. Each SSE event is limited to 8 MiB, and session/event IDs to 1,024 bytes.
+
+Background HTTP GET is optional: 405 leaves the attachment usable with manual
+refresh. For accepted streams, EOF/read timeout reconnects only the read-only
+GET, sends the last event ID when present, respects `retry` with a minimum
+one-second delay, and invalidates the catalog to reconcile delivery gaps.
+Each HTTP request/stream has a 15-second I/O deadline, so an idle subscription
+periodically renews. Other GET failures or malformed events invalidate health.
+Closing a session stops new subscription work; an outstanding HTTP read can
+finish within its deadline. Stdio reader shutdown is joined and its child reaped.
+As with explicit refresh, an in-flight catalog operation finishes within its
+bounds before a closed session's resources are discarded.
+
+The `sse` configuration value remains an alias for the POST-based transport.
+Legacy HTTP+SSE endpoint discovery, resumable POST responses, remote HTTP
+session DELETE, OAuth negotiation, and non-tool MCP features are not implemented.
+A server selecting `2024-11-05` over HTTP retains the existing POST/JSON/SSE
+response compatibility path, without a GET subscription. This is not a claim
+of complete MCP conformance. Discovery provenance/UI and broader platform
+acceptance remain tracked in #29.
+
+Protocol references: [lifecycle and capabilities](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
+and [Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
 
 Pagination follows the [MCP cursor contract](https://modelcontextprotocol.io/specification/2024-11-05/server/utilities/pagination).

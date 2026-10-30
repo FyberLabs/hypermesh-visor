@@ -932,6 +932,7 @@ async fn open_session(
         mcp_servers: mcp.server_names(),
     };
     lock(&state.sessions).insert(id, Session::create(id, harness, vault, mcp));
+    spawn_mcp_watch(&state, id);
     Ok((StatusCode::CREATED, Json(opened)))
 }
 
@@ -972,6 +973,61 @@ struct McpRefreshRequest {
 enum McpRefreshAction {
     Refresh,
     Reconnect,
+}
+
+// One coalescing worker per session. Only catalog reads are automatic.
+fn spawn_mcp_watch(state: &Arc<AppState>, id: Uuid) {
+    let weak = Arc::downgrade(state);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let Some(state) = weak.upgrade() else {
+                break;
+            };
+            let names = {
+                let sessions = lock(&state.sessions);
+                let Some(session) = sessions.get(&id) else {
+                    break;
+                };
+                session
+                    .mcp()
+                    .servers
+                    .iter()
+                    .filter(|s| s.needs_refresh())
+                    .map(|s| s.name.clone())
+                    .collect::<Vec<_>>()
+            };
+            for name in names {
+                let state = Arc::clone(&state);
+                let _ = tokio::task::spawn_blocking(move || {
+                    let server = {
+                        let mut sessions = lock(&state.sessions);
+                        sessions
+                            .get_mut(&id)
+                            .and_then(|s| s.mcp_mut().take_for_refresh(&name).ok())
+                    };
+                    let Some(mut server) = server else {
+                        return;
+                    };
+                    let result = server.refresh(false);
+                    {
+                        let mut sessions = lock(&state.sessions);
+                        if let Some(session) = sessions.get_mut(&id) {
+                            session.mcp_mut().restore_after_refresh(server);
+                        }
+                        // Otherwise drop the server outside the session mutex below.
+                    }
+                    lock(&state.mcp_audit).record(McpAuditRow {
+                        server: name,
+                        tool: "@subscription_refresh".into(),
+                        decision: "approve".into(),
+                        outcome: if result.is_ok() { "ok" } else { "failed" }.into(),
+                    });
+                })
+                .await;
+            }
+        }
+    });
 }
 
 async fn mcp_refresh(
@@ -3051,6 +3107,75 @@ mod tests {
         assert!(body.len() < 64 * 1024, "poll is {} bytes", body.len());
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["session"]["purpose"], purpose);
+    }
+
+    #[tokio::test]
+    async fn idle_mcp_notification_refreshes_catalog_and_close_reaps_reader() {
+        let dir = std::env::temp_dir().join(format!("hm-subscribe-api-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = r#"
+import sys,json,pathlib,threading,time,os
+p=pathlib.Path(sys.argv[1]); (p/'pid').write_text(str(os.getpid()))
+changed=False; lists=0
+def notify():
+ global changed
+ while not (p/'change').exists(): time.sleep(.01)
+ changed=True
+ for i in range(100): print(json.dumps({'jsonrpc':'2.0','method':'notifications/tools/list_changed'}),flush=True)
+ print(json.dumps({'jsonrpc':'2.0','id':'server-ping','method':'ping'}),flush=True)
+threading.Thread(target=notify,daemon=True).start()
+for line in sys.stdin:
+ m=json.loads(line)
+ if m.get('id')=='server-ping':
+  assert m['result']=={}
+  (p/'pong').touch(); continue
+ if 'id' not in m: continue
+ if m['method']=='initialize': result={'protocolVersion':'2025-06-18','capabilities':{'tools':{'listChanged':True}}}
+ elif m['method']=='tools/list':
+  lists+=1; (p/'lists').write_text(str(lists))
+  result={'tools':[{'name':'new' if changed else 'old'}]}
+ else: raise Exception('unexpected tool execution')
+ print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+"#;
+        std::fs::write(dir.join("mcp.json"), serde_json::json!({"mcpServers":{"fixture":{"command":"python3","args":["-u","-c",script,dir.to_string_lossy()]}}}).to_string()).unwrap();
+        std::fs::write(
+            dir.join("mcp-profiles.json"),
+            r#"{"profiles":{"default":{"servers":["fixture"]}}}"#,
+        )
+        .unwrap();
+        let addr = spawn_with_mcp_dir(FakeDesktop::new(), dir.clone()).await;
+        let (status, _, id) = open_session_id(addr, serde_json::json!([])).await;
+        assert_eq!(status, 201);
+        std::fs::write(dir.join("change"), "").unwrap();
+        let start = Instant::now();
+        loop {
+            let (_, _, body) = send(addr, "GET", &format!("/session/{id}/mcp"), None).await;
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if value["servers"][0]["tools"][0]["name"] == "new"
+                && value["servers"][0]["healthy"] == true
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "catalog did not refresh: {value}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            dir.join("pong").exists(),
+            "idle server ping was not answered"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("lists")).unwrap(),
+            "2",
+            "notifications were not coalesced"
+        );
+        let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
+        assert_eq!(status, 204);
+        let pid = std::fs::read_to_string(dir.join("pid")).unwrap();
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
