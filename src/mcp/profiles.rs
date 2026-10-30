@@ -15,7 +15,7 @@ const LIMIT: u64 = 256 * 1024;
 fn error(message: &str) -> McpError {
     McpError::message(message)
 }
-fn read(path: &Path) -> Result<Option<Vec<u8>>, McpError> {
+pub(super) fn read(path: &Path) -> Result<Option<Vec<u8>>, McpError> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -42,11 +42,11 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, McpError> {
     }
     Ok(Some(bytes))
 }
-fn revision(raw: Option<&[u8]>) -> String {
+pub(super) fn revision(raw: Option<&[u8]>) -> String {
     raw.map(trust_disk::digest)
         .unwrap_or_else(|| "missing".into())
 }
-fn document(raw: Option<&[u8]>) -> Result<Value, McpError> {
+pub(super) fn document(raw: Option<&[u8]>) -> Result<Value, McpError> {
     let mut v = raw
         .map(serde_json::from_slice)
         .transpose()
@@ -79,7 +79,7 @@ fn document(raw: Option<&[u8]>) -> Result<Value, McpError> {
     }
     Ok(v)
 }
-fn valid_name(s: &str) -> Result<(), McpError> {
+pub(super) fn valid_name(s: &str) -> Result<(), McpError> {
     if s.is_empty() || s.len() > 512 || s.chars().any(char::is_control) || s.trim() != s {
         return Err(error("Names must be nonempty, at most 512 bytes, and contain no control characters or surrounding whitespace"));
     }
@@ -151,7 +151,7 @@ pub enum Edit {
         name: String,
     },
 }
-pub fn edit(base: &Path, trust: &mut TrustStore, edit: Edit) -> Result<Snapshot, McpError> {
+pub(super) fn config_lock(base: &Path) -> Result<std::fs::File, McpError> {
     fs::create_dir_all(base).map_err(|_| error("Cannot create MCP configuration directory"))?;
     let lock = OpenOptions::new()
         .read(true)
@@ -173,6 +173,36 @@ pub fn edit(base: &Path, trust: &mut TrustStore, edit: Edit) -> Result<Snapshot,
     {
         return Err(error("MCP profiles are busy or their lock is unsafe"));
     }
+    Ok(lock)
+}
+
+pub(super) fn atomic_write(base: &Path, name: &str, data: &[u8]) -> Result<(), McpError> {
+    let temp = base.join(format!(".mcp-edit-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temp)
+            .map_err(|_| error("Cannot write MCP configuration"))?;
+        file.write_all(data)
+            .and_then(|_| file.sync_all())
+            .map_err(|_| error("Cannot persist MCP configuration"))?;
+        fs::rename(&temp, base.join(name))
+            .map_err(|_| error("Cannot replace MCP configuration"))?;
+        fs::File::open(base)
+            .and_then(|d| d.sync_all())
+            .map_err(|_| error("Cannot sync MCP configuration directory"))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temp);
+    }
+    result
+}
+
+pub fn edit(base: &Path, trust: &mut TrustStore, edit: Edit) -> Result<Snapshot, McpError> {
+    let lock = config_lock(base)?;
     let _unlock = trust_disk::UnlockOnDrop(&lock);
     let path = base.join("mcp-profiles.json");
     let raw = read(&path)?;
@@ -263,27 +293,8 @@ pub fn edit(base: &Path, trust: &mut TrustStore, edit: Edit) -> Result<Snapshot,
     if read(&path)? != raw {
         return Err(error("MCP profiles changed; reopen the editor"));
     }
-    let temp = base.join(format!(".mcp-profiles-{}", uuid::Uuid::new_v4()));
-    let write = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temp)
-            .map_err(|_| error("Cannot write MCP profiles"))?;
-        file.write_all(&data)
-            .and_then(|_| file.sync_all())
-            .map_err(|_| error("Cannot persist MCP profiles"))?;
-        fs::rename(&temp, &path).map_err(|_| error("Cannot replace MCP profiles"))?;
-        fs::File::open(base)
-            .and_then(|d| d.sync_all())
-            .map_err(|_| error("Cannot sync MCP profile directory"))?;
-        Ok(result)
-    })();
-    if write.is_err() {
-        let _ = fs::remove_file(temp);
-    }
-    write
+    atomic_write(base, "mcp-profiles.json", &data)?;
+    Ok(result)
 }
 
 #[cfg(test)]

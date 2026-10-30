@@ -12,6 +12,7 @@ mod protocol;
 mod subscription;
 pub mod trust;
 pub mod profiles;
+pub mod servers;
 mod trust_disk;
 pub mod sources;
 mod jsonc;

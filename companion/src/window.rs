@@ -732,14 +732,20 @@ fn on_click(
                 *app.status.lock().unwrap() = err;
             }
         }
-        Action::McpTrust => {
+        Action::McpTrust | Action::McpServers => {
             app.menu = false;
-            let result = std::env::current_exe().and_then(|exe| {
-                open_terminal_command(&[exe.to_string_lossy().into_owned(), "--mcp-trust".into()])
+            let status = Arc::clone(&app.status);
+            let action = hit.action;
+            std::thread::spawn(move || {
+                let result = if action == Action::McpTrust {
+                    crate::mcp_trust_gui::run()
+                } else {
+                    crate::mcp_servers::run()
+                };
+                if let Err(err) = result {
+                    *status.lock().unwrap() = err;
+                }
             });
-            if let Err(err) = result {
-                *app.status.lock().unwrap() = err.to_string();
-            }
         }
         Action::McpProfiles => {
             app.menu = false;

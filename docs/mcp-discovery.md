@@ -76,14 +76,65 @@ The graphical editor creates at most eight profiles, with at most 128 server IDs
 per edited profile. Persistent trust currently retains up to eight profile
 decisions, including deleted/revoked names; reuse an existing name when that
 limit is reached. These limits and preserved overrides are visible in errors or
-the save confirmation. Graphical server-definition/secret editing is outside
-this screen.
+the save confirmation. Server definitions are edited in the separate **MCP servers** screen.
+
+## Graphical server editing
+
+Choose **MCP servers** or run `hypermesh-companion --mcp-servers`.
+Create a stdio command or HTTP/SSE endpoint, enable/disable a server, change its
+working directory, replace arguments/environment/headers, or delete its user
+definition. Add its ID to a profile through **MCP profiles**, then review that
+profile through **MCP trust**. The editor never starts a server.
+
+The list shows command, working-directory, transport, enabled state, argument
+count, environment/header names, and endpoint origin as metadata. Existing
+argument, environment/header values, and URL credentials/path/query are never
+fetched into the screen. Private fields use explicit replacement dialogs:
+arguments are a JSON array of strings, environment/headers are JSON objects of
+string values, and endpoints are full HTTP(S) URLs. Replacing a map replaces all
+its entries; `{}` clears it, and `[]` clears arguments. Cancel preserves existing
+values. Review replacements privately before confirming; they are written to
+your private configuration file, not a vault. Prefer environment references
+where appropriate. Private replacement payloads do not appear in dialog command arguments,
+save confirmations, or API error messages.
+
+Untouched fields, including unknown fields and private values, are preserved.
+Changing transport keeps other fields; only the selected transport is used.
+Deleting a user definition can expose an explicitly selected project's duplicate
+definition or the implicit Docker gateway, so deletion also requires renewed
+review.
+
+The companion-only `GET /mcp/servers` returns redacted metadata and a revision.
+`POST /mcp/servers` accepts `save` with `name`, `create`, `revision`, and a
+`fields` patch, or `delete` with `name` and `revision`. Omitted fields are
+preserved; explicit JSON null removes a field. Writes share the profile editor's
+lock and atomic mode-0600 replacement. Existing safety checks and revision
+conflict handling apply. Creates are limited to 128 user servers and the file
+to 256 KiB.
+
+Because `mcp.json` is shared, every server save/delete persistently blocks all
+configured, active, and previously reviewed profile names before writing.
+A failed write can leave those profiles blocked. Membership is not changed.
+The existing eight-decision trust limit can reject an edit before the file is
+changed; decisions are updated together. Existing sessions retain their captured
+configuration. Pending reviews for those profiles are canceled; review again
+after saving. Explicit vault MCP retrieval remains a separate named-server
+operation, as described above.
 
 ## Review discovery sources in the companion
 
-Open the bug menu and choose **MCP trust**, or run `hypermesh-companion --mcp-trust`
-in an interactive terminal. The companion opens its trust screen in the installed
-terminal emulator, alongside the existing MCP profile and doctor actions.
+Open the bug menu and choose **MCP trust**, or run
+`hypermesh-companion --mcp-trust-gui` in your desktop session. Choose **Review a
+profile**, select its visor profile, and choose daemon configuration, a discovered
+editor source, or an explicit configuration file. A read-only provenance dialog
+precedes the separate typed **TRUST** confirmation. Canceling or a dialog failure
+cancels the staged token; opening the screen grants nothing. Select a listed
+decision and type **REVOKE** to block future sessions.
+
+The terminal equivalent remains `hypermesh-companion --mcp-trust` in an
+interactive terminal. Both screens use the same content-bound approvals,
+redaction, five-minute review tokens, and durable revocations. The detailed
+review sequence is:
 
 1. Choose **Review a profile** and enter its name, or leave it blank for the active
    user profile. The profile must already exist in `mcp-profiles.json`; its server
@@ -214,8 +265,7 @@ terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
   cannot preserve a stale match. Failure to find a healthy match retains desktop mode. Input
   authorization and physical-user pause still apply.
 
-Issue #29 remains open for additional documented discovery sources, richer graphical
-server-definition editing, native stable
+Issue #29 remains open for additional documented discovery sources, additional editor integration, native stable
 identity coverage beyond the current Linux probes, automatic server reconnect
 policy, and native Windows/macOS discovery. The implemented protocol surface and
 remaining compatibility limits are described below.
