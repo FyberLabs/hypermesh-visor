@@ -2475,6 +2475,10 @@ PY
   echo "other user cannot drive the control socket, the companion socket, or the opted-in port"
 }
 
+scenario_mcp_profiles() {
+  dbus-run-session -- python3 "$root/ci/display/mcp-profiles.py" "$COMPANION_BIN"
+}
+
 X11_SCENARIOS=(
   uinput-channel
   key-down-detects
@@ -2483,6 +2487,7 @@ X11_SCENARIOS=(
   scroll-lands
   scroll-editor
   scroll-browser
+  mcp-profiles
   stop-resume-during-type
   uinput-key-pauses-type
   uinput-move-pauses

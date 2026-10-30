@@ -11,6 +11,7 @@ mod http;
 mod protocol;
 mod subscription;
 pub mod trust;
+pub mod profiles;
 mod trust_disk;
 pub mod sources;
 mod jsonc;
@@ -22,7 +23,7 @@ pub use audit::{McpAuditRow, McpAuditor};
 pub use bindings::{
     companion_mode, explain_preferred, load_bindings, BindingCache, FocusedApp, MatchDecision,
 };
-pub use config::{config_dir, active_profile};
+pub use config::{config_dir, active_profile, load_profile_resolution};
 pub use secret_fetch::fetch_secret_bytes;
 pub use stdio::{attach_profile, attach_specs, McpBundle, ToolInfo};
 
