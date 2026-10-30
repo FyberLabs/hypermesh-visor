@@ -2476,7 +2476,10 @@ PY
 }
 
 scenario_mcp_profiles() {
-  dbus-run-session -- python3 "$root/ci/display/mcp-profiles.py" "$COMPANION_BIN"
+  local mode
+  for mode in profiles servers trust; do
+    dbus-run-session -- python3 "$root/ci/display/mcp-profiles.py" "$COMPANION_BIN" "$mode"
+  done
 }
 
 X11_SCENARIOS=(

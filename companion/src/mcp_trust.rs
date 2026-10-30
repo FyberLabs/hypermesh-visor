@@ -177,13 +177,10 @@ fn screen(
         }
     }
 }
-fn review(
-    reader: &mut impl BufRead,
-    out: &mut impl Write,
-    preview: &Value,
-) -> Result<bool, String> {
+pub(crate) fn review_description(preview: &Value) -> Result<String, String> {
+    let mut out = Vec::new();
     writeln!(
-        out,
+        &mut out,
         "\nProfile: {}\nProfile/override source: {}",
         text(&preview["profile"]),
         text(&preview["profiles_path"])
@@ -193,10 +190,18 @@ fn review(
         .as_array()
         .ok_or("Invalid discovery response")?
     {
-        writeln!(out,"\n{} — {}\n  Source: {} ({})\n  Transport: {}  Executable: {}  Endpoint origin: {}\n  Enabled: {}  Working directory: {}\n  Arguments: {} (values hidden)\n  Environment names: {}\n  Header names: {}\n  Profile override fields: {}",
+        writeln!(&mut out,"\n{} — {}\n  Source: {} ({})\n  Transport: {}  Executable: {}  Endpoint origin: {}\n  Enabled: {}  Working directory: {}\n  Arguments: {} (values hidden)\n  Environment names: {}\n  Header names: {}\n  Profile override fields: {}",
             text(&server["name"]),text(&server["status"]),text(&server["path"]),text(&server["source"]),text(&server["transport"]),text(&server["command"]),text(&server["endpoint"]),text(&server["enabled"]),text(&server["cwd"]),text(&server["argument_count"]),text(&server["environment_names"]),text(&server["header_names"]),text(&server["overrides"])).map_err(|_| "Terminal output failed")?;
     }
-    writeln!(out,"\nOnly selected entries will attach. User definitions win duplicates.\nArguments, environment/header values, and URL paths/credentials are hidden.\nReview the full source files privately before trusting them. Programs and files they reference can change.\nTrust permits future sessions to run these commands or connect to these endpoints as you.\nApproval does not start servers now. This review expires in five minutes.").map_err(|_| "Terminal output failed")?;
+    writeln!(&mut out,"\nOnly selected entries will attach. User definitions win duplicates.\nArguments, environment/header values, and URL paths/credentials are hidden.\nReview the full source files privately before trusting them. Programs and files they reference can change.\nTrust permits future sessions to run these commands or connect to these endpoints as you.\nApproval does not start servers now. This review expires in five minutes.").map_err(|_| "Terminal output failed")?;
+    String::from_utf8(out).map_err(|_| "Invalid review text".into())
+}
+fn review(
+    reader: &mut impl BufRead,
+    out: &mut impl Write,
+    preview: &Value,
+) -> Result<bool, String> {
+    write!(out, "{}", review_description(preview)?).map_err(|_| "Terminal output failed")?;
     Ok(input(
         reader,
         out,

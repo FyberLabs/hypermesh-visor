@@ -9,6 +9,10 @@ import tempfile
 import threading
 import time
 
+mode = sys.argv[2] if len(sys.argv) > 2 else "profiles"
+title = {"profiles": "MCP profiles", "servers": "MCP servers", "trust": "MCP trust"}[mode]
+option = {"profiles": "--mcp-profiles", "servers": "--mcp-servers", "trust": "--mcp-trust-gui"}[mode]
+
 with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
     listener = socket.socket(socket.AF_UNIX)
     listener.bind(runtime + "/companion.sock")
@@ -33,7 +37,7 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
                         break
                     data += part
                 calls.append(data.split(b"\r\n", 1)[0])
-                body = json.dumps({
+                payload = {
                     "revision": "fixture",
                     "active": "default",
                     "profiles": [{
@@ -42,7 +46,12 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
                         "gateway": False,
                         "has_overrides": True,
                     }],
-                }).encode()
+                }
+                if mode == "servers":
+                    payload = {"revision": "fixture", "servers": [{"name": "editor", "transport": "stdio", "enabled": True}]}
+                elif mode == "trust":
+                    payload = []
+                body = json.dumps(payload).encode()
                 try:
                     conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
                                  str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
@@ -52,13 +61,13 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
     server = threading.Thread(target=serve)
     server.start()
     env = dict(os.environ, HYPERMESH_RUNTIME_DIR=runtime, GDK_BACKEND="x11", GSK_RENDERER="cairo")
-    process = subprocess.Popen([sys.argv[1], "--mcp-profiles"], env=env)
+    process = subprocess.Popen([sys.argv[1], option], env=env)
     try:
         deadline = time.monotonic() + 15
         window = None
         while time.monotonic() < deadline:
             found = subprocess.run(
-                ["xdotool", "search", "--onlyvisible", "--name", "^MCP profiles$"],
+                ["xdotool", "search", "--onlyvisible", "--name", f"^{title}$"],
                 capture_output=True, text=True)
             if found.returncode == 0 and found.stdout.strip():
                 window = found.stdout.splitlines()[0]
@@ -74,9 +83,9 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
         subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
         subprocess.run(["xdotool", "key", "Escape"], check=True)
         assert process.wait(timeout=5) == 0, "cancel did not exit cleanly"
-        assert calls == [b"GET /mcp/profiles HTTP/1.1"], calls
+        assert calls == [f"GET /mcp/{mode} HTTP/1.1".encode()], calls
         assert not errors, errors
-        print("MCP profile GTK chooser rendered; cancel submitted no writes")
+        print(f"{title} GTK chooser rendered; cancel submitted no writes")
     finally:
         if process.poll() is None:
             process.terminate()

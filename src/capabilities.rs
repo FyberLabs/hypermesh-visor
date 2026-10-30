@@ -50,6 +50,7 @@ pub(crate) fn describe(backend: &str) -> Value {
             "discovery_sources": "/mcp/sources",
             "persistent_trust": true,
             "profile_editor": "/mcp/profiles",
+            "server_editor": "/mcp/servers",
             "discovery": "/mcp/discovery",
             "trust": "/mcp/trust",
             "trust_requires_companion_socket": true,

@@ -621,6 +621,7 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .route("/mcp/trust", get(mcp_trusted).post(mcp_trust_decision))
         .route("/mcp/sources", get(mcp_sources))
         .route("/mcp/profiles", get(mcp_profiles).post(mcp_profile_edit))
+        .route("/mcp/servers", get(mcp_servers).post(mcp_server_edit))
         .route("/session/:id/stream", post(session_stream))
         .route("/session/:id/inbox", get(session_inbox))
         .route("/session/:id/mcp", get(session_mcp))
@@ -672,6 +673,42 @@ async fn mcp_discovery(
     })
     .await
     .map_err(|_| ApiError::internal("MCP discovery task failed"))?
+}
+
+async fn mcp_servers(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !link.0 {
+        return Err(ApiError::forbidden(
+            "MCP servers require the local companion socket",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        mcp::servers::list(&state.mcp_dir)
+            .map(Json)
+            .map_err(ApiError::from_mcp)
+    })
+    .await
+    .map_err(|_| ApiError::internal("Server read failed"))?
+}
+async fn mcp_server_edit(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+    Json(edit): Json<mcp::servers::Edit>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !link.0 {
+        return Err(ApiError::forbidden(
+            "MCP servers require the local companion socket",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        mcp::servers::edit(&state.mcp_dir, &mut lock(&state.mcp_trust), edit)
+            .map(Json)
+            .map_err(|e| ApiError::conflict(e.to_string()))
+    })
+    .await
+    .map_err(|_| ApiError::internal("Server save failed"))?
 }
 
 async fn mcp_profiles(
@@ -3521,6 +3558,125 @@ for line in sys.stdin:
             "unreviewed server executed"
         );
         assert!(lock(&state.sessions).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_edit_during_vault_fetch_never_executes_changed_definition() {
+        let dir = std::env::temp_dir().join(format!("hm-trust-race-{}", Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let script = r#"
+import sys,json,pathlib,time
+p=pathlib.Path(sys.argv[1])
+for line in sys.stdin:
+ m=json.loads(line)
+ if 'id' not in m: continue
+ if m['method']=='initialize': result={'protocolVersion':'2025-11-25','capabilities':{'tools':{}}}
+ elif m['method']=='tools/list': result={'tools':[{'name':'secret'}]}
+ elif m['method']=='tools/call':
+  (p/'waiting').touch()
+  while not (p/'release').exists(): time.sleep(.01)
+  result={'content':[{'type':'text','text':'fixture-secret'}]}
+ print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+"#;
+        std::fs::write(dir.join("mcp.json"),serde_json::json!({"mcpServers":{"vault":{"command":"python3","args":["-u","-c",script,dir]},"forbidden":{"command":"python3","args":["-c","import pathlib,sys; pathlib.Path(sys.argv[1]).touch()",dir.join("forbidden-started")] }}}).to_string()).unwrap();
+        let profiles = serde_json::json!({"active":"a","profiles":{"a":{"servers":["forbidden"]},"b":{"servers":["forbidden"]}}});
+        std::fs::write(dir.join("mcp-profiles.json"), profiles.to_string()).unwrap();
+        let mut state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        state.mcp_dir = dir.clone();
+        let state = Arc::new(state);
+        lock(&state.mcp_trust).sync(&dir).unwrap();
+        let review = mcp::trust::inspect(&dir, Some("b"), None).unwrap();
+        let id = lock(&state.mcp_trust).stage(review).unwrap().review_id;
+        lock(&state.mcp_trust).approve(id).unwrap();
+        lock(&state.mcp_trust).revoke("b").unwrap();
+        let mut body: serde_json::Value =
+            serde_json::from_str(&session_body("trust-race")).unwrap();
+        body["secrets"] =
+            serde_json::json!([{"name":"token","source":"mcp","locator":"vault/secret"}]);
+        let app = router(Arc::clone(&state));
+        let open =
+            tokio::spawn(async move { trust_test_request(app, "POST", "/session", body).await });
+        let start = Instant::now();
+        while !dir.join("waiting").exists() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "vault never reached wait"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let revision = mcp::servers::list(&dir).unwrap()["revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        mcp::servers::edit(
+            &dir,
+            &mut lock(&state.mcp_trust),
+            mcp::servers::Edit::Save {
+                revision,
+                name: "forbidden".into(),
+                create: false,
+                fields: serde_json::json!({"enabled":true}),
+            },
+        )
+        .unwrap();
+        std::fs::write(dir.join("release"), "").unwrap();
+        let (status, opened) = open.await.unwrap();
+        assert_eq!(status, StatusCode::CONFLICT, "{opened}");
+        assert!(
+            !dir.join("forbidden-started").exists(),
+            "unreviewed server executed"
+        );
+        assert!(lock(&state.sessions).is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn graphical_servers_are_companion_only_redacted_and_block_future_sessions() {
+        let dir = std::env::temp_dir().join(format!("visor-server-api-{}", Uuid::new_v4()));
+        let mut state = AppState::new(FakeDesktop::new(), Duration::from_millis(20));
+        state.mcp_dir = dir.clone();
+        let state = Arc::new(state);
+        let edit = serde_json::json!({"action":"save","revision":"missing","name":"remote","create":true,
+            "fields":{"type":"http","url":"https://user:private-password@example.com/private-path","headers":{"Authorization":"private-header"}}});
+        for app in [
+            router(Arc::clone(&state)),
+            tcp_router(Arc::clone(&state), "fixture-token".into()),
+        ] {
+            assert_eq!(
+                trust_test_request(app.clone(), "GET", "/mcp/servers", serde_json::json!({}))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+            assert_eq!(
+                trust_test_request(app, "POST", "/mcp/servers", edit.clone())
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(!dir.exists());
+        let app = companion_router(Arc::clone(&state));
+        assert_eq!(
+            trust_test_request(app.clone(), "GET", "/mcp/servers", serde_json::json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        assert!(!dir.exists());
+        let (status, body) = trust_test_request(app, "POST", "/mcp/servers", edit).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.to_string().contains("private-"));
+        assert!(!dir.join("mcp-profiles.json").exists());
+        assert!(lock(&state.mcp_trust).is_revoked("default"));
+        let body: serde_json::Value = serde_json::from_str(&session_body("server-editor")).unwrap();
+        assert_eq!(
+            trust_test_request(router(state), "POST", "/session", body)
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 

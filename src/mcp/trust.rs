@@ -386,36 +386,44 @@ impl TrustStore {
     }
     /// Profile edits never confer trust, including newly created profiles.
     pub fn block_for_edit(&mut self, profile: &str) -> Result<(), McpError> {
+        self.block_profiles(&[profile.to_string()])
+    }
+    pub fn block_profiles(&mut self, profiles: &[String]) -> Result<(), McpError> {
         let base = self
             .storage
             .as_ref()
-            .ok_or_else(|| McpError::message("Load trust before editing profiles"))?;
-        if !self.receipts.contains_key(profile) && self.receipts.len() >= MAX_REVIEWS {
+            .ok_or_else(|| McpError::message("Load trust before editing configuration"))?;
+        let mut next = self.receipts.clone();
+        for profile in profiles {
+            let receipt = next.entry(profile.clone()).or_insert_with(|| Receipt {
+                review_id: Uuid::new_v4(),
+                revoked: true,
+                source_kind: "selected_project".into(),
+                sources: vec![
+                    Fingerprint {
+                        path: base.join("mcp.json"),
+                        sha256: None,
+                    },
+                    Fingerprint {
+                        path: base.join("mcp-profiles.json"),
+                        sha256: None,
+                    },
+                ],
+            });
+            receipt.revoked = true;
+        }
+        if next.len() > MAX_REVIEWS {
             return Err(McpError::message(
-                "Trust profile limit reached; profile edit not saved",
+                "Trust profile limit reached; configuration edit not saved",
             ));
         }
-        let mut next = self.receipts.clone();
-        let receipt = next.entry(profile.into()).or_insert_with(|| Receipt {
-            review_id: Uuid::new_v4(),
-            revoked: true,
-            source_kind: "selected_project".into(),
-            sources: vec![
-                Fingerprint {
-                    path: base.join("mcp.json"),
-                    sha256: None,
-                },
-                Fingerprint {
-                    path: base.join("mcp-profiles.json"),
-                    sha256: None,
-                },
-            ],
-        });
-        receipt.revoked = true;
         self.persist(next)?;
-        self.grants.remove(profile);
-        self.revoked.insert(profile.into());
-        self.pending.retain(|_, p| p.resolution.profile != profile);
+        for profile in profiles {
+            self.grants.remove(profile);
+            self.revoked.insert(profile.clone());
+        }
+        self.pending
+            .retain(|_, p| !profiles.contains(&p.resolution.profile));
         Ok(())
     }
     pub fn is_revoked(&self, profile: &str) -> bool {
