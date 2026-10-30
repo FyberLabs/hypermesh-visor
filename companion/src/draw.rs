@@ -27,6 +27,7 @@ pub enum Action {
     ToggleEyes,
     ToggleBugCursor,
     McpProfiles,
+    McpTrust,
     McpDoctor,
     ContinueAutomation,
     DismissAutomation,
@@ -248,6 +249,7 @@ pub fn render(
         };
         let rows = [
             ("Open CLI", Action::OpenCli),
+            ("MCP trust", Action::McpTrust),
             ("MCP profiles", Action::McpProfiles),
             ("MCP doctor", Action::McpDoctor),
             ("Login", Action::Login),
@@ -1012,6 +1014,13 @@ mod tests {
             u32::MAX,
             0,
         )
+    }
+
+    #[test]
+    fn menu_exposes_mcp_trust_action() {
+        let sprites = Sprites::load();
+        let menu = render(&sprites, &Pose::Idle, Mascot::Idle, 0, true, false, None, false, false, None, None, u32::MAX, 0);
+        assert!(menu.hits.iter().any(|hit| hit.action==Action::McpTrust));
     }
 
     #[test]

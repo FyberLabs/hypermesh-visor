@@ -10,6 +10,7 @@ mod discovery;
 mod http;
 mod protocol;
 mod subscription;
+pub mod trust;
 mod secret_fetch;
 mod stdio;
 
@@ -18,9 +19,9 @@ pub use audit::{McpAuditRow, McpAuditor};
 pub use bindings::{
     companion_mode, explain_preferred, load_bindings, BindingCache, FocusedApp, MatchDecision,
 };
-pub use config::config_dir;
+pub use config::{config_dir, active_profile};
 pub use secret_fetch::fetch_secret_bytes;
-pub use stdio::{attach_profile, McpBundle, ToolInfo};
+pub use stdio::{attach_profile, attach_specs, McpBundle, ToolInfo};
 
 use std::fmt;
 

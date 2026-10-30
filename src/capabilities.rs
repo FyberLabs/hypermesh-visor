@@ -47,6 +47,9 @@ pub(crate) fn describe(backend: &str) -> Value {
             "tcp_requires_bearer": true
         },
         "mcp": {
+            "discovery": "/mcp/discovery",
+            "trust": "/mcp/trust",
+            "trust_requires_companion_socket": true,
             "attached_tools": "/session/{id}/mcp",
             "refresh_tools": "/session/{id}/mcp/refresh",
             "refresh_actions": ["refresh", "reconnect"],

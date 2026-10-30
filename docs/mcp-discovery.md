@@ -38,6 +38,60 @@ project is writable by others. Do not put credentials in issue reports or logs.
 Vault MCP retrieval remains separate and uses named servers from user `mcp.json`;
 it does not import project config or require session profile membership.
 
+## Review discovery sources in the companion
+
+Open the bug menu and choose **MCP trust**, or run `hypermesh-companion --mcp-trust`
+in an interactive terminal. The companion opens its trust screen in the installed
+terminal emulator, alongside the existing MCP profile and doctor actions.
+
+1. Choose **Review a profile** and enter its name, or leave it blank for the active
+   user profile. The profile must already exist in `mcp-profiles.json`; its server
+   list remains the selection boundary. Use the existing profile tools or edit
+   that file to change membership.
+2. Optionally enter an absolute MCP JSON file or directory containing `mcp.json`.
+   This previews the file without setting `HYPERMESH_MCP_PROJECT`, editing user
+   configuration, starting a command, or connecting to an endpoint. Blank uses
+   the daemon's existing configuration selection. No project scan occurs.
+3. Review each server's source path and kind, transport, executable, endpoint
+   origin, enabled state, working directory, argument count, environment/header names, and profile override fields.
+   The profile file supplying overrides is shown separately. Status explains
+   whether an entry is selected, disabled, outside the profile, or shadowed by a
+   user definition. An implicit Docker gateway is identified as `gateway_default`.
+4. Review the complete files privately. Argument values, environment/header
+   values, URL credentials, paths, and queries are hidden in this screen. Type
+   **TRUST** to approve the snapshot. Any other response, cancellation, or EOF
+   cancels; merely opening the screen never grants trust or starts a server.
+
+Approval is single-use, expires after five minutes, and checks that all source
+file contents still match the preview. A changed, removed, or newly created
+source requires another review. Future sessions selecting that profile (including
+when it remains the active profile) attach the captured effective configuration,
+not newly edited file contents. `GET /session/{id}/mcp` includes `provenance` and
+`trust_review` so a session's actual attachment source remains visible after edits.
+Existing explicitly configured user/environment selections retain their previous
+behavior when no reviewed snapshot overrides the profile.
+
+**Revoke a profile** removes its snapshot and blocks new sessions for that profile
+until another review is approved. It does not terminate existing sessions or their
+reconnects; close those sessions separately. An attachment already in progress is
+discarded if trust changes before it can be published as a session. Approval does
+not pin executables, working directories, referenced files, or environment values
+resolved when a process starts. Keep those resources under your control.
+
+Snapshots, revocations, and pending reviews are daemon-local and disappear on
+restart; they do not change `mcp.json` or profiles on disk. Restart restores the
+normal file/environment configuration behavior. Vault MCP secret retrieval is a
+separate explicit operation and does not use these session-profile grants.
+
+The UI uses `POST /mcp/discovery`, `GET /mcp/trust`, and `POST /mcp/trust` with
+`approve`, `cancel`, or `revoke`. These routes require the same-user companion
+socket; control-socket callers and TCP callers, including valid bearer holders,
+receive 403. This is a local account boundary, not protection against malicious
+processes already running as the same OS user. Trust actions are recorded in the
+MCP audit without config values or arguments. Configuration text is escaped before
+terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
+200 KiB of preview JSON, eight pending reviews, and eight approved/revoked profiles.
+
 ## Current matching and transport inventory
 
 - Stdio and HTTP/SSE transports initialize and load tools on attachment. Closing
@@ -57,7 +111,8 @@ it does not import project config or require session profile membership.
   cannot preserve a stale match. Failure to find a healthy match retains desktop mode. Input
   authorization and physical-user pause still apply.
 
-Issue #29 remains open for a reviewable discovery/provenance UI, native stable
+Issue #29 remains open for additional documented discovery sources, richer graphical
+profile editing/persistent approvals, native stable
 identity coverage beyond the current Linux probes, automatic server reconnect
 policy, and native Windows/macOS discovery. The implemented protocol surface and
 remaining compatibility limits are described below.
@@ -174,7 +229,7 @@ Legacy HTTP+SSE endpoint discovery, resumable POST responses, remote HTTP
 session DELETE, OAuth negotiation, and non-tool MCP features are not implemented.
 A server selecting `2024-11-05` over HTTP retains the existing POST/JSON/SSE
 response compatibility path, without a GET subscription. This is not a claim
-of complete MCP conformance. Discovery provenance/UI and broader platform
+of complete MCP conformance. Additional discovery sources and broader platform
 acceptance remain tracked in #29.
 
 Protocol references: [lifecycle and capabilities](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)

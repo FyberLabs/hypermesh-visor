@@ -358,13 +358,46 @@ fn exchange_at(path: &Path, request: &str) -> Option<String> {
     }
 }
 
+pub fn trust_request(
+    path: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    if !matches!(path, "/mcp/trust" | "/mcp/discovery") {
+        return Err("Invalid trust endpoint".into());
+    }
+    let method = if body.is_some() { "POST" } else { "GET" };
+    let body = body.map(|v| v.to_string()).unwrap_or_default();
+    let request = format!("{method} {path} HTTP/1.1\r\nhost: hypermesh\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len());
+    let socket = socket_path().ok_or("Companion socket unavailable")?;
+    let Exchange::Body(response) = exchange_read_timeout(&socket, &request, Duration::from_secs(5))
+    else {
+        return Err("Cannot reach visor; no trust change confirmed".into());
+    };
+    if !status_ok(&response) {
+        let message = body_of(&response)
+            .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
+            .and_then(|value| value.get("error").and_then(|v| v.as_str()).map(str::to_string))
+            .unwrap_or_else(|| "Review rejected; review again".into());
+        let message: String = message.chars().take(200).flat_map(char::escape_default).collect();
+        return Err(format!("MCP review failed: {message}"));
+    }
+    let body = body_of(&response).ok_or("Invalid visor response")?;
+    if body.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(body).map_err(|_| "Invalid or oversized visor response".into())
+}
+
 fn exchange_read(path: &Path, request: &str) -> Exchange {
+    exchange_read_timeout(path, request, Duration::from_millis(300))
+}
+fn exchange_read_timeout(path: &Path, request: &str, timeout: Duration) -> Exchange {
     let mut stream = match UnixStream::connect(path) {
         Ok(stream) => stream,
         Err(_) => return Exchange::Failed,
     };
     if stream
-        .set_read_timeout(Some(Duration::from_millis(300)))
+        .set_read_timeout(Some(timeout))
         .is_err()
         || stream
             .set_write_timeout(Some(Duration::from_millis(200)))
