@@ -330,6 +330,22 @@ remaining compatibility limits are described below.
 
 ## Attachment diagnostics
 
+Choose **MCP status** in the companion menu, or run
+`hypermesh-companion --mcp-status` from your desktop session. The read-only
+plain-text dialog explains focused-app matching and desktop fallback, the winning
+binding index when present, attachment routing states, and last-negotiated tool
+capabilities. It shows the driving session, or the most recently used session
+when automation is off. Reopen the dialog to get a new snapshot.
+
+The dialog reads only `GET /mcp/status` through the same-user companion socket.
+This endpoint does not register or renew an automation heartbeat.
+Its session includes bounded `mcp_attachments` summaries and an explicit
+`mcp_attachments_omitted` count, using the existing companion list/text limits.
+It does not fetch tool catalogs, show private connection settings, or submit
+refreshes, reconnects, approvals, or tool calls. Empty sessions, older daemons,
+and unavailable status have explicit messages. Cancel/close performs no mutation.
+
+
 Each server in `GET /session/{id}/mcp` includes a `routing_status`:
 
 | Status | Meaning |

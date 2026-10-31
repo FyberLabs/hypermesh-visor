@@ -732,13 +732,15 @@ fn on_click(
                 *app.status.lock().unwrap() = err;
             }
         }
-        Action::McpTrust | Action::McpServers => {
+        Action::McpTrust | Action::McpServers | Action::McpStatus => {
             app.menu = false;
             let status = Arc::clone(&app.status);
             let action = hit.action;
             std::thread::spawn(move || {
                 let result = if action == Action::McpTrust {
                     crate::mcp_trust_gui::run()
+                } else if action == Action::McpStatus {
+                    crate::mcp_status::run()
                 } else {
                     crate::mcp_servers::run()
                 };

@@ -13,6 +13,7 @@ mod mcp_trust;
 mod mcp_profiles;
 mod mcp_dialog;
 mod mcp_servers;
+mod mcp_status;
 mod mcp_trust_gui;
 mod pages;
 mod pointer;
@@ -41,6 +42,10 @@ fn main() -> ExitCode {
                 eprintln!("hypermesh-companion: {err}");
                 ExitCode::from(1)
             }
+        },
+        Some("--mcp-status") => match mcp_status::run() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => { eprintln!("MCP status: {err}"); ExitCode::from(1) }
         },
         Some("--mcp-servers") => match mcp_servers::run() {
             Ok(()) => ExitCode::SUCCESS,
@@ -134,7 +139,7 @@ fn main() -> ExitCode {
         }
         Some("-h" | "--help") => {
             println!(
-                "hypermesh-companion\n  --mcp-servers       edit MCP servers in desktop dialogs\n  --mcp-trust-gui     review and revoke MCP trust in desktop dialogs\n  --mcp-profiles      edit MCP profiles in desktop dialogs\n  --mcp-trust         review discovery sources and trust snapshots\n  --dump-frames DIR   write an idle frame and an automation frame\n  --prompt TEXT --session ID [--model NAME] [--visor URL]\n      send one prompt on the visor stream\n\nThe bug plays the animated states in companion/assets/states.\nWhile the visor drives the desktop the pointer is the bug cursor.\nBug cursor outside an automation is off unless companion.toml sets bug_cursor.\nsleep_after_secs (default 900) and automation_resume_secs (default 120)\nare read from that file at startup."
+                "hypermesh-companion\n  --mcp-status        show focused-app routing and attachment status\n  --mcp-servers       edit MCP servers in desktop dialogs\n  --mcp-trust-gui     review and revoke MCP trust in desktop dialogs\n  --mcp-profiles      edit MCP profiles in desktop dialogs\n  --mcp-trust         review discovery sources and trust snapshots\n  --dump-frames DIR   write an idle frame and an automation frame\n  --prompt TEXT --session ID [--model NAME] [--visor URL]\n      send one prompt on the visor stream\n\nThe bug plays the animated states in companion/assets/states.\nWhile the visor drives the desktop the pointer is the bug cursor.\nBug cursor outside an automation is off unless companion.toml sets bug_cursor.\nsleep_after_secs (default 900) and automation_resume_secs (default 120)\nare read from that file at startup."
             );
             ExitCode::SUCCESS
         }

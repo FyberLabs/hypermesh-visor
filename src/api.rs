@@ -294,12 +294,21 @@ impl AppState {
                 None => None,
             }
             .or_else(|| sessions.values().max_by_key(|session| session.touched()))?;
+            let attachments: Vec<_> = session.mcp().servers.iter()
+                .map(|server| (server, server.routing_status())).collect();
             ChosenSession {
                 id: session.id(),
                 purpose: clip_text(session.purpose(), SESSION_TEXT_MAX),
                 verb: session.verb().map(Verb::as_str),
                 mcp_servers: session.mcp().server_names(),
-                healthy: session.mcp().healthy_server_names(),
+                healthy: attachments.iter().filter(|(_, status)| *status == mcp::RoutingStatus::Ready)
+                    .map(|(server, _)| server.name.clone()).collect(),
+                mcp_attachments: attachments.iter().take(SESSION_LIST_MAX).map(|(server, status)| McpAttachment {
+                    name: clip_text(&server.name, SESSION_TEXT_MAX),
+                    routing_status: *status,
+                    protocol: server.negotiated.clone(),
+                }).collect(),
+                mcp_attachments_omitted: session.mcp().servers.len().saturating_sub(SESSION_LIST_MAX),
                 idle_ms: u64::try_from(session.touched().elapsed().as_millis()).unwrap_or(u64::MAX),
             }
         };
@@ -335,6 +344,8 @@ impl AppState {
             focused,
             prefer_mcp,
             mcp_match,
+            mcp_attachments: chosen.mcp_attachments,
+            mcp_attachments_omitted: chosen.mcp_attachments_omitted,
             idle_ms: chosen.idle_ms,
         })
     }
@@ -534,7 +545,17 @@ struct ChosenSession {
     verb: Option<&'static str>,
     mcp_servers: Vec<String>,
     healthy: Vec<String>,
+    mcp_attachments: Vec<McpAttachment>,
+    mcp_attachments_omitted: usize,
     idle_ms: u64,
+}
+
+#[derive(Serialize)]
+struct McpAttachment {
+    name: String,
+    routing_status: mcp::RoutingStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<mcp::NegotiatedProtocol>,
 }
 
 #[derive(Serialize)]
@@ -554,6 +575,8 @@ struct CompanionSession {
     focused: Option<FocusedApp>,
     prefer_mcp: bool,
     mcp_match: MatchDecision,
+    mcp_attachments: Vec<McpAttachment>,
+    mcp_attachments_omitted: usize,
     /// Milliseconds since this session was last used.
     idle_ms: u64,
 }
@@ -619,6 +642,7 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .route("/mcp-audit", get(list_mcp_audit))
         .route("/mcp/discovery", post(mcp_discovery))
         .route("/mcp/trust", get(mcp_trusted).post(mcp_trust_decision))
+        .route("/mcp/status", get(mcp_status))
         .route("/mcp/sources", get(mcp_sources))
         .route("/mcp/profiles", get(mcp_profiles).post(mcp_profile_edit))
         .route("/mcp/servers", get(mcp_servers).post(mcp_server_edit))
@@ -673,6 +697,15 @@ async fn mcp_discovery(
     })
     .await
     .map_err(|_| ApiError::internal("MCP discovery task failed"))?
+}
+
+/// Diagnostics must never register a companion heartbeat or mutate the gate.
+async fn mcp_status(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !link.0 { return Err(ApiError::forbidden("MCP status requires the local companion socket")); }
+    Ok(Json(serde_json::json!({"session": state.companion_session()})))
 }
 
 async fn mcp_servers(
@@ -4180,6 +4213,8 @@ while True:
         let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(companion["session"]["prefer_mcp"], false);
         assert_eq!(companion["session"]["mcp_match"]["reason"], "focus_unavailable");
+        assert_eq!(companion["session"]["mcp_attachments"][0], serde_json::json!({"name":"fixture","routing_status":"ready","protocol":{"version":"2024-11-05","tools":true,"list_changed":false}}));
+        assert_eq!(companion["session"]["mcp_attachments_omitted"], 0);
         assert_eq!(companion["session"]["mcp_match"]["bindings_status"], "ready");
         assert!(companion["session"].get("mcp").is_none() || companion["session"]["mcp"].is_null());
 
@@ -5311,6 +5346,28 @@ while True:
             "a start replayed after the poll expired must not enter running"
         );
         let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn mcp_status_never_establishes_or_renews_companion_presence() {
+        let timeout = Duration::from_secs(2);
+        let state = Arc::new(AppState::new(FakeDesktop::new(), timeout));
+        let app = companion_router(Arc::clone(&state));
+        for previously_present in [false, true] {
+            if previously_present {
+                lock(&state.automation).note_poll(Instant::now() - Duration::from_secs(10), timeout);
+            }
+            let (status, body) = trust_test_request(app.clone(), "GET", "/mcp/status", serde_json::json!({})).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body["session"].is_null());
+            let gate = lock(&state.automation);
+            assert!(!gate.poll_fresh(Instant::now(), timeout));
+            assert_eq!(gate.stale_reentry(Instant::now(), timeout), previously_present);
+        }
+        assert_eq!(trust_test_request(router(Arc::clone(&state)), "GET", "/mcp/status", serde_json::json!({})).await.0, StatusCode::FORBIDDEN);
+        // A real monitoring poll still grants presence.
+        trust_test_request(app, "GET", "/companion", serde_json::json!({})).await;
+        assert!(lock(&state.automation).poll_fresh(Instant::now(), timeout));
     }
 
     #[tokio::test]

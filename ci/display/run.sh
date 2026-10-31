@@ -2521,7 +2521,7 @@ PY
 
 scenario_mcp_profiles() {
   local mode
-  for mode in profiles servers trust; do
+  for mode in profiles servers trust status; do
     dbus-run-session -- python3 "$root/ci/display/mcp-profiles.py" "$COMPANION_BIN" "$mode"
   done
 }
