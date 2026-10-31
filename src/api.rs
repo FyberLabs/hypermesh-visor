@@ -1071,6 +1071,9 @@ struct SessionMcpBody {
 #[derive(Serialize)]
 struct SessionMcpServer {
     refreshing: bool,
+    routing_status: mcp::RoutingStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<mcp::NegotiatedProtocol>,
     name: String,
     transport: String,
     healthy: bool,
@@ -1240,12 +1243,17 @@ async fn session_mcp(
         .mcp()
         .servers
         .iter()
-        .map(|server| SessionMcpServer {
-            refreshing: server.refreshing,
-            name: server.name.clone(),
-            transport: server.transport.clone(),
-            healthy: server.is_healthy(),
-            tools: server.tools.clone(),
+        .map(|server| {
+            let routing_status = server.routing_status();
+            SessionMcpServer {
+                refreshing: server.refreshing,
+                routing_status,
+                protocol: server.negotiated.clone(),
+                name: server.name.clone(),
+                transport: server.transport.clone(),
+                healthy: routing_status.is_healthy(),
+                tools: server.tools.clone(),
+            }
         })
         .collect();
     Ok(Json(SessionMcpBody {
@@ -4154,6 +4162,8 @@ while True:
         assert_eq!(mcp["profile"], "default");
         assert_eq!(mcp["servers"][0]["name"], "fixture");
         assert_eq!(mcp["servers"][0]["healthy"], true);
+        assert_eq!(mcp["servers"][0]["routing_status"], "ready");
+        assert_eq!(mcp["servers"][0]["protocol"], serde_json::json!({"version":"2024-11-05","tools":true,"list_changed":false}));
         assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
         assert_eq!(mcp["servers"][0]["tools"][0]["inputSchema"], serde_json::json!({"type":"object"}));
         assert_eq!(mcp["servers"][0]["tools"][0]["annotations"]["readOnlyHint"], true);

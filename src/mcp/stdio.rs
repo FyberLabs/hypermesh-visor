@@ -41,6 +41,7 @@ struct StdioClient {
     supports_tools: bool,
     listed_generation: u64,
     next_id: u64,
+    negotiated: Option<super::protocol::Negotiated>,
 }
 
 impl StdioClient {
@@ -133,6 +134,23 @@ fn read_background(
     changes.failed.store(true, Ordering::Release);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingStatus {
+    Refreshing,
+    Disconnected,
+    CatalogStale,
+    NoTools,
+    TaskRequired,
+    Ready,
+}
+
+impl RoutingStatus {
+    pub fn is_healthy(self) -> bool {
+        matches!(self, Self::Ready | Self::TaskRequired)
+    }
+}
+
 pub struct AttachedServer {
     pub name: String,
     pub transport: String,
@@ -142,6 +160,7 @@ pub struct AttachedServer {
     http: Option<HttpClient>,
     spec: ServerSpec,
     pub refreshing: bool,
+    pub negotiated: Option<super::protocol::Negotiated>,
     listed_generation: u64,
 }
 
@@ -160,6 +179,7 @@ impl AttachedServer {
             tools,
             child: None,
             client: None,
+            negotiated: http.negotiated.clone(),
             http: Some(http),
             spec,
             refreshing: false,
@@ -210,14 +230,22 @@ impl AttachedServer {
             })
     }
 
-    pub fn is_healthy(&self) -> bool {
-        if self.needs_refresh() {
-            return false;
+    pub fn routing_status(&self) -> RoutingStatus {
+        if self.refreshing { return RoutingStatus::Refreshing; }
+        if !self.connection_alive() || self.changes().is_some_and(|c| c.failed.load(Ordering::Acquire)) {
+            return RoutingStatus::Disconnected;
         }
+        if self.needs_refresh() { return RoutingStatus::CatalogStale; }
+        if self.tools.is_empty() { return RoutingStatus::NoTools; }
+        if !self.tools.iter().any(ToolInfo::supports_direct_call) { return RoutingStatus::TaskRequired; }
+        RoutingStatus::Ready
+    }
 
-        if self.tools.is_empty() {
-            return false;
-        }
+    pub fn is_healthy(&self) -> bool {
+        self.routing_status().is_healthy()
+    }
+
+    fn connection_alive(&self) -> bool {
         match self.transport.as_str() {
             "stdio" => {
                 if self.client.is_none() {
@@ -359,6 +387,7 @@ impl McpBundle {
             http: None,
             spec: server.spec.clone(),
             refreshing: true,
+            negotiated: server.negotiated.clone(),
             listed_generation: 0,
         };
         Ok(std::mem::replace(server, placeholder))
@@ -381,7 +410,7 @@ impl McpBundle {
     pub fn healthy_server_names(&self) -> Vec<String> {
         self.servers
             .iter()
-            .filter(|s| s.is_healthy() && s.tools.iter().any(ToolInfo::supports_direct_call))
+            .filter(|s| s.routing_status() == RoutingStatus::Ready)
             .map(|s| s.name.clone())
             .collect()
     }
@@ -511,6 +540,7 @@ fn attach_stdio(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpErro
         transport: "stdio".into(),
         tools,
         child: Some(child),
+        negotiated: client.negotiated.clone(),
         client: Some(client),
         http: None,
         spec: spec.clone(),
@@ -570,9 +600,11 @@ fn handshake(
         supports_tools: false,
         listed_generation: 0,
         next_id: 1,
+        negotiated: None,
     };
     let init = client.call(name, "initialize", json!({"protocolVersion":super::protocol::VERSION,"capabilities":{},"clientInfo":{"name":"hypermesh-visor","version":"0.1.0"}}))?;
     let negotiated = super::protocol::negotiate(&init)?;
+    client.negotiated = Some(negotiated.clone());
     client.supports_tools = negotiated.tools;
     client
         .changes
@@ -840,16 +872,21 @@ for line in sys.stdin:
         fs::write(&version, "new").unwrap();
         server.refresh(false).unwrap();
         assert_eq!(server.tools[1].name, "new-b");
+        assert_eq!(server.routing_status(), RoutingStatus::Ready);
+        assert_eq!(server.negotiated.as_ref().unwrap().version, "2024-11-05");
         assert_eq!(server.tools[1].input_schema.as_ref().unwrap()["properties"], json!({"new":{"type":"string"}}));
         fs::write(&version, "required").unwrap();
         server.refresh(false).unwrap();
         assert!(server.call_tool("required-a", json!({})).unwrap_err().to_string().contains("requires task execution"));
         assert!(server.is_healthy());
         assert!(!calls.exists(), "task-required call reached the child");
+        assert_eq!(server.routing_status(), RoutingStatus::TaskRequired);
         fs::write(&version, "invalid-schema").unwrap();
         assert!(server.refresh(false).is_err());
         assert!(server.tools.is_empty());
         assert!(!server.is_healthy());
+        assert_eq!(server.routing_status(), RoutingStatus::Disconnected);
+        assert_eq!(server.negotiated.as_ref().unwrap().version, "2024-11-05");
         fs::write(&version, "new").unwrap();
         server.refresh(true).unwrap();
         fs::write(&version, "fail").unwrap();
