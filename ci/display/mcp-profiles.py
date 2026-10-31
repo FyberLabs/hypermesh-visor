@@ -10,8 +10,8 @@ import threading
 import time
 
 mode = sys.argv[2] if len(sys.argv) > 2 else "profiles"
-title = {"profiles": "MCP profiles", "servers": "MCP servers", "trust": "MCP trust"}[mode]
-option = {"profiles": "--mcp-profiles", "servers": "--mcp-servers", "trust": "--mcp-trust-gui"}[mode]
+title = {"profiles": "MCP profiles", "servers": "MCP servers", "trust": "MCP trust", "status": "MCP status"}[mode]
+option = {"profiles": "--mcp-profiles", "servers": "--mcp-servers", "trust": "--mcp-trust-gui", "status": "--mcp-status"}[mode]
 
 with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
     listener = socket.socket(socket.AF_UNIX)
@@ -49,6 +49,8 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
                 }
                 if mode == "servers":
                     payload = {"revision": "fixture", "servers": [{"name": "editor", "transport": "stdio", "enabled": True}]}
+                elif mode == "status":
+                    payload = {"session": None}
                 elif mode == "trust":
                     payload = []
                 body = json.dumps(payload).encode()
@@ -83,7 +85,8 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
         subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
         subprocess.run(["xdotool", "key", "Escape"], check=True)
         assert process.wait(timeout=5) == 0, "cancel did not exit cleanly"
-        assert calls == [f"GET /mcp/{mode} HTTP/1.1".encode()], calls
+        endpoint = "/companion" if mode == "status" else f"/mcp/{mode}"
+        assert calls == [f"GET {endpoint} HTTP/1.1".encode()], calls
         assert not errors, errors
         print(f"{title} GTK chooser rendered; cancel submitted no writes")
     finally:

@@ -294,12 +294,21 @@ impl AppState {
                 None => None,
             }
             .or_else(|| sessions.values().max_by_key(|session| session.touched()))?;
+            let attachments: Vec<_> = session.mcp().servers.iter()
+                .map(|server| (server, server.routing_status())).collect();
             ChosenSession {
                 id: session.id(),
                 purpose: clip_text(session.purpose(), SESSION_TEXT_MAX),
                 verb: session.verb().map(Verb::as_str),
                 mcp_servers: session.mcp().server_names(),
-                healthy: session.mcp().healthy_server_names(),
+                healthy: attachments.iter().filter(|(_, status)| *status == mcp::RoutingStatus::Ready)
+                    .map(|(server, _)| server.name.clone()).collect(),
+                mcp_attachments: attachments.iter().take(SESSION_LIST_MAX).map(|(server, status)| McpAttachment {
+                    name: clip_text(&server.name, SESSION_TEXT_MAX),
+                    routing_status: *status,
+                    protocol: server.negotiated.clone(),
+                }).collect(),
+                mcp_attachments_omitted: session.mcp().servers.len().saturating_sub(SESSION_LIST_MAX),
                 idle_ms: u64::try_from(session.touched().elapsed().as_millis()).unwrap_or(u64::MAX),
             }
         };
@@ -335,6 +344,8 @@ impl AppState {
             focused,
             prefer_mcp,
             mcp_match,
+            mcp_attachments: chosen.mcp_attachments,
+            mcp_attachments_omitted: chosen.mcp_attachments_omitted,
             idle_ms: chosen.idle_ms,
         })
     }
@@ -534,7 +545,17 @@ struct ChosenSession {
     verb: Option<&'static str>,
     mcp_servers: Vec<String>,
     healthy: Vec<String>,
+    mcp_attachments: Vec<McpAttachment>,
+    mcp_attachments_omitted: usize,
     idle_ms: u64,
+}
+
+#[derive(Serialize)]
+struct McpAttachment {
+    name: String,
+    routing_status: mcp::RoutingStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<mcp::NegotiatedProtocol>,
 }
 
 #[derive(Serialize)]
@@ -554,6 +575,8 @@ struct CompanionSession {
     focused: Option<FocusedApp>,
     prefer_mcp: bool,
     mcp_match: MatchDecision,
+    mcp_attachments: Vec<McpAttachment>,
+    mcp_attachments_omitted: usize,
     /// Milliseconds since this session was last used.
     idle_ms: u64,
 }
@@ -4180,6 +4203,8 @@ while True:
         let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(companion["session"]["prefer_mcp"], false);
         assert_eq!(companion["session"]["mcp_match"]["reason"], "focus_unavailable");
+        assert_eq!(companion["session"]["mcp_attachments"][0], serde_json::json!({"name":"fixture","routing_status":"ready","protocol":{"version":"2024-11-05","tools":true,"list_changed":false}}));
+        assert_eq!(companion["session"]["mcp_attachments_omitted"], 0);
         assert_eq!(companion["session"]["mcp_match"]["bindings_status"], "ready");
         assert!(companion["session"].get("mcp").is_none() || companion["session"]["mcp"].is_null());
 
