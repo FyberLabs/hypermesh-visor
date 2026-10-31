@@ -139,7 +139,7 @@ review sequence is:
 1. Choose **Review a profile** and enter its name, or leave it blank for the active
    user profile. The profile must already exist in `mcp-profiles.json`; its server
    list remains the selection boundary. Use **MCP profiles** or edit that file to change membership.
-2. Select a listed Cursor or VS Code source ID, or enter an absolute MCP JSON
+2. Select a listed editor source ID, or enter an absolute MCP JSON
    file or directory containing `mcp.json`.
    This previews the file without setting `HYPERMESH_MCP_PROJECT`, editing user
    configuration, starting a command, or connecting to an endpoint. Blank uses
@@ -195,6 +195,8 @@ Known locations on Linux:
 
 | Source ID | MCP file |
 | --- | --- |
+| `zed_user` | `<config>/zed/settings.json` |
+| `devin_user` | `~/.config/devin/mcp_config.json` |
 | `cursor_global` | `~/.cursor/mcp.json` |
 | `vscode_user` | `<config>/Code/User/mcp.json` |
 | `vscode_insiders_user` | `<config>/Code - Insiders/User/mcp.json` |
@@ -217,11 +219,29 @@ path for omitted profiles, portable/custom user-data installations, or workspace
 configurations. Projects are never scanned or automatically imported.
 
 External imports accept JSON and JSONC (line/block comments and trailing commas)
-with either `mcpServers` or `servers`. JSON5 features such as single quotes,
+with exactly one `mcpServers`, `servers`, or Zed `context_servers` map. JSON5 features such as single quotes,
 unquoted keys, and non-JSON numbers are unsupported. User/profile files belonging
 to visor itself still require strict JSON. Receipts hash the original external
 file bytes, so even comment-only edits require review after restart. Existing
 strict-JSON approvals retain their semantics.
+
+Zed imports support custom command/args/env and URL/headers definitions, including
+`enabled: false`. Extension-provided definitions and legacy command objects need
+an explicit compatible export. Only these unrelated presentation settings may
+accompany `context_servers`: `theme`, `icon_theme`, `buffer_font_family`,
+`buffer_font_size`, `ui_font_family`, `ui_font_size`, `vim_mode`, `tab_size`,
+`soft_wrap`, and `show_whitespaces`. Other root settings (including agent policies,
+release-channel overrides, and settings layers) are rejected rather than ignored.
+The complete settings file is pinned, including presentation changes.
+
+Devin Local discovery uses its current dedicated user MCP file, not the older
+`config.json` layout. Visor does not migrate older files, merge project/local
+layers, or inherit editor enterprise policies or OAuth sessions. Its `disabled`
+flag is preserved; explicit `transport: "http"` maps to visor's HTTP transport.
+Legacy SSE, OAuth options, file substitutions, and conflicting transport fields
+are rejected. Supply static compatible server definitions and review their
+credentials separately. Neither integration starts or contacts servers during
+listing, preview, or approval; attach remains a separate approved-session action.
 
 Imports preserve visor's user-first precedence and profile membership. Editor
 inputs, sandbox settings, env files, OAuth settings, and unsupported variable
@@ -234,6 +254,9 @@ version to review or revoke them.
 Source references: [Cursor MCP configuration](https://prod.cursor.com/help/customization/mcp),
 [VS Code MCP configuration](https://code.visualstudio.com/docs/agents/reference/mcp-configuration),
 [profile file layout](https://code.visualstudio.com/docs/configure/settings#_profile-settings),
+[Zed custom MCP servers](https://zed.dev/docs/ai/mcp),
+[Zed Linux configuration](https://github.com/zed-industries/zed/blob/main/docs/.doc-examples/configuration.md),
+[Devin MCP configuration](https://docs.devin.ai/cli/extensibility/mcp/configuration),
 and [VS Code profile resource resolution](https://github.com/microsoft/vscode/blob/main/src/vs/platform/userDataProfile/common/userDataProfile.ts).
 
 The UI uses `GET /mcp/sources`, `POST /mcp/discovery` (optional `source_id` or

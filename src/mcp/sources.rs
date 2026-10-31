@@ -46,6 +46,20 @@ fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
             });
             add_profiles(&mut out, &user.join("profiles"), id, label);
         }
+        out.push(Location {
+            id: "zed_user".into(),
+            label: "Zed user settings".into(),
+            path: config.join("zed/settings.json"),
+            status: "missing",
+        });
+    }
+    if let Some(home) = home.filter(|p| p.is_absolute()) {
+        out.push(Location {
+            id: "devin_user".into(),
+            label: "Devin Local user configuration".into(),
+            path: home.join(".config/devin/mcp_config.json"),
+            status: "missing",
+        });
     }
     for location in &mut out {
         if location.status == "use_explicit_path" {
@@ -71,7 +85,12 @@ fn profile_id(id: &str) -> bool {
 pub(super) fn valid_source_kind(kind: &str) -> bool {
     matches!(
         kind,
-        "selected_project" | "cursor_global" | "vscode_user" | "vscode_insiders_user"
+        "selected_project"
+            | "cursor_global"
+            | "vscode_user"
+            | "vscode_insiders_user"
+            | "zed_user"
+            | "devin_user"
     ) || ["vscode_profile:", "vscode_insiders_profile:"]
         .iter()
         .any(|prefix| kind.strip_prefix(prefix).is_some_and(profile_id))
@@ -148,19 +167,36 @@ pub(super) fn normalize(raw: &str) -> Result<String, McpError> {
     let object = value
         .as_object()
         .ok_or_else(|| McpError::message("MCP import must be an object"))?;
-    let key = match (
-        object.contains_key("mcpServers"),
-        object.contains_key("servers"),
-    ) {
-        (true, false) => "mcpServers",
-        (false, true) => "servers",
-        _ => {
-            return Err(McpError::message(
-                "MCP import requires exactly one servers or mcpServers map",
-            ))
-        }
-    };
-    if object.keys().any(|k| k != key && k != "$schema") {
+    let keys: Vec<_> = ["mcpServers", "servers", "context_servers"]
+        .into_iter()
+        .filter(|key| object.contains_key(*key))
+        .collect();
+    if keys.len() != 1 {
+        return Err(McpError::message(
+            "MCP import requires exactly one servers, mcpServers, or context_servers map",
+        ));
+    }
+    let key = keys[0];
+    // Zed stores MCP definitions in its general settings file. Only ignore
+    // explicitly harmless presentation settings; never drop policy or layers.
+    if object.keys().any(|k| {
+        k != key
+            && k != "$schema"
+            && !(key == "context_servers"
+                && matches!(
+                    k.as_str(),
+                    "theme"
+                        | "icon_theme"
+                        | "buffer_font_family"
+                        | "buffer_font_size"
+                        | "ui_font_family"
+                        | "ui_font_size"
+                        | "vim_mode"
+                        | "tab_size"
+                        | "soft_wrap"
+                        | "show_whitespaces"
+                ))
+    }) {
         return Err(McpError::message(
             "MCP import contains unsupported root settings",
         ));
@@ -173,6 +209,30 @@ pub(super) fn normalize(raw: &str) -> Result<String, McpError> {
         let entry = server
             .as_object_mut()
             .ok_or_else(|| McpError::message("Invalid MCP server"))?;
+        if let Some(transport) = entry.remove("transport") {
+            if entry.contains_key("type") || transport != "http" {
+                return Err(McpError::message(
+                    "Unsupported or conflicting MCP transport",
+                ));
+            }
+            entry.insert("type".into(), transport);
+        }
+        if key == "context_servers" {
+            let command = entry
+                .get("command")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            let url = entry
+                .get("url")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty());
+            if command.is_some() == url.is_some()
+                || entry.get("command").is_some_and(|v| !v.is_string())
+                || entry.get("url").is_some_and(|v| !v.is_string())
+            {
+                return Err(McpError::message("Zed import requires a custom command or URL server; export extension definitions explicitly"));
+            }
+        }
         if entry.keys().any(|k| {
             !matches!(
                 k.as_str(),
@@ -238,7 +298,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested/.cursor")).unwrap();
         std::fs::write(dir.join("nested/.cursor/mcp.json"), "must not discover").unwrap();
         let sources = locations(Some(&dir), Some(&dir.join("xdg")));
-        assert_eq!(sources.len(), 3);
+        assert_eq!(sources.len(), 5);
         assert_eq!(sources[0].status, "available_for_review");
         assert_eq!(sources[1].path, dir.join("xdg/Code/User/mcp.json"));
         assert_eq!(sources[1].status, "missing");
@@ -266,7 +326,8 @@ mod tests {
                 "vscode_user",
                 "vscode_profile:a-first",
                 "vscode_profile:z-last",
-                "vscode_insiders_user"
+                "vscode_insiders_user",
+                "zed_user"
             ]
         );
         assert!(sources[1].path.ends_with("profiles/a-first/mcp.json"));
@@ -292,6 +353,77 @@ mod tests {
         assert!(sources.iter().any(|s| s.status == "use_explicit_path"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    #[test]
+    fn additional_editor_locations_use_documented_roots_without_reading_files() {
+        let dir = std::env::temp_dir().join(format!("visor-editors-{}", uuid::Uuid::new_v4()));
+        let xdg = dir.join("custom");
+        for path in [
+            xdg.join("zed/settings.json"),
+            dir.join(".config/devin/mcp_config.json"),
+        ] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "not JSON: metadata only").unwrap();
+        }
+        let sources = locations(Some(&dir), Some(&xdg));
+        for (id, path) in [
+            ("zed_user", xdg.join("zed/settings.json")),
+            ("devin_user", dir.join(".config/devin/mcp_config.json")),
+        ] {
+            let source = sources.iter().find(|s| s.id == id).unwrap();
+            assert_eq!(source.path, path);
+            assert_eq!(source.status, "available_for_review");
+            assert!(valid_source_kind(id));
+        }
+        let fallback = locations(Some(&dir), Some(Path::new("relative")));
+        assert_eq!(
+            fallback.iter().find(|s| s.id == "zed_user").unwrap().path,
+            dir.join(".config/zed/settings.json")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn zed_custom_servers_and_devin_http_import_preserve_controls() {
+        let raw = r#"{// ordinary Zed presentation settings
+            "theme":"One Dark", "vim_mode":true,
+            "context_servers":{
+                "local":{"command":"never-run","args":["private"],"enabled":false},
+                "remote":{"url":"https://example.com/mcp","headers":{"Authorization":"private"}},
+            },
+        }"#;
+        let parsed: Value = serde_json::from_str(&normalize(raw).unwrap()).unwrap();
+        assert_eq!(parsed["mcpServers"]["local"]["enabled"], false);
+        assert_eq!(
+            parsed["mcpServers"]["remote"]["headers"]["Authorization"],
+            "private"
+        );
+        let parsed: Value = serde_json::from_str(
+            &normalize(
+                r#"{"mcpServers":{"remote":{
+            "url":"https://example.com/mcp","transport":"http","disabled":true}}}"#,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed["mcpServers"]["remote"]["type"], "http");
+        assert_eq!(parsed["mcpServers"]["remote"]["enabled"], false);
+        for raw in [
+            r#"{"context_servers":{},"servers":{}}"#,
+            r#"{"context_servers":{},"nightly":{"context_servers":{}}}"#,
+            r#"{"context_servers":{},"agent":{"tool_permissions":{}}}"#,
+            r#"{"context_servers":{"extension":{"enabled":true}}}"#,
+            r#"{"context_servers":{"legacy":{"command":{"path":"x"}}}}"#,
+            r#"{"context_servers":{"both":{"command":"x","url":"https://example.com"}}}"#,
+            r#"{"context_servers":{"extension":{"command":"x","settings":{}}}}"#,
+            r#"{"mcpServers":{"remote":{"url":"https://example.com","transport":"sse"}}}"#,
+            r#"{"mcpServers":{"remote":{"url":"https://example.com","transport":"http","type":"http"}}}"#,
+            r#"{"mcpServers":{"remote":{"url":"https://example.com","oauthClientId":"private"}}}"#,
+            r#"{"mcpServers":{"local":{"command":"x","env":{"TOKEN":"${file:/secret}"}}}}"#,
+        ] {
+            assert!(normalize(raw).is_err(), "accepted {raw}");
+        }
+    }
+
     #[test]
     fn profile_receipt_ids_cannot_encode_paths() {
         for id in [
