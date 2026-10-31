@@ -588,6 +588,10 @@ mod tests {
                 "devin_user",
                 r#"{/*reviewed*/"mcpServers":{"new":{"url":"https://example.com/mcp","transport":"http"}}}"#,
             ),
+            (
+                "junie_user",
+                r#"{/*reviewed*/"mcpServers":{"new":{"url":"https://example.com/mcp","type":"streamable-http"}}}"#,
+            ),
         ] {
             let dir = fixture();
             let path = dir.join("editor.json");

@@ -61,6 +61,14 @@ fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
             status: "missing",
         });
     }
+    if let Some(home) = home.filter(|p| p.is_absolute()) {
+        out.push(Location {
+            id: "junie_user".into(),
+            label: "Junie user configuration".into(),
+            path: home.join(".junie/mcp/mcp.json"),
+            status: "missing",
+        });
+    }
     for location in &mut out {
         if location.status == "use_explicit_path" {
             continue;
@@ -91,6 +99,7 @@ pub(super) fn valid_source_kind(kind: &str) -> bool {
             | "vscode_insiders_user"
             | "zed_user"
             | "devin_user"
+            | "junie_user"
     ) || ["vscode_profile:", "vscode_insiders_profile:"]
         .iter()
         .any(|prefix| kind.strip_prefix(prefix).is_some_and(profile_id))
@@ -217,6 +226,19 @@ pub(super) fn normalize(raw: &str) -> Result<String, McpError> {
             }
             entry.insert("type".into(), transport);
         }
+        // External editors use `sse` for the legacy endpoint-discovery
+        // protocol, unlike visor's historical POST-based internal alias.
+        if let Some(transport) = entry.get_mut("type") {
+            match transport.as_str() {
+                Some("streamable-http") => *transport = json!("http"),
+                Some("stdio" | "http") => {}
+                _ => {
+                    return Err(McpError::message(
+                        "Unsupported MCP import transport; use stdio or Streamable HTTP",
+                    ))
+                }
+            }
+        }
         if key == "context_servers" {
             let command = entry
                 .get("command")
@@ -298,7 +320,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested/.cursor")).unwrap();
         std::fs::write(dir.join("nested/.cursor/mcp.json"), "must not discover").unwrap();
         let sources = locations(Some(&dir), Some(&dir.join("xdg")));
-        assert_eq!(sources.len(), 5);
+        assert_eq!(sources.len(), 6);
         assert_eq!(sources[0].status, "available_for_review");
         assert_eq!(sources[1].path, dir.join("xdg/Code/User/mcp.json"));
         assert_eq!(sources[1].status, "missing");
@@ -421,6 +443,50 @@ mod tests {
             r#"{"mcpServers":{"local":{"command":"x","env":{"TOKEN":"${file:/secret}"}}}}"#,
         ] {
             assert!(normalize(raw).is_err(), "accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn junie_source_is_user_scoped_metadata_only() {
+        let dir = std::env::temp_dir().join(format!("visor-junie-{}", uuid::Uuid::new_v4()));
+        let path = dir.join(".junie/mcp/mcp.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not parsed while listing").unwrap();
+        let sources = locations(Some(&dir), Some(&dir.join("xdg")));
+        let source = sources.iter().find(|s| s.id == "junie_user").unwrap();
+        assert_eq!(source.path, path);
+        assert_eq!(source.status, "available_for_review");
+        assert!(valid_source_kind("junie_user"));
+        assert!(!valid_source_kind("junie_user:../project"));
+        assert!(!locations(None, Some(&dir))
+            .iter()
+            .any(|s| s.id == "junie_user"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn imports_explicit_transports_without_reinterpreting_legacy_sse() {
+        for key in ["mcpServers", "servers", "context_servers"] {
+            let raw =
+                json!({key:{"remote":{"type":"streamable-http","url":"https://example.com/mcp"}}});
+            let parsed: Value =
+                serde_json::from_str(&normalize(&raw.to_string()).unwrap()).unwrap();
+            assert_eq!(parsed["mcpServers"]["remote"]["type"], "http");
+            for transport in [
+                json!("sse"),
+                json!("unknown"),
+                json!(""),
+                json!(null),
+                json!(3),
+            ] {
+                let raw =
+                    json!({key:{"remote":{"type":transport,"url":"https://example.com/mcp"}}});
+                assert!(normalize(&raw.to_string()).is_err());
+            }
+        }
+        for field in ["timeout", "oauth", "autoApprove"] {
+            let raw = json!({"mcpServers":{"remote":{"url":"https://example.com/mcp",field:1000}}});
+            assert!(normalize(&raw.to_string()).is_err(), "discarded {field}");
         }
     }
 
