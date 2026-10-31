@@ -4155,6 +4155,7 @@ while True:
         assert_eq!(mcp["servers"][0]["name"], "fixture");
         assert_eq!(mcp["servers"][0]["healthy"], true);
         assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
+        assert_eq!(mcp["servers"][0]["tools"][0]["inputSchema"], serde_json::json!({"type":"object"}));
         for action in ["refresh", "reconnect"] {
             let (status, _, _) = send(addr, "POST", &format!("/session/{id}/mcp/refresh"), Some(serde_json::json!({"server":"fixture","action":action}).to_string())).await;
             assert_eq!(status, 204);

@@ -43,10 +43,10 @@ pub fn list_tools(
             }
             tools.push(ToolInfo {
                 name: name.into(),
-                description: tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
+                description: optional_text(tool, "description")?,
+                title: optional_text(tool, "title")?,
+                input_schema: optional_schema(tool, "inputSchema")?,
+                output_schema: optional_schema(tool, "outputSchema")?,
             });
         }
         match result.get("nextCursor") {
@@ -64,6 +64,24 @@ pub fn list_tools(
         }
     }
     Err(McpError::message("MCP tool page limit exceeded"))
+}
+
+// Preserve schema data without evaluating references or fetching remote content.
+// Older servers may omit inputSchema; never synthesize an empty-argument schema.
+fn optional_schema(tool: &Value, field: &str) -> Result<Option<Value>, McpError> {
+    match tool.get(field) {
+        None => Ok(None),
+        Some(value) if value.is_object() => Ok(Some(value.clone())),
+        _ => Err(McpError::message("MCP tool schema must be an object")),
+    }
+}
+
+fn optional_text(tool: &Value, field: &str) -> Result<Option<String>, McpError> {
+    match tool.get(field) {
+        None => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        _ => Err(McpError::message("MCP tool metadata must be text")),
+    }
 }
 
 #[cfg(test)]
@@ -89,6 +107,42 @@ mod tests {
         .unwrap();
         assert_eq!(tools[0].name, "last");
     }
+    #[test]
+    fn schemas_and_titles_survive_pagination_without_evaluating_references() {
+        let schema = json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"$defs":{"x":{"$ref":"https://invalid.example/schema"}}});
+        let mut page = 0;
+        let tools = list_tools(|_| {
+            page += 1;
+            Ok(if page == 1 { json!({"result":{"tools":[{"name":"first","title":"Search","description":"Find records","inputSchema":schema,"outputSchema":{"type":"object"}}],"nextCursor":"next"}}) }
+                else { json!({"result":{"tools":[{"name":"legacy"}]}}) })
+        }).unwrap();
+        let exported = serde_json::to_value(&tools).unwrap();
+        assert_eq!(exported[0]["inputSchema"], schema);
+        assert_eq!(exported[0]["outputSchema"], json!({"type":"object"}));
+        assert_eq!(exported[0]["title"], "Search");
+        assert_eq!(exported[1], json!({"name":"legacy"}));
+    }
+
+    #[test]
+    fn malformed_metadata_rejects_the_whole_catalog_without_echoing_values() {
+        for field in ["inputSchema", "outputSchema", "title", "description"] {
+            for bad in [json!(null), json!(3), json!(["private"])] {
+                let result = list_tools(|_| {
+                    Ok(json!({"result":{"tools":[{"name":"valid"},{"name":"invalid",field:bad}]}}))
+                });
+                let error = result.unwrap_err().to_string();
+                assert!(!error.contains("private"));
+            }
+        }
+        for bad in [json!(false), json!("private")] {
+            assert!(list_tools(|_| Ok(
+                json!({"result":{"tools":[{"name":"bad","inputSchema":bad}]}})
+            ))
+            .is_err());
+        }
+        assert!(list_tools(|_| Ok(json!({"result":{"tools":[{"name":"large","inputSchema":{"description":"x".repeat(8*1024*1024)}}]}}))).is_err());
+    }
+
     #[test]
     fn rejects_cycles_duplicates_invalid_cursors_and_limits() {
         assert!(list_tools(|_| Ok(json!({"result":{"tools":[],"nextCursor":"same"}}))).is_err());
