@@ -10,6 +10,7 @@ pub struct HttpClient {
     url: String,
     headers: BTreeMap<String, String>,
     next_id: u64,
+    pub negotiated: Option<super::protocol::Negotiated>,
     pub changes: Arc<Changes>,
     pub supports_tools: bool,
     pub listed_generation: u64,
@@ -85,12 +86,14 @@ pub fn handshake_http(
         url,
         headers,
         next_id: 1,
+        negotiated: None,
         changes: Arc::new(Changes::default()),
         supports_tools: false,
         listed_generation: 0,
     };
     let init = client.call("initialize", json!({"protocolVersion":super::protocol::VERSION,"capabilities":{},"clientInfo":{"name":"hypermesh-visor","version":env!("CARGO_PKG_VERSION")}}))?;
     let negotiated = super::protocol::negotiate(&init)?;
+    client.negotiated = Some(negotiated.clone());
     client.supports_tools = negotiated.tools;
     client
         .changes
@@ -406,6 +409,38 @@ mod tests {
     }
 
     #[test]
+    fn routing_states_and_negotiation_survive_refresh_placeholders() {
+        use super::super::stdio::{AttachedServer, McpBundle, RoutingStatus};
+        let spec: ServerSpec = serde_json::from_value(json!({"url":"https://unused.invalid"})).unwrap();
+        let mut client = test_client("https://unused.invalid".into(), BTreeMap::new());
+        client.negotiated = Some(super::super::protocol::Negotiated { version:"2025-06-18".into(), tools:true, list_changed:true });
+        let changes = Arc::clone(&client.changes);
+        let tools = super::super::discovery::list_tools(|_| Ok(json!({"result":{"tools":[{"name":"tool"}]}}))).unwrap();
+        let server = AttachedServer::from_http("fixture".into(), "http".into(), tools, client, spec);
+        assert_eq!(server.routing_status(), RoutingStatus::Ready);
+        let mut bundle = McpBundle { servers:vec![server], ..Default::default() };
+        let mut active = bundle.take_for_refresh("fixture").unwrap();
+        assert_eq!(bundle.servers[0].routing_status(), RoutingStatus::Refreshing);
+        assert!(!bundle.servers[0].is_healthy());
+        assert_eq!(bundle.servers[0].negotiated.as_ref().unwrap().version, "2025-06-18");
+        assert!(bundle.healthy_server_names().is_empty());
+        active.tools.clear();
+        assert_eq!(active.routing_status(), RoutingStatus::NoTools);
+        assert!(!active.is_healthy());
+        active.tools = super::super::discovery::list_tools(|_| Ok(json!({"result":{"tools":[{"name":"tool","execution":{"taskSupport":"required"}}]}}))).unwrap();
+        assert_eq!(active.routing_status(), RoutingStatus::TaskRequired);
+        assert!(active.is_healthy());
+        bundle.restore_after_refresh(active);
+        assert!(bundle.healthy_server_names().is_empty());
+        changes.invalidate();
+        assert_eq!(bundle.servers[0].routing_status(), RoutingStatus::CatalogStale);
+        changes.failed.store(true, Ordering::Release);
+        assert_eq!(bundle.servers[0].routing_status(), RoutingStatus::Disconnected);
+        let summary = serde_json::to_value(bundle.servers[0].negotiated.as_ref().unwrap()).unwrap();
+        assert_eq!(summary, json!({"version":"2025-06-18","tools":true,"list_changed":true}));
+    }
+
+    #[test]
     fn reconnect_and_drop_delete_each_negotiated_session_once() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -523,6 +558,7 @@ mod tests {
             url,
             headers,
             next_id: 1,
+            negotiated: None,
             changes: Arc::new(Changes::default()),
             supports_tools: false,
             listed_generation: 0,
