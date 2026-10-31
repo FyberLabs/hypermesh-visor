@@ -504,6 +504,14 @@ mod tests {
         assert!(err.to_string().contains("visor already running"));
         assert!(unix_socket_listening(&path));
         drop(listener);
+        // Concurrent command tests can fork before CLOEXEC closes the inherited
+        // listener. Allow that short child-startup window, but keep a hard bound.
+        for _ in 0..30 {
+            if !unix_socket_listening(&path) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         assert!(!unix_socket_listening(&path));
         let replaced = bind(&dir).await.unwrap();
         drop(replaced);

@@ -272,7 +272,7 @@ terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
 ## Current matching and transport inventory
 
 - Stdio and HTTP/SSE transports initialize and load tools on attachment. Closing
-  a session terminates its stdio children and drops HTTP clients.
+  a session terminates its stdio children and schedules best-effort HTTP session cleanup.
 - `GET /session/{id}/mcp` reports attached servers, health, and tools.
 - `mcp-bindings.json` matches focused identity fields, not window titles, against
   attached healthy server IDs. The first matching healthy binding wins; all
@@ -435,9 +435,26 @@ finish within its deadline. Stdio reader shutdown is joined and its child reaped
 As with explicit refresh, an in-flight catalog operation finishes within its
 bounds before a closed session's resources are discarded.
 
+When a modern HTTP attachment with a negotiated session ID is discarded (close,
+explicit reconnect, or failed attachment/transport), visor schedules one
+best-effort `DELETE` to its original MCP endpoint with that connection's session
+ID, negotiated version, and configured headers. Stateless, unnegotiated, and
+`2024-11-05` connections do not send DELETE. A new connection never inherits the
+old ID. This follows the [MCP session termination guidance](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management).
+
+Cleanup runs outside session locks on one process-wide worker with a queue of
+32 requests and a three-second request deadline. Local closure stops subscription
+work immediately and never waits for cleanup capacity or a remote response.
+Queue saturation, unavailable worker, process exit, and network/server failures
+can leave remote cleanup incomplete; server-side expiry remains necessary.
+Cleanup is not persisted, retried, or reported as confirmed remote deletion.
+Redirects are disabled, response bodies are ignored, and 404/405 are terminal
+just like other outcomes. Cleanup never initializes a session or replays tools.
+An already-running subscription read can still finish within its existing bound.
+
 The `sse` configuration value remains an alias for the POST-based transport.
-Legacy HTTP+SSE endpoint discovery, resumable POST responses, remote HTTP
-session DELETE, OAuth negotiation, and non-tool MCP features are not implemented.
+Legacy HTTP+SSE endpoint discovery, resumable POST responses, OAuth negotiation,
+and non-tool MCP features are not implemented.
 A server selecting `2024-11-05` over HTTP retains the existing POST/JSON/SSE
 response compatibility path, without a GET subscription. This is not a claim
 of complete MCP conformance. Additional discovery sources and broader platform
