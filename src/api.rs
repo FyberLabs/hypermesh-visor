@@ -642,6 +642,7 @@ fn routes(state: Arc<AppState>, from_companion: bool) -> Router {
         .route("/mcp-audit", get(list_mcp_audit))
         .route("/mcp/discovery", post(mcp_discovery))
         .route("/mcp/trust", get(mcp_trusted).post(mcp_trust_decision))
+        .route("/mcp/status", get(mcp_status))
         .route("/mcp/sources", get(mcp_sources))
         .route("/mcp/profiles", get(mcp_profiles).post(mcp_profile_edit))
         .route("/mcp/servers", get(mcp_servers).post(mcp_server_edit))
@@ -696,6 +697,15 @@ async fn mcp_discovery(
     })
     .await
     .map_err(|_| ApiError::internal("MCP discovery task failed"))?
+}
+
+/// Diagnostics must never register a companion heartbeat or mutate the gate.
+async fn mcp_status(
+    State(state): State<Arc<AppState>>,
+    Extension(link): Extension<CompanionLink>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if !link.0 { return Err(ApiError::forbidden("MCP status requires the local companion socket")); }
+    Ok(Json(serde_json::json!({"session": state.companion_session()})))
 }
 
 async fn mcp_servers(
@@ -5336,6 +5346,28 @@ while True:
             "a start replayed after the poll expired must not enter running"
         );
         let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn mcp_status_never_establishes_or_renews_companion_presence() {
+        let timeout = Duration::from_secs(2);
+        let state = Arc::new(AppState::new(FakeDesktop::new(), timeout));
+        let app = companion_router(Arc::clone(&state));
+        for previously_present in [false, true] {
+            if previously_present {
+                lock(&state.automation).note_poll(Instant::now() - Duration::from_secs(10), timeout);
+            }
+            let (status, body) = trust_test_request(app.clone(), "GET", "/mcp/status", serde_json::json!({})).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body["session"].is_null());
+            let gate = lock(&state.automation);
+            assert!(!gate.poll_fresh(Instant::now(), timeout));
+            assert_eq!(gate.stale_reentry(Instant::now(), timeout), previously_present);
+        }
+        assert_eq!(trust_test_request(router(Arc::clone(&state)), "GET", "/mcp/status", serde_json::json!({})).await.0, StatusCode::FORBIDDEN);
+        // A real monitoring poll still grants presence.
+        trust_test_request(app, "GET", "/companion", serde_json::json!({})).await;
+        assert!(lock(&state.automation).poll_fresh(Instant::now(), timeout));
     }
 
     #[tokio::test]

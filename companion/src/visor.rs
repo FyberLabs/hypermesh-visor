@@ -361,7 +361,7 @@ fn exchange_at(path: &Path, request: &str) -> Option<String> {
 /// Read-only status over the same-user companion socket.
 pub fn mcp_status_request() -> Result<serde_json::Value, String> {
     let socket = socket_path().ok_or("Companion socket unavailable")?;
-    let request = "GET /companion HTTP/1.1\r\nhost: hypermesh\r\nconnection: close\r\n\r\n";
+    let request = "GET /mcp/status HTTP/1.1\r\nhost: hypermesh\r\nconnection: close\r\n\r\n";
     let Exchange::Body(response) = exchange_read_timeout(&socket, request, Duration::from_secs(5)) else {
         return Err("Cannot read MCP status from visor".into());
     };

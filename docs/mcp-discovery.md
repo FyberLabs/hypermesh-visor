@@ -337,7 +337,8 @@ binding index when present, attachment routing states, and last-negotiated tool
 capabilities. It shows the driving session, or the most recently used session
 when automation is off. Reopen the dialog to get a new snapshot.
 
-The dialog reads only `GET /companion` through the same-user companion socket.
+The dialog reads only `GET /mcp/status` through the same-user companion socket.
+This endpoint does not register or renew an automation heartbeat.
 Its session includes bounded `mcp_attachments` summaries and an explicit
 `mcp_attachments_omitted` count, using the existing companion list/text limits.
 It does not fetch tool catalogs, show private connection settings, or submit

@@ -85,7 +85,7 @@ with tempfile.TemporaryDirectory(prefix="visor-profile-gui-") as runtime:
         subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
         subprocess.run(["xdotool", "key", "Escape"], check=True)
         assert process.wait(timeout=5) == 0, "cancel did not exit cleanly"
-        endpoint = "/companion" if mode == "status" else f"/mcp/{mode}"
+        endpoint = f"/mcp/{mode}"
         assert calls == [f"GET {endpoint} HTTP/1.1".encode()], calls
         assert not errors, errors
         print(f"{title} GTK chooser rendered; cancel submitted no writes")
