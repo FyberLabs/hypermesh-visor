@@ -50,7 +50,7 @@ fn process_id(value: &serde_json::Value) -> Option<u32> {
 
 /// Best-effort local process hint, never a title or command line. A missing,
 /// inaccessible, foreign-user, or deleted process contributes no executable.
-fn process_executable(pid: u32) -> Option<String> {
+pub(super) fn process_executable(pid: u32) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
     if std::fs::metadata(&proc).ok()?.uid() != unsafe { libc::geteuid() } {

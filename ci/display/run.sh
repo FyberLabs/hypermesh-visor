@@ -2046,6 +2046,50 @@ scenario_scroll_editor() {
     sleep 0.1
   done
   xwininfo -name 'Visor scroll editor' >/dev/null 2>&1 || die "scroll editor did not open"
+  # Exercise the real X11 probe with explicit EWMH client properties. A foreign
+  # machine must clear the executable hint while retaining the class hint.
+  local editor_window client_host expected found
+  editor_window=$(xwininfo -name 'Visor scroll editor' | awk '/Window id:/ {print $4; exit}')
+  # This harness has no WM. Publish the WINDOW-typed EWMH root property
+  # explicitly; keyboard focus alone does not establish _NET_ACTIVE_WINDOW.
+  python3 - "$editor_window" <<'PYX11'
+import ctypes, sys
+x = ctypes.CDLL("libX11.so.6")
+x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+x.XOpenDisplay.restype = ctypes.c_void_p
+x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+x.XDefaultRootWindow.restype = ctypes.c_ulong
+x.XInternAtom.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int]
+x.XInternAtom.restype = ctypes.c_ulong
+x.XChangeProperty.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+x.XCloseDisplay.argtypes = [ctypes.c_void_p]
+display = x.XOpenDisplay(None)
+assert display, "XOpenDisplay failed"
+window = ctypes.c_ulong(int(sys.argv[1], 0))
+x.XChangeProperty(display, x.XDefaultRootWindow(display), x.XInternAtom(display, b"_NET_ACTIVE_WINDOW", 0), 33, 32, 0, ctypes.byref(window), 1)
+x.XCloseDisplay(display)
+PYX11
+  xprop -id "$editor_window" -f _NET_WM_PID 32c -set _NET_WM_PID "$editor_pid"
+  for client_host in "$(hostname)" visor-foreign.invalid "$(hostname)"; do
+    xprop -id "$editor_window" -f WM_CLIENT_MACHINE 8s -set WM_CLIENT_MACHINE "$client_host"
+    expected=$python
+    [[ $client_host != visor-foreign.invalid ]] || expected=''
+    found=0
+    for i in $(seq 1 40); do
+      if curl_visor --max-time 5 -fsS "$BASE/companion" | python3 -c '
+import json, sys
+focus = (json.load(sys.stdin).get("session") or {}).get("focused") or {}
+raise SystemExit(0 if focus.get("wm_class") and (focus.get("executable") or "") == sys.argv[1] else 1)
+' "$expected"; then found=1; break; fi
+      sleep 0.1
+    done
+    if [[ $found != 1 ]]; then
+      xprop -root -remove _NET_ACTIVE_WINDOW
+      die "X11 executable hint did not match client locality"
+    fi
+  done
+  xprop -root -remove _NET_ACTIVE_WINDOW
+
   http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"scroll","x":650,"y":120,"delta_x":0,"delta_y":3}'
   [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "editor scroll down $(cat "$HTTP_BODY")"
   local moved=0

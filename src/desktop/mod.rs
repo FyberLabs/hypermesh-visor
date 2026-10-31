@@ -275,17 +275,7 @@ impl Desktop for LinuxDesktop {
 
     fn focused_app(&self) -> Result<Option<crate::mcp::FocusedApp>, DesktopError> {
         match choose_backend(&self.env)? {
-            BackendKind::X11 => {
-                let wm_class = x11::focused_wm_class(self.env.display.as_deref())?;
-                if wm_class.is_none() {
-                    return Ok(None);
-                }
-                Ok(Some(crate::mcp::FocusedApp {
-                    wm_class,
-                    app_id: None,
-                    executable: None,
-                }))
-            }
+            BackendKind::X11 => x11::focused_app(self.env.display.as_deref()),
             BackendKind::Wayland => Ok(focus::wayland_focused_app()),
         }
     }

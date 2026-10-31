@@ -495,6 +495,9 @@ mod tests {
         let mut restarted = TrustStore::default();
         restarted.sync(&dir).unwrap();
         assert!(restarted.approved("default").is_some());
+        // Concurrent tests fork children which can briefly inherit this open
+        // file description. Explicit unlock avoids waiting for their close.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(lock);
         store.revoke("default").unwrap();
         std::fs::remove_dir_all(dir).unwrap();
