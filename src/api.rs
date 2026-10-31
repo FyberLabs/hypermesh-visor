@@ -4110,7 +4110,7 @@ while True:
     elif method == "notifications/initialized":
         pass
     elif method == "tools/list":
-        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"}}]}})
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":True,"destructiveHint":False},"execution":{"taskSupport":"optional"}},{"name":"task-only","execution":{"taskSupport":"required"}}]}})
     elif method == "tools/call":
         send({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"pong"}]}})
 "#,
@@ -4156,6 +4156,8 @@ while True:
         assert_eq!(mcp["servers"][0]["healthy"], true);
         assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
         assert_eq!(mcp["servers"][0]["tools"][0]["inputSchema"], serde_json::json!({"type":"object"}));
+        assert_eq!(mcp["servers"][0]["tools"][0]["annotations"]["readOnlyHint"], true);
+        assert_eq!(mcp["servers"][0]["tools"][1]["execution"]["taskSupport"], "required");
         for action in ["refresh", "reconnect"] {
             let (status, _, _) = send(addr, "POST", &format!("/session/{id}/mcp/refresh"), Some(serde_json::json!({"server":"fixture","action":action}).to_string())).await;
             assert_eq!(status, 204);
@@ -4283,6 +4285,16 @@ while True:
         assert_eq!(audit[2]["server"], "fixture");
         assert_eq!(audit[3]["decision"], "approve");
         assert_eq!(audit[3]["outcome"], "ok");
+
+        let (status, _, body) = send(addr, "POST", &format!("/session/{id}/mcp/call"), Some(
+            serde_json::json!({"server":"fixture","tool":"task-only","decision":"approve","arguments":{}}).to_string()
+        )).await;
+        assert_eq!(status, 502);
+        assert!(String::from_utf8_lossy(&body).contains("requires task execution"));
+        let (_, _, body) = send(addr, "GET", &format!("/session/{id}/mcp"), None).await;
+        let catalog: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(catalog["servers"][0]["healthy"], true);
+
 
         let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
         assert_eq!(status, 204);

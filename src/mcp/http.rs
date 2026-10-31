@@ -657,7 +657,7 @@ mod tests {
                 let result = if req["method"] == "initialize" {
                     json!({"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":true}}})
                 } else {
-                    json!({"tools":[{"name":"ping"}]})
+                    json!({"tools":[{"name":"ping","execution":{"taskSupport":"required"},"annotations":{"readOnlyHint":true}}]})
                 };
                 let body = json!({"jsonrpc":"2.0","id":req["id"],"result":result}).to_string();
                 write!(stream,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body).unwrap();
@@ -673,10 +673,16 @@ mod tests {
             cwd: None,
             enabled: None,
         };
-        let server = super::super::stdio::attach_one_server("no-get", &spec).unwrap();
+        let mut server = super::super::stdio::attach_one_server("no-get", &spec).unwrap();
         worker.join().unwrap();
         assert!(server.is_healthy());
         assert!(!server.needs_refresh());
+        // The fixture has closed its listener: a network attempt would fail
+        // differently and invalidate health. Task gating must remain local.
+        assert!(server.call_tool("ping", json!({})).unwrap_err().to_string().contains("requires task execution"));
+        assert!(server.is_healthy());
+        let bundle = super::super::stdio::McpBundle { servers: vec![server], ..Default::default() };
+        assert!(bundle.healthy_server_names().is_empty(), "task-only server remained a routing candidate");
     }
 
     #[test]

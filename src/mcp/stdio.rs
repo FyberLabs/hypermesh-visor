@@ -21,6 +21,16 @@ pub struct ToolInfo {
     pub input_schema: Option<Value>,
     #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
     pub output_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<Value>,
+}
+
+impl ToolInfo {
+    fn supports_direct_call(&self) -> bool {
+        self.execution.as_ref().and_then(|v| v.get("taskSupport")).and_then(Value::as_str) != Some("required")
+    }
 }
 
 struct StdioClient {
@@ -307,6 +317,9 @@ impl AttachedServer {
                 "MCP catalog invalidated; wait for refresh or reconnect",
             ));
         }
+        if self.tools.iter().any(|info| info.name == tool && !info.supports_direct_call()) {
+            return Err(McpError::message("MCP tool requires task execution, which is not supported"));
+        }
         let response = self.request("tools/call", json!({"name":tool,"arguments":arguments}))?;
         if response.get("error").is_some() {
             return Err(McpError::message("MCP tool call rejected"));
@@ -368,7 +381,7 @@ impl McpBundle {
     pub fn healthy_server_names(&self) -> Vec<String> {
         self.servers
             .iter()
-            .filter(|s| s.is_healthy())
+            .filter(|s| s.is_healthy() && s.tools.iter().any(ToolInfo::supports_direct_call))
             .map(|s| s.name.clone())
             .collect()
     }
@@ -791,7 +804,7 @@ for line in sys.stdin:
    print(json.dumps({'jsonrpc':'2.0','id':m['id'],'error':{'message':'private detail'}}),flush=True); continue
   second='cursor' in m['params']
   if second: assert m['params']['cursor']=='opaque +/='
-  result={'tools':[{'name':v+('-b' if second else '-a'),'inputSchema':None if v=='invalid-schema' else {'type':'object','properties':{v:{'type':'string'}}}}]}
+  result={'tools':[{'name':v+('-b' if second else '-a'),'inputSchema':None if v=='invalid-schema' else {'type':'object','properties':{v:{'type':'string'}}},'execution':{'taskSupport':'required' if v=='required' else 'optional'}}]}
   if not second: result['nextCursor']='opaque +/='
   print(json.dumps({'jsonrpc':'2.0','method':'notifications/tools/list_changed'}),flush=True)
  elif method=='tools/call':
@@ -828,6 +841,11 @@ for line in sys.stdin:
         server.refresh(false).unwrap();
         assert_eq!(server.tools[1].name, "new-b");
         assert_eq!(server.tools[1].input_schema.as_ref().unwrap()["properties"], json!({"new":{"type":"string"}}));
+        fs::write(&version, "required").unwrap();
+        server.refresh(false).unwrap();
+        assert!(server.call_tool("required-a", json!({})).unwrap_err().to_string().contains("requires task execution"));
+        assert!(server.is_healthy());
+        assert!(!calls.exists(), "task-required call reached the child");
         fs::write(&version, "invalid-schema").unwrap();
         assert!(server.refresh(false).is_err());
         assert!(server.tools.is_empty());
