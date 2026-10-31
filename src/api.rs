@@ -32,7 +32,7 @@ use crate::input::{
     POINTER_BATCH, TYPE_CHUNK_KEYSTROKES, TYPE_MAX_KEYSTROKES,
 };
 use crate::mcp::{
-    self, companion_mode, explain_preferred, BindingCache, FocusedApp, MatchDecision, McpAuditRow,
+    self, companion_mode, BindingCache, FocusedApp, MatchDecision, McpAuditRow,
     McpAuditor, McpError, ToolInfo,
 };
 use crate::prompt::{self, AuditRecord, PromptError};
@@ -305,7 +305,7 @@ impl AppState {
         };
         let focused = self.cached_focus();
         let bindings = lock(&self.bindings).current(&self.mcp_dir, Instant::now());
-        let mcp_match = explain_preferred(focused.as_ref(), &bindings, &chosen.healthy);
+        let mcp_match = bindings.explain(focused.as_ref(), &chosen.healthy);
         let preferred = mcp_match.preferred.clone();
         let mode = companion_mode(preferred.as_deref(), chosen.verb)
             .map(|mode| clip_text(&mode, SESSION_TEXT_MAX));
@@ -4167,6 +4167,7 @@ while True:
         let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(companion["session"]["prefer_mcp"], false);
         assert_eq!(companion["session"]["mcp_match"]["reason"], "focus_unavailable");
+        assert_eq!(companion["session"]["mcp_match"]["bindings_status"], "ready");
         assert!(companion["session"].get("mcp").is_none() || companion["session"]["mcp"].is_null());
 
         desktop.set_focus(Some(FocusedApp {
@@ -4200,6 +4201,33 @@ while True:
         }
         assert!(preferred, "focused app should show up within the cache ttl");
         assert!(desktop.focus_probes.load(Ordering::SeqCst) <= 2);
+
+        // Bad binding edits must remove preferred routing without detaching the
+        // healthy server; a corrected file is picked up on the next bounded poll.
+        for (raw, expected) in [
+            (r#"{"bindings":[{"server":"fixture","wm_class":"FixtureApp","executable_path":"private"}]}"#, "invalid"),
+            (r#"{"bindings":[{"server":"fixture","wm_class":"FixtureApp"}]}"#, "ready"),
+        ] {
+            std::fs::write(dir.join("mcp-bindings.json"), raw).unwrap();
+            let started = Instant::now();
+            loop {
+                let (_, _, body) = send(addr, "GET", "/companion", None).await;
+                let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let decision = &companion["session"]["mcp_match"];
+                if decision["bindings_status"] == expected {
+                    if expected == "invalid" {
+                        assert_eq!(decision["reason"], "bindings_unavailable");
+                        assert_eq!(companion["session"]["prefer_mcp"], false);
+                        assert_eq!(companion["session"]["mode"], "mouse");
+                        assert!(!decision.to_string().contains("private"));
+                    }
+                    break;
+                }
+                assert!(started.elapsed() < Duration::from_secs(3), "binding status did not refresh");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
 
         let (status, _, body) = send(
             addr,

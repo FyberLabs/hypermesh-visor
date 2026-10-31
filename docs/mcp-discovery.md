@@ -283,7 +283,7 @@ terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
   for the same user; missing, inaccessible, deleted, or foreign-user processes
   contribute no executable. Titles and command lines are never executable
   identities. These are routing hints, not authenticated application identities.
-- Bindings are cached with a one-second metadata refresh; focus has its own
+- Bindings are re-read at most once per second with bounded I/O; focus has its own
   short cache. Expired focus is withheld while refreshing, so a stalled probe
   cannot preserve a stale match. Failure to find a healthy match retains desktop mode. Input
   authorization and physical-user pause still apply.
@@ -299,7 +299,9 @@ remaining compatibility limits are described below.
 `mode`, `prefer_mcp`, and `focused` fields. It does not attach or start servers.
 
 - `reason`: `focus_unavailable`, `no_bindings`, `identity_mismatch`,
-  `server_unavailable`, or `matched`.
+  `server_unavailable`, `bindings_unavailable`, or `matched`.
+- `bindings_status`: `missing`, `ready`, `invalid`, `unavailable`, or `too_large`.
+  This reports configuration health independently of focus availability.
 - `binding_index`: zero-based index in `mcp-bindings.json` of the winning binding,
   present only for a match. Reorder bindings to set explicit precedence.
 - `identity_matches`: number of bindings matching every populated selector.
@@ -307,9 +309,30 @@ remaining compatibility limits are described below.
   More than one exposes overlapping rules; the first healthy binding wins.
 
 `server_unavailable` means the identity matched but none of its servers is
-attached and healthy. `no_bindings` means no usable bindings were loaded; missing
-or malformed files currently both yield an empty set. `focus_unavailable` also
-covers an expired sample while its refresh is pending. Counters describe the
+attached and healthy. `no_bindings` means a missing file or an explicitly empty
+`bindings` list (distinguished by `bindings_status`). Malformed configuration,
+unknown fields, invalid selectors, and read/size failures produce
+`bindings_unavailable`, zero match counters, and desktop fallback, even when
+focus is unavailable. No parser excerpts, paths, or raw selector values are
+included in diagnostics.
+
+Binding files must be regular files, at most 64 KiB, with at most 128 rules.
+Each rule requires a nonblank server ID (at most 1,024 bytes) and at least one
+nonblank `wm_class`, `app_id`, or absolute `executable` selector (at most 4,096
+bytes each, without NULs). Unknown root/rule fields reject the whole file, so a
+misspelled selector cannot weaken a multi-selector rule. Correct unsupported
+fields rather than relying on them being ignored. An empty `bindings` list is
+valid. Nonblocking opens reject FIFOs/devices rather than waiting for content;
+reads are capped even if a file grows during loading.
+
+The bounded refresh re-reads content instead of trusting mtime, so equal-timestamp
+edits and changed read permissions cannot indefinitely preserve old routing.
+Failures clear cached rules on the next refresh; corrected files recover on the
+next refresh without restarting the daemon. This is still a one-second routing
+cache, not a new authorization boundary; loaded server approvals and sessions
+are unchanged.
+
+`focus_unavailable` also covers an expired sample while its refresh is pending. Counters describe the
 current attachment health snapshot, not a new network probe, permanent app
 capability, or authorization. HTTP health reflects successful attachment/refresh until an observed transport
 failure; it is not a background liveness probe. Explicit reconnect is available
