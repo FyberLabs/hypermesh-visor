@@ -36,53 +36,134 @@ pub(crate) fn find_keycode(map: &KeyMap, keysym: u32) -> Option<(u8, bool)> {
     None
 }
 
-/// Best-effort focused window WM_CLASS for MCP bindings.
-pub fn focused_wm_class(display: Option<&str>) -> Result<Option<String>, DesktopError> {
+/// X11 properties are routing hints, not authenticated application identity.
+pub fn focused_app(display: Option<&str>) -> Result<Option<crate::mcp::FocusedApp>, DesktopError> {
+    use x11rb::protocol::xproto::AtomEnum;
     let (conn, screen_num) = connect(display)?;
     let root = conn.setup().roots[screen_num].root;
-    let atom_active = intern(&conn, "_NET_ACTIVE_WINDOW")?;
-    let atom_wm_class = intern(&conn, "WM_CLASS")?;
-    let reply = conn
-        .get_property(
-            false,
-            root,
-            atom_active,
-            x11rb::protocol::xproto::AtomEnum::WINDOW,
-            0,
-            1,
-        )
-        .map_err(unavailable)?
-        .reply()
-        .map_err(unavailable)?;
-    if reply.value.len() < 4 {
+    let active = intern(&conn, "_NET_ACTIVE_WINDOW")?;
+    let get = |window, atom, kind, length| {
+        conn.get_property(false, window, atom, kind, 0, length)
+            .map_err(unavailable)?
+            .reply()
+            .map_err(unavailable)
+    };
+    let Some(window) = property_u32(&get(root, active, AtomEnum::WINDOW, 1)?, AtomEnum::WINDOW)
+    else {
         return Ok(None);
-    }
-    let window = u32::from_ne_bytes([
-        reply.value[0],
-        reply.value[1],
-        reply.value[2],
-        reply.value[3],
-    ]);
-    if window == 0 {
-        return Ok(None);
-    }
-    let class = conn
-        .get_property(
-            false,
+    };
+    let class = get(window, intern(&conn, "WM_CLASS")?, AtomEnum::STRING, 256)?;
+    let wm_class = property_text(&class).and_then(|raw| {
+        raw.split('\0')
+            .filter(|s| !s.trim().is_empty())
+            .last()
+            .map(str::to_string)
+    });
+    // A remote X client can report a PID in another machine's namespace. Never
+    // resolve it locally without both a local display and an exact host match.
+    let executable = if local_display(display) {
+        let pid = get(window, intern(&conn, "_NET_WM_PID")?, AtomEnum::CARDINAL, 1).ok();
+        let machine = get(
             window,
-            atom_wm_class,
-            x11rb::protocol::xproto::AtomEnum::STRING,
-            0,
+            intern(&conn, "WM_CLIENT_MACHINE")?,
+            AtomEnum::STRING,
             256,
         )
-        .map_err(unavailable)?
-        .reply()
-        .map_err(unavailable)?;
-    let raw = String::from_utf8_lossy(&class.value);
-    // WM_CLASS is instance\0class\0 — prefer the class token.
-    let parts: Vec<&str> = raw.split('\0').filter(|s| !s.is_empty()).collect();
-    let name = parts.last().copied().or_else(|| parts.first().copied());
-    Ok(name.map(str::to_string))
+        .ok();
+        let hostname = local_hostname();
+        local_executable_hint(
+            pid.as_ref(),
+            machine.as_ref(),
+            hostname.as_deref(),
+            super::focus::process_executable,
+        )
+    } else {
+        None
+    };
+    // Do not publish an identity assembled while the active window changed.
+    if property_u32(&get(root, active, AtomEnum::WINDOW, 1)?, AtomEnum::WINDOW) != Some(window) {
+        return Ok(None);
+    }
+    let app = crate::mcp::FocusedApp {
+        wm_class,
+        app_id: None,
+        executable,
+    };
+    Ok((!app.is_empty()).then_some(app))
+}
+
+fn property_u32(
+    reply: &x11rb::protocol::xproto::GetPropertyReply,
+    kind: x11rb::protocol::xproto::AtomEnum,
+) -> Option<u32> {
+    if reply.type_ != u32::from(kind)
+        || reply.format != 32
+        || reply.bytes_after != 0
+        || reply.value.len() != 4
+    {
+        return None;
+    }
+    let value = u32::from_ne_bytes(reply.value.as_slice().try_into().ok()?);
+    (value > 0).then_some(value)
+}
+
+fn property_text(reply: &x11rb::protocol::xproto::GetPropertyReply) -> Option<&str> {
+    if reply.type_ != u32::from(x11rb::protocol::xproto::AtomEnum::STRING)
+        || reply.format != 8
+        || reply.bytes_after != 0
+    {
+        return None;
+    }
+    std::str::from_utf8(&reply.value).ok()
+}
+
+fn local_executable_hint(
+    pid: Option<&x11rb::protocol::xproto::GetPropertyReply>,
+    machine: Option<&x11rb::protocol::xproto::GetPropertyReply>,
+    hostname: Option<&str>,
+    resolve: impl FnOnce(u32) -> Option<String>,
+) -> Option<String> {
+    let machine = property_text(machine?)?;
+    let machine = machine.strip_suffix('\0').unwrap_or(machine);
+    let hostname = hostname.filter(|s| !s.is_empty())?;
+    if machine != hostname {
+        return None;
+    }
+    resolve(property_u32(
+        pid?,
+        x11rb::protocol::xproto::AtomEnum::CARDINAL,
+    )?)
+}
+
+fn local_display(display: Option<&str>) -> bool {
+    let env = std::env::var("DISPLAY").ok();
+    let Some(display) = display.or(env.as_deref()) else {
+        return false;
+    };
+    // Conservative Unix-socket forms only; no TCP, SSH forwarding, or DNS.
+    let Some(number) = display
+        .strip_prefix(':')
+        .or_else(|| display.strip_prefix("unix:"))
+    else {
+        return false;
+    };
+    !number.is_empty()
+        && number.split('.').count() <= 2
+        && number
+            .split('.')
+            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn local_hostname() -> Option<String> {
+    let mut bytes = [0u8; 256];
+    if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return None;
+    }
+    let end = bytes.iter().position(|b| *b == 0)?;
+    std::str::from_utf8(&bytes[..end])
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 fn intern(
@@ -563,6 +644,118 @@ fn input_err(err: impl std::fmt::Display) -> DesktopError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn property(
+        kind: x11rb::protocol::xproto::AtomEnum,
+        format: u8,
+        value: Vec<u8>,
+    ) -> x11rb::protocol::xproto::GetPropertyReply {
+        x11rb::protocol::xproto::GetPropertyReply {
+            format,
+            sequence: 0,
+            length: 0,
+            type_: kind.into(),
+            bytes_after: 0,
+            value_len: (value.len() * 8 / format as usize) as u32,
+            value,
+        }
+    }
+
+    #[test]
+    fn x11_executable_requires_local_host_and_valid_pid_properties() {
+        use x11rb::protocol::xproto::AtomEnum;
+        let pid = property(AtomEnum::CARDINAL, 32, 42u32.to_ne_bytes().to_vec());
+        let machine = property(AtomEnum::STRING, 8, b"workstation\0".to_vec());
+        assert_eq!(
+            local_executable_hint(Some(&pid), Some(&machine), Some("workstation"), |p| {
+                assert_eq!(p, 42);
+                Some("/opt/editor".into())
+            })
+            .as_deref(),
+            Some("/opt/editor")
+        );
+        for host in [None, Some(""), Some("remote"), Some("workstation.example")] {
+            assert!(
+                local_executable_hint(Some(&pid), Some(&machine), host, |_| panic!(
+                    "foreign host probed"
+                ))
+                .is_none()
+            );
+        }
+        assert!(
+            local_executable_hint(None, Some(&machine), Some("workstation"), |_| panic!(
+                "missing pid"
+            ))
+            .is_none()
+        );
+        assert!(
+            local_executable_hint(Some(&pid), None, Some("workstation"), |_| panic!(
+                "missing machine"
+            ))
+            .is_none()
+        );
+        assert!(
+            local_executable_hint(Some(&pid), Some(&machine), Some("workstation"), |_| None)
+                .is_none()
+        );
+        for invalid in [
+            property(AtomEnum::STRING, 32, 42u32.to_ne_bytes().to_vec()),
+            property(AtomEnum::CARDINAL, 8, vec![42]),
+            property(AtomEnum::CARDINAL, 32, vec![0; 4]),
+            property(AtomEnum::CARDINAL, 32, vec![1; 8]),
+        ] {
+            assert!(local_executable_hint(
+                Some(&invalid),
+                Some(&machine),
+                Some("workstation"),
+                |_| panic!("invalid pid")
+            )
+            .is_none());
+        }
+        let mut truncated = pid.clone();
+        truncated.bytes_after = 4;
+        assert!(property_u32(&truncated, AtomEnum::CARDINAL).is_none());
+        let mut truncated = machine.clone();
+        truncated.bytes_after = 1;
+        assert!(property_text(&truncated).is_none());
+        assert!(property_text(&property(AtomEnum::STRING, 8, vec![255])).is_none());
+        assert!(property_text(&property(AtomEnum::CARDINAL, 32, vec![0; 4])).is_none());
+    }
+
+    #[test]
+    fn executable_hints_never_resolve_tcp_or_forwarded_displays() {
+        for display in [":0", ":12.1", "unix:0"] {
+            assert!(local_display(Some(display)));
+        }
+        for display in [
+            "localhost:10.0",
+            "127.0.0.1:0",
+            "remote:0",
+            "tcp/host:0",
+            ":",
+            ":0.bad",
+            ":0.1.2",
+        ] {
+            assert!(!local_display(Some(display)));
+        }
+    }
+
+    #[test]
+    fn x11_process_restart_resolves_the_new_pid_not_a_cached_path() {
+        use x11rb::protocol::xproto::AtomEnum;
+        let machine = property(AtomEnum::STRING, 8, b"local".to_vec());
+        for (pid, path) in [(42u32, "/opt/old"), (43u32, "/opt/new")] {
+            let prop = property(AtomEnum::CARDINAL, 32, pid.to_ne_bytes().to_vec());
+            assert_eq!(
+                local_executable_hint(Some(&prop), Some(&machine), Some("local"), |p| {
+                    assert_eq!(p, pid);
+                    Some(path.into())
+                })
+                .as_deref(),
+                Some(path)
+            );
+        }
+    }
 
     #[test]
     fn finds_shifted_and_plain_keycodes() {

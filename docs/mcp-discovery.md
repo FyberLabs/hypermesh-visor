@@ -278,7 +278,19 @@ terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
   attached healthy server IDs. The first matching healthy binding wins; all
   populated selectors must match. Class/app-ID comparisons retain case-insensitive compatibility. Executable
   paths match exactly, including case; use the resolved absolute path.
-- X11 uses `WM_CLASS`; Wayland probes Hyprland, Sway, and KWin on a best-effort
+- X11 uses `WM_CLASS` and, on Unix-socket displays (`:N[.S]` or `unix:N[.S]`),
+  a same-user `/proc/<pid>/exe` hint from `_NET_WM_PID`. The bounded PID property
+  must be exactly one positive CARDINAL/32 value, and `WM_CLIENT_MACHINE` must
+  exactly match the local hostname (with an optional trailing NUL). Missing,
+  malformed, truncated, nonlocal, inaccessible, or deleted process hints contribute
+  no executable; class matching remains available. TCP/SSH-forwarded displays,
+  hostname aliases/FQDNs that differ from the local hostname, and different PID
+  namespaces intentionally receive no reliable executable support. No DNS lookup
+  or title/command-line inference is used. The active window is checked again
+  before publishing the identity. These client-supplied properties are routing
+  hints, not authenticated process ownership or protection from spoofing.
+  See the [EWMH process and client-machine properties](https://specifications.freedesktop.org/wm/latest-single/).
+- Wayland probes Hyprland, Sway, and KWin on a best-effort
   basis. Hyprland and Sway resolve the reported positive PID through `/proc/<pid>/exe`
   for the same user; missing, inaccessible, deleted, or foreign-user processes
   contribute no executable. Titles and command lines are never executable

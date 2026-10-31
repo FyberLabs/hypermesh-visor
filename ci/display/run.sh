@@ -2046,6 +2046,27 @@ scenario_scroll_editor() {
     sleep 0.1
   done
   xwininfo -name 'Visor scroll editor' >/dev/null 2>&1 || die "scroll editor did not open"
+  # Exercise the real X11 probe with explicit EWMH client properties. A foreign
+  # machine must clear the executable hint while retaining the class hint.
+  local editor_window client_host expected found
+  editor_window=$(xwininfo -name 'Visor scroll editor' | awk '/Window id:/ {print $4; exit}')
+  xprop -id "$editor_window" -f _NET_WM_PID 32c -set _NET_WM_PID "$editor_pid"
+  for client_host in "$(hostname)" visor-foreign.invalid "$(hostname)"; do
+    xprop -id "$editor_window" -f WM_CLIENT_MACHINE 8s -set WM_CLIENT_MACHINE "$client_host"
+    expected=$python
+    [[ $client_host != visor-foreign.invalid ]] || expected=''
+    found=0
+    for i in $(seq 1 40); do
+      if curl_visor --max-time 5 -fsS "$BASE/companion" | python3 -c '
+import json, sys
+focus = (json.load(sys.stdin).get("session") or {}).get("focused") or {}
+raise SystemExit(0 if focus.get("wm_class") and (focus.get("executable") or "") == sys.argv[1] else 1)
+' "$expected"; then found=1; break; fi
+      sleep 0.1
+    done
+    [[ $found == 1 ]] || die "X11 executable hint did not match client locality"
+  done
+
   http_code "$REQ_DIR/last.code" POST "$BASE/session/$SID/mouse" '{"action":"scroll","x":650,"y":120,"delta_x":0,"delta_y":3}'
   [[ $(cat "$REQ_DIR/last.code") == 204 ]] || die "editor scroll down $(cat "$HTTP_BODY")"
   local moved=0
