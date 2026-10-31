@@ -4,6 +4,7 @@ use serde_json::Value;
 
 pub const VERSION: &str = "2025-11-25";
 
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Negotiated {
     pub version: String,
     pub tools: bool,

@@ -50,3 +50,6 @@ impl McpError {
         Self::Message(text.into())
     }
 }
+
+pub use protocol::Negotiated as NegotiatedProtocol;
+pub use stdio::RoutingStatus;

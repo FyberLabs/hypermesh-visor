@@ -328,6 +328,33 @@ identity coverage beyond the current Linux probes, automatic server reconnect
 policy, and native Windows/macOS discovery. The implemented protocol surface and
 remaining compatibility limits are described below.
 
+## Attachment diagnostics
+
+Each server in `GET /session/{id}/mcp` includes a `routing_status`:
+
+| Status | Meaning |
+| --- | --- |
+| `ready` | Current catalog, live transport, and at least one directly callable tool. |
+| `task_required` | Healthy transport/catalog, but every tool requires unsupported task execution. |
+| `no_tools` | Live transport with an empty catalog, including servers without a tools capability. |
+| `catalog_stale` | A tool-list notification invalidated the catalog; refresh is needed. |
+| `disconnected` | Transport missing/exited or its reader failed. |
+| `refreshing` | Refresh/reconnect I/O is in progress. |
+
+Only `ready` servers are focused-app routing candidates. `healthy` remains true
+for `ready` and `task_required`; it is false for the other states. The API derives
+both fields from one state sample. A reported live HTTP connection reflects
+observed transport state, not a new liveness probe.
+
+The optional `protocol` object records the last successful negotiation:
+`version`, `tools`, and `list_changed`. It survives a refresh placeholder or a
+failed connection so diagnostics retain the last observed capabilities; reconnect
+success replaces it. It is historical context, not a claim that a disconnected
+server still supports those capabilities. Only the supported tool capability
+summary is exposed, without server instructions, experimental capabilities,
+endpoint URLs, headers, arguments, or environment values. Listing performs no
+network I/O, server startup, or automatic reconnect.
+
 ## Match diagnostics
 
 `GET /companion` includes `session.mcp_match` alongside the existing `mcp`,
@@ -344,7 +371,7 @@ remaining compatibility limits are described below.
   More than one exposes overlapping rules; the first healthy binding wins.
 
 `server_unavailable` means the identity matched but none of its servers is
-attached and healthy. `no_bindings` means a missing file or an explicitly empty
+attached, healthy, and offering a directly callable tool. `no_bindings` means a missing file or an explicitly empty
 `bindings` list (distinguished by `bindings_status`). Malformed configuration,
 unknown fields, invalid selectors, and read/size failures produce
 `bindings_unavailable`, zero match counters, and desktop fallback, even when
@@ -402,8 +429,25 @@ MCP schema conformance validation: schema keywords and argument/result values
 are not evaluated here. References are retained as data and never fetched.
 Downstream clients can use the supplied schemas to construct calls, but must
 still treat server metadata as untrusted. Metadata does not grant tool permission
-or change call approval. Annotations, icons, and task execution metadata are not
-exposed by this catalog surface yet. See the [MCP tool definition](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool).
+or change call approval. Optional `annotations` and `execution` objects are also preserved. Known
+annotation hints (`readOnlyHint`, `destructiveHint`, `idempotentHint`, and
+`openWorldHint`) must be booleans; annotation `title` must be text. Missing hints
+are left absent. Annotations remain untrusted descriptions and never bypass
+approve/deny decisions, affect routing, or grant permissions. Unknown annotation
+and execution fields remain data within the same size limit.
+
+`execution.taskSupport`, when supplied, must be `forbidden`, `optional`, or
+`required`. Visor does not implement task execution. A `required` tool remains
+visible for inspection, but even an approved call fails locally before transport
+I/O; health and the catalog remain intact. Focused-app routing excludes servers
+with no directly callable tools (empty or entirely task-required catalogs),
+allowing desktop fallback even while the connection is healthy. `optional`, `forbidden`, and omitted
+values allow the existing direct-call path, still subject to normal approval.
+Refresh replaces these requirements with the catalog; invalid execution metadata
+fails the entire refresh. This is compatibility gating, not validation of whether
+a server's claims are truthful. Task requests are never synthesized or retried.
+The existing call API reports unsupported task-required calls as 502 and records
+a failed approved call without arguments. Icons are not exposed yet. See the [MCP tool definition](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool).
 
 Use the authenticated local control API, or opted-in bearer-authenticated TCP:
 

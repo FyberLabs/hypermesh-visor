@@ -47,6 +47,8 @@ pub fn list_tools(
                 title: optional_text(tool, "title")?,
                 input_schema: optional_schema(tool, "inputSchema")?,
                 output_schema: optional_schema(tool, "outputSchema")?,
+                annotations: optional_annotations(tool)?,
+                execution: optional_execution(tool)?,
             });
         }
         match result.get("nextCursor") {
@@ -82,6 +84,45 @@ fn optional_text(tool: &Value, field: &str) -> Result<Option<String>, McpError> 
         Some(Value::String(value)) => Ok(Some(value.clone())),
         _ => Err(McpError::message("MCP tool metadata must be text")),
     }
+}
+
+fn optional_annotations(tool: &Value) -> Result<Option<Value>, McpError> {
+    let Some(value) = tool.get("annotations") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| McpError::message("MCP annotations must be an object"))?;
+    for key in [
+        "readOnlyHint",
+        "destructiveHint",
+        "idempotentHint",
+        "openWorldHint",
+    ] {
+        if object.get(key).is_some_and(|v| !v.is_boolean()) {
+            return Err(McpError::message("MCP annotation hint must be boolean"));
+        }
+    }
+    if object.get("title").is_some_and(|v| !v.is_string()) {
+        return Err(McpError::message("MCP annotation title must be text"));
+    }
+    Ok(Some(value.clone()))
+}
+
+fn optional_execution(tool: &Value) -> Result<Option<Value>, McpError> {
+    let Some(value) = tool.get("execution") else {
+        return Ok(None);
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| McpError::message("MCP execution metadata must be an object"))?;
+    if object
+        .get("taskSupport")
+        .is_some_and(|v| !matches!(v.as_str(), Some("forbidden" | "optional" | "required")))
+    {
+        return Err(McpError::message("MCP task support value is unsupported"));
+    }
+    Ok(Some(value.clone()))
 }
 
 #[cfg(test)]
@@ -141,6 +182,45 @@ mod tests {
             .is_err());
         }
         assert!(list_tools(|_| Ok(json!({"result":{"tools":[{"name":"large","inputSchema":{"description":"x".repeat(8*1024*1024)}}]}}))).is_err());
+    }
+
+    #[test]
+    fn execution_and_annotations_roundtrip_without_inventing_defaults() {
+        for support in ["forbidden", "optional", "required"] {
+            let tool = json!({"name":"x","annotations":{"title":"Display","readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false,"extension":{"value":"untrusted"}},"execution":{"taskSupport":support}});
+            let tools = list_tools(|_| Ok(json!({"result":{"tools":[tool]}}))).unwrap();
+            assert_eq!(serde_json::to_value(&tools[0]).unwrap(), tool);
+        }
+        let tools = list_tools(|_| Ok(json!({"result":{"tools":[{"name":"legacy"}]}}))).unwrap();
+        assert_eq!(
+            serde_json::to_value(&tools[0]).unwrap(),
+            json!({"name":"legacy"})
+        );
+    }
+
+    #[test]
+    fn invalid_execution_or_annotations_reject_the_entire_catalog() {
+        for invalid in [
+            json!({"annotations":null}),
+            json!({"annotations":[]}),
+            json!({"annotations":{"readOnlyHint":"private"}}),
+            json!({"annotations":{"destructiveHint":0}}),
+            json!({"annotations":{"idempotentHint":null}}),
+            json!({"annotations":{"openWorldHint":[]}}),
+            json!({"annotations":{"title":false}}),
+            json!({"execution":null}),
+            json!({"execution":[]}),
+            json!({"execution":{"taskSupport":"private"}}),
+            json!({"execution":{"taskSupport":false}}),
+            json!({"execution":{"taskSupport":null}}),
+        ] {
+            let mut tool = invalid;
+            tool["name"] = json!("bad");
+            let error = list_tools(|_| Ok(json!({"result":{"tools":[{"name":"valid"},tool]}})))
+                .unwrap_err()
+                .to_string();
+            assert!(!error.contains("private"));
+        }
     }
 
     #[test]

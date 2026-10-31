@@ -1071,6 +1071,9 @@ struct SessionMcpBody {
 #[derive(Serialize)]
 struct SessionMcpServer {
     refreshing: bool,
+    routing_status: mcp::RoutingStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protocol: Option<mcp::NegotiatedProtocol>,
     name: String,
     transport: String,
     healthy: bool,
@@ -1240,12 +1243,17 @@ async fn session_mcp(
         .mcp()
         .servers
         .iter()
-        .map(|server| SessionMcpServer {
-            refreshing: server.refreshing,
-            name: server.name.clone(),
-            transport: server.transport.clone(),
-            healthy: server.is_healthy(),
-            tools: server.tools.clone(),
+        .map(|server| {
+            let routing_status = server.routing_status();
+            SessionMcpServer {
+                refreshing: server.refreshing,
+                routing_status,
+                protocol: server.negotiated.clone(),
+                name: server.name.clone(),
+                transport: server.transport.clone(),
+                healthy: routing_status.is_healthy(),
+                tools: server.tools.clone(),
+            }
         })
         .collect();
     Ok(Json(SessionMcpBody {
@@ -4110,7 +4118,7 @@ while True:
     elif method == "notifications/initialized":
         pass
     elif method == "tools/list":
-        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"}}]}})
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":True,"destructiveHint":False},"execution":{"taskSupport":"optional"}},{"name":"task-only","execution":{"taskSupport":"required"}}]}})
     elif method == "tools/call":
         send({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"pong"}]}})
 "#,
@@ -4154,8 +4162,12 @@ while True:
         assert_eq!(mcp["profile"], "default");
         assert_eq!(mcp["servers"][0]["name"], "fixture");
         assert_eq!(mcp["servers"][0]["healthy"], true);
+        assert_eq!(mcp["servers"][0]["routing_status"], "ready");
+        assert_eq!(mcp["servers"][0]["protocol"], serde_json::json!({"version":"2024-11-05","tools":true,"list_changed":false}));
         assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
         assert_eq!(mcp["servers"][0]["tools"][0]["inputSchema"], serde_json::json!({"type":"object"}));
+        assert_eq!(mcp["servers"][0]["tools"][0]["annotations"]["readOnlyHint"], true);
+        assert_eq!(mcp["servers"][0]["tools"][1]["execution"]["taskSupport"], "required");
         for action in ["refresh", "reconnect"] {
             let (status, _, _) = send(addr, "POST", &format!("/session/{id}/mcp/refresh"), Some(serde_json::json!({"server":"fixture","action":action}).to_string())).await;
             assert_eq!(status, 204);
@@ -4283,6 +4295,16 @@ while True:
         assert_eq!(audit[2]["server"], "fixture");
         assert_eq!(audit[3]["decision"], "approve");
         assert_eq!(audit[3]["outcome"], "ok");
+
+        let (status, _, body) = send(addr, "POST", &format!("/session/{id}/mcp/call"), Some(
+            serde_json::json!({"server":"fixture","tool":"task-only","decision":"approve","arguments":{}}).to_string()
+        )).await;
+        assert_eq!(status, 502);
+        assert!(String::from_utf8_lossy(&body).contains("requires task execution"));
+        let (_, _, body) = send(addr, "GET", &format!("/session/{id}/mcp"), None).await;
+        let catalog: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(catalog["servers"][0]["healthy"], true);
+
 
         let (status, _, _) = send(addr, "DELETE", &format!("/session/{id}"), None).await;
         assert_eq!(status, 204);
