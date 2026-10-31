@@ -196,6 +196,7 @@ Known locations on Linux:
 | Source ID | MCP file |
 | --- | --- |
 | `zed_user` | `<config>/zed/settings.json` |
+| `junie_user` | `~/.junie/mcp/mcp.json` |
 | `devin_user` | `~/.config/devin/mcp_config.json` |
 | `cursor_global` | `~/.cursor/mcp.json` |
 | `vscode_user` | `<config>/Code/User/mcp.json` |
@@ -243,6 +244,26 @@ are rejected. Supply static compatible server definitions and review their
 credentials separately. Neither integration starts or contacts servers during
 listing, preview, or approval; attach remains a separate approved-session action.
 
+Junie user configuration is listed from `~/.junie/mcp/mcp.json`, shared by its
+IDE plugin and CLI. Supported command/args/env and URL/headers entries use the
+existing `mcpServers` importer. Visor does not scan Junie projects, merge its
+custom locations, inherit its approvals, or reuse OAuth sessions. Select project
+files explicitly. Junie-specific `timeout`, OAuth, and other unsupported fields
+require a privately reviewed compatible export; they are never silently dropped.
+Visor's request deadlines and explicit trust/profile membership still apply.
+
+External imports accept explicit `type: "stdio"` and `type: "http"`, and normalize
+`type: "streamable-http"` to `http`. Omitted types retain command/URL inference.
+Legacy `type: "sse"`, empty/null/non-string types, and unknown types are rejected.
+This avoids interpreting an editor's legacy SSE transport as visor's historical
+POST-based `sse` alias. The alias remains available in visor's own configuration;
+this restriction applies to imported files and their restored approvals. Existing
+external SSE receipts will need a compatible source and fresh approval after a
+restart. Do not merely rename a legacy SSE transport: verify that the endpoint
+actually supports Streamable HTTP first. Continue's documented JSON MCP files
+can already be selected explicitly; its YAML files and project directories are
+not scanned or imported.
+
 Imports preserve visor's user-first precedence and profile membership. Editor
 inputs, sandbox settings, env files, OAuth settings, and unsupported variable
 expansions remain rejected; supply a privately reviewed compatible export.
@@ -251,7 +272,9 @@ security settings are never silently discarded. Downgrading to a version without
 these source IDs rejects their receipts; keep backups and use a compatible
 version to review or revoke them.
 
-Source references: [Cursor MCP configuration](https://prod.cursor.com/help/customization/mcp),
+Source references: [Junie MCP configuration](https://junie.jetbrains.com/docs/junie-cli-mcp-configuration.html),
+[Continue JSON and transport formats](https://github.com/continuedev/continue/blob/main/docs/customize/deep-dives/mcp.mdx),
+[Cursor MCP configuration](https://prod.cursor.com/help/customization/mcp),
 [VS Code MCP configuration](https://code.visualstudio.com/docs/agents/reference/mcp-configuration),
 [profile file layout](https://code.visualstudio.com/docs/configure/settings#_profile-settings),
 [Zed custom MCP servers](https://zed.dev/docs/ai/mcp),
