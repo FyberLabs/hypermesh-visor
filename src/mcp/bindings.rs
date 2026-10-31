@@ -1,20 +1,23 @@
 //! Focused-app → MCP server bindings (companion prefer-MCP).
 
 use std::fs;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
 use super::McpError;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct BindingsFile {
-    #[serde(default)]
     pub bindings: Vec<Binding>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Binding {
     pub server: String,
     #[serde(default)]
@@ -43,68 +46,128 @@ impl FocusedApp {
     }
 }
 
-/// How often `GET /companion` may stat `mcp-bindings.json`.
+/// Re-read bounded configuration at most once per second. Content and permission
+/// changes must invalidate stale routing even when timestamps are preserved.
 pub const BINDINGS_REFRESH: Duration = Duration::from_secs(1);
+const MAX_BYTES: u64 = 64 * 1024;
+const MAX_BINDINGS: usize = 128;
 
-/// In-memory bindings. The file is read only when this is due and the mtime changed.
-#[derive(Debug, Default)]
-pub struct BindingCache {
-    checked_at: Option<Instant>,
-    mtime: Option<SystemTime>,
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindingStatus {
+    #[default]
+    Missing,
+    Ready,
+    Invalid,
+    Unavailable,
+    TooLarge,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BindingSnapshot {
+    status: BindingStatus,
     bindings: Vec<Binding>,
 }
 
-impl BindingCache {
-    pub fn current(&mut self, dir: &Path, now: Instant) -> Vec<Binding> {
-        let due = self
-            .checked_at
-            .map(|at| now.saturating_duration_since(at) >= BINDINGS_REFRESH)
-            .unwrap_or(true);
-        if !due {
-            return self.bindings.clone();
+impl BindingSnapshot {
+    pub fn explain(&self, focus: Option<&FocusedApp>, healthy: &[String]) -> MatchDecision {
+        let mut decision = explain_preferred(focus, &self.bindings, healthy);
+        decision.bindings_status = self.status;
+        if matches!(
+            self.status,
+            BindingStatus::Invalid | BindingStatus::Unavailable | BindingStatus::TooLarge
+        ) {
+            decision.reason = MatchReason::BindingsUnavailable;
         }
-        let path = dir.join("mcp-bindings.json");
-        let mtime = fs::metadata(&path).and_then(|meta| meta.modified()).ok();
-        refresh_cached_bindings(self, now, BINDINGS_REFRESH, mtime, || {
-            load_bindings(dir).unwrap_or_default().bindings
-        })
+        decision
     }
 }
 
-/// Apply one refresh decision. `load` runs only on the first fill or when `mtime` changes.
-pub fn refresh_cached_bindings(
-    cache: &mut BindingCache,
-    now: Instant,
-    interval: Duration,
-    mtime: Option<SystemTime>,
-    load: impl FnOnce() -> Vec<Binding>,
-) -> Vec<Binding> {
-    if cache
-        .checked_at
-        .is_some_and(|at| now.saturating_duration_since(at) < interval)
-    {
-        return cache.bindings.clone();
+#[derive(Debug, Default)]
+pub struct BindingCache {
+    checked_at: Option<Instant>,
+    snapshot: BindingSnapshot,
+}
+
+impl BindingCache {
+    pub fn current(&mut self, dir: &Path, now: Instant) -> BindingSnapshot {
+        if self
+            .checked_at
+            .is_none_or(|at| now.saturating_duration_since(at) >= BINDINGS_REFRESH)
+        {
+            self.snapshot = match read_bindings(dir) {
+                Ok(file) => BindingSnapshot {
+                    status: BindingStatus::Ready,
+                    bindings: file.bindings,
+                },
+                Err(status) => BindingSnapshot {
+                    status,
+                    bindings: Vec::new(),
+                },
+            };
+            self.checked_at = Some(now);
+        }
+        self.snapshot.clone()
     }
-    if cache.checked_at.is_some() && cache.mtime == mtime {
-        cache.checked_at = Some(now);
-        return cache.bindings.clone();
+}
+
+fn read_bindings(dir: &Path) -> Result<BindingsFile, BindingStatus> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(dir.join("mcp-bindings.json"))
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                BindingStatus::Missing
+            } else {
+                BindingStatus::Unavailable
+            }
+        })?;
+    let meta = file.metadata().map_err(|_| BindingStatus::Unavailable)?;
+    if !meta.is_file() {
+        return Err(BindingStatus::Unavailable);
     }
-    let bindings = load();
-    cache.bindings.clone_from(&bindings);
-    cache.mtime = mtime;
-    cache.checked_at = Some(now);
-    bindings
+    if meta.len() > MAX_BYTES {
+        return Err(BindingStatus::TooLarge);
+    }
+    let mut raw = Vec::new();
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|_| BindingStatus::Unavailable)?;
+    if raw.len() as u64 > MAX_BYTES {
+        return Err(BindingStatus::TooLarge);
+    }
+    let parsed: BindingsFile = serde_json::from_slice(&raw).map_err(|_| BindingStatus::Invalid)?;
+    if parsed.bindings.len() > MAX_BINDINGS {
+        return Err(BindingStatus::TooLarge);
+    }
+    for binding in &parsed.bindings {
+        let selectors = [&binding.wm_class, &binding.app_id, &binding.executable];
+        if binding.server.trim().is_empty()
+            || binding.server.len() > 1024
+            || !selectors.iter().any(|s| s.is_some())
+            || selectors.iter().any(|s| {
+                s.as_ref()
+                    .is_some_and(|s| s.trim().is_empty() || s.len() > 4096 || s.contains('\0'))
+            })
+            || binding
+                .executable
+                .as_ref()
+                .is_some_and(|s| !Path::new(s.trim()).is_absolute())
+        {
+            return Err(BindingStatus::Invalid);
+        }
+    }
+    Ok(parsed)
 }
 
 pub fn load_bindings(dir: &Path) -> Result<BindingsFile, McpError> {
-    let path = dir.join("mcp-bindings.json");
-    if !path.exists() {
-        return Ok(BindingsFile::default());
+    match read_bindings(dir) {
+        Ok(file) => Ok(file),
+        Err(BindingStatus::Missing) => Ok(BindingsFile::default()),
+        // Never expose raw parser errors or configuration fragments.
+        Err(status) => Err(McpError::message(format!("MCP bindings {status:?}"))),
     }
-    let raw = fs::read_to_string(&path)
-        .map_err(|e| McpError::message(format!("read {}: {e}", path.display())))?;
-    serde_json::from_str(&raw)
-        .map_err(|e| McpError::message(format!("parse {}: {e}", path.display())))
 }
 
 /// A bounded explanation of routing. No config values, credentials, or titles.
@@ -113,6 +176,7 @@ pub struct MatchDecision {
     #[serde(skip)]
     pub preferred: Option<String>,
     pub reason: MatchReason,
+    pub bindings_status: BindingStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_index: Option<usize>,
     pub identity_matches: usize,
@@ -124,6 +188,7 @@ pub struct MatchDecision {
 pub enum MatchReason {
     FocusUnavailable,
     NoBindings,
+    BindingsUnavailable,
     IdentityMismatch,
     ServerUnavailable,
     Matched,
@@ -139,6 +204,7 @@ pub fn explain_preferred(
     let mut decision = MatchDecision {
         preferred: None,
         reason: MatchReason::FocusUnavailable,
+        bindings_status: BindingStatus::Ready,
         binding_index: None,
         identity_matches: 0,
         healthy_matches: 0,
@@ -281,7 +347,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(chosen).unwrap(),
             serde_json::json!({
-                "reason":"matched", "binding_index":1, "identity_matches":3, "healthy_matches":2
+                "reason":"matched", "bindings_status":"ready", "binding_index":1, "identity_matches":3, "healthy_matches":2
             })
         );
     }
@@ -352,63 +418,103 @@ mod tests {
     }
 
     #[test]
-    fn bindings_reload_only_after_the_interval_when_mtime_changes() {
+    fn binding_cache_invalidates_stale_routes_and_recovers_without_mtime_changes() {
+        let dir = std::env::temp_dir().join(format!("visor-bindings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mcp-bindings.json");
         let mut cache = BindingCache::default();
-        let start = Instant::now();
-        let mtime = SystemTime::UNIX_EPOCH;
-        let mut loads = 0;
-        let first =
-            refresh_cached_bindings(&mut cache, start, BINDINGS_REFRESH, Some(mtime), || {
-                loads += 1;
-                vec![Binding {
-                    server: "chrome".into(),
-                    wm_class: Some("chrome".into()),
-                    app_id: None,
-                    executable: None,
-                }]
-            });
-        assert_eq!(loads, 1);
-        assert_eq!(first[0].server, "chrome");
-        let again = refresh_cached_bindings(
-            &mut cache,
-            start + Duration::from_millis(40),
-            BINDINGS_REFRESH,
-            Some(mtime + Duration::from_secs(5)),
-            || {
-                loads += 1;
-                Vec::new()
-            },
+        let now = Instant::now();
+        assert_eq!(cache.current(&dir, now).status, BindingStatus::Missing);
+        let raw = r#"{"bindings":[{"server":"editor","wm_class":"Editor"}]}"#;
+        fs::write(&path, raw).unwrap();
+        let focus = FocusedApp {
+            wm_class: Some("Editor".into()),
+            ..Default::default()
+        };
+        let healthy = vec!["editor".into()];
+        assert_eq!(cache.current(&dir, now).status, BindingStatus::Missing);
+        assert!(cache
+            .current(&dir, now + BINDINGS_REFRESH)
+            .explain(Some(&focus), &healthy)
+            .preferred
+            .is_some());
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        fs::write(&path, raw.replace("wm_class", "wm_clazz")).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let invalid = cache
+            .current(&dir, now + BINDINGS_REFRESH * 2)
+            .explain(Some(&focus), &healthy);
+        assert_eq!(invalid.bindings_status, BindingStatus::Invalid);
+        assert_eq!(invalid.reason, MatchReason::BindingsUnavailable);
+        assert!(invalid.preferred.is_none());
+        fs::write(&path, raw).unwrap();
+        assert_eq!(
+            cache.current(&dir, now + BINDINGS_REFRESH * 3).status,
+            BindingStatus::Ready
         );
-        assert_eq!(loads, 1);
-        assert_eq!(again[0].server, "chrome");
-        let same = refresh_cached_bindings(
-            &mut cache,
-            start + BINDINGS_REFRESH,
-            BINDINGS_REFRESH,
-            Some(mtime),
-            || {
-                loads += 1;
-                Vec::new()
-            },
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            cache.current(&dir, now + BINDINGS_REFRESH * 4).status,
+            BindingStatus::Missing
         );
-        assert_eq!(loads, 1);
-        assert_eq!(same[0].server, "chrome");
-        let changed = refresh_cached_bindings(
-            &mut cache,
-            start + BINDINGS_REFRESH + BINDINGS_REFRESH,
-            BINDINGS_REFRESH,
-            Some(mtime + Duration::from_secs(5)),
-            || {
-                loads += 1;
-                vec![Binding {
-                    server: "editor".into(),
-                    wm_class: None,
-                    app_id: None,
-                    executable: None,
-                }]
-            },
-        );
-        assert_eq!(loads, 2);
-        assert_eq!(changed[0].server, "editor");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_selectors_and_unknown_fields_fail_the_entire_file() {
+        let dir = std::env::temp_dir().join(format!("visor-bindings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        for raw in [
+            r#"{}"#,
+            r#"{"bindings":[],"policy":"private"}"#,
+            r#"{"bindings":[{"server":"x","wm_class":"Editor","executable_path":"private"}]}"#,
+            r#"{"bindings":[{"server":"x"}]}"#,
+            r#"{"bindings":[{"server":"x","wm_class":"Editor","app_id":" "}]}"#,
+            r#"{"bindings":[{"server":"x","executable":"editor"}]}"#,
+            r#"{"bindings":[{"server":"","wm_class":"Editor"}]}"#,
+            r#"{"bindings":[{"server":"x","wm_class":"Editor"},{"server":"bad"}]}"#,
+            "private invalid JSON",
+        ] {
+            fs::write(dir.join("mcp-bindings.json"), raw).unwrap();
+            assert_eq!(read_bindings(&dir).unwrap_err(), BindingStatus::Invalid);
+            let mut cache = BindingCache::default();
+            let decision = cache.current(&dir, Instant::now()).explain(None, &[]);
+            assert_eq!(decision.reason, MatchReason::BindingsUnavailable);
+            let displayed = serde_json::to_string(&decision).unwrap();
+            assert!(!displayed.contains("private"));
+            assert!(decision.preferred.is_none());
+        }
+        fs::write(dir.join("mcp-bindings.json"), r#"{"bindings":[]}"#).unwrap();
+        assert!(read_bindings(&dir).unwrap().bindings.is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn bounded_reads_reject_large_files_rule_counts_and_special_files() {
+        let dir = std::env::temp_dir().join(format!("visor-bindings-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mcp-bindings.json");
+        fs::write(&path, vec![b' '; MAX_BYTES as usize + 1]).unwrap();
+        assert_eq!(read_bindings(&dir).unwrap_err(), BindingStatus::TooLarge);
+        let binding = serde_json::json!({"server":"x","wm_class":"Editor"});
+        fs::write(
+            &path,
+            serde_json::json!({"bindings":vec![binding; MAX_BINDINGS + 1]}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(read_bindings(&dir).unwrap_err(), BindingStatus::TooLarge);
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert_eq!(read_bindings(&dir).unwrap_err(), BindingStatus::Unavailable);
+        fs::remove_dir(&path).unwrap();
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_bindings(&dir).unwrap_err(), BindingStatus::Unavailable);
+        fs::remove_dir_all(dir).unwrap();
     }
 }
