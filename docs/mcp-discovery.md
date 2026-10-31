@@ -388,6 +388,23 @@ and 4,096-byte cursors. Each response is capped at 8 MiB. Stdio writes and respo
 requests have a 15-second I/O deadline; discovery stops starting new pages after
 30 seconds (a final outstanding request can take another 15 seconds).
 
+`GET /session/{id}/mcp` preserves each discovered tool's optional `title`,
+`inputSchema`, and `outputSchema`, using the MCP field names alongside `name`
+and `description`. Schemas change atomically with the catalog on refresh and
+reconnect. A malformed schema or text field rejects the entire catalog; failed
+refresh clears the old metadata and removes the server from healthy routing.
+All metadata, including schemas, counts toward the existing 8 MiB catalog limit.
+
+Schemas must be JSON objects when supplied; title/description must be strings.
+For compatibility, servers that omit input schemas remain discoverable, with
+`inputSchema` absent rather than an invented no-argument schema. This is not full
+MCP schema conformance validation: schema keywords and argument/result values
+are not evaluated here. References are retained as data and never fetched.
+Downstream clients can use the supplied schemas to construct calls, but must
+still treat server metadata as untrusted. Metadata does not grant tool permission
+or change call approval. Annotations, icons, and task execution metadata are not
+exposed by this catalog surface yet. See the [MCP tool definition](https://modelcontextprotocol.io/specification/2025-11-25/server/tools#tool).
+
 Use the authenticated local control API, or opted-in bearer-authenticated TCP:
 
 ```sh

@@ -15,6 +15,12 @@ pub struct ToolInfo {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<Value>,
+    #[serde(rename = "outputSchema", skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
 }
 
 struct StdioClient {
@@ -785,7 +791,7 @@ for line in sys.stdin:
    print(json.dumps({'jsonrpc':'2.0','id':m['id'],'error':{'message':'private detail'}}),flush=True); continue
   second='cursor' in m['params']
   if second: assert m['params']['cursor']=='opaque +/='
-  result={'tools':[{'name':v+('-b' if second else '-a')}]}
+  result={'tools':[{'name':v+('-b' if second else '-a'),'inputSchema':None if v=='invalid-schema' else {'type':'object','properties':{v:{'type':'string'}}}}]}
   if not second: result['nextCursor']='opaque +/='
   print(json.dumps({'jsonrpc':'2.0','method':'notifications/tools/list_changed'}),flush=True)
  elif method=='tools/call':
@@ -821,6 +827,13 @@ for line in sys.stdin:
         fs::write(&version, "new").unwrap();
         server.refresh(false).unwrap();
         assert_eq!(server.tools[1].name, "new-b");
+        assert_eq!(server.tools[1].input_schema.as_ref().unwrap()["properties"], json!({"new":{"type":"string"}}));
+        fs::write(&version, "invalid-schema").unwrap();
+        assert!(server.refresh(false).is_err());
+        assert!(server.tools.is_empty());
+        assert!(!server.is_healthy());
+        fs::write(&version, "new").unwrap();
+        server.refresh(true).unwrap();
         fs::write(&version, "fail").unwrap();
         let error = server.refresh(false).unwrap_err().to_string();
         assert!(!error.contains("private detail"));
