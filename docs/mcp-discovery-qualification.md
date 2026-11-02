@@ -55,18 +55,23 @@ retain `mcp-persistence.log` alongside the discovery log.
 
 ## Installed-platform acceptance
 
-The release workflow's `installed Debian X11 qualification` job downloads the
+The release workflow's `installed Debian X11` matrix downloads the
 packages from the same workflow run, checks their SHA-256 manifest, installs the
-x86_64 Debian package with apt, and verifies installed package files. It runs the
+matching Debian package with apt, and verifies installed package files. Each
+job checks that the kernel, Debian host and package architectures agree:
+`x86_64`/`amd64` on `ubuntu-24.04`, and `aarch64`/`arm64` on
+`ubuntu-24.04-arm`. No emulation or cross-architecture fallback is configured. It runs the
 full X11 harness with `bash ci/display/run.sh --installed x11`. This mode uses
 only `/usr/bin/hypermesh-visor` and `/usr/bin/hypermesh-companion`; it never builds
 or falls back to checkout binaries. Tag publication waits for this job.
 
-The `installed-x11-<sha>` artifact records the candidate/package and executable
+Each `installed-x11-<architecture>-<sha>` artifact records the candidate/package and executable
 hashes, OS and Xorg package versions, run/attempt, full harness result, and MCP
 scenario log. A failed or absent job is not installed-package acceptance.
-This exercises Ubuntu 24.04 x86_64 with dummy Xorg and kernel uinput. It does not
-qualify RPM installation, ARM hardware, graphical-login autostart, native
+This exercises Ubuntu 24.04 x86_64 and ARM64 hosted VMs with dummy Xorg and
+kernel uinput. Native ARM execution does not qualify Jetson/AGX hardware, GPU
+drivers or physical displays. It also does not qualify RPM installation,
+graphical-login autostart, native
 Windows/macOS, container isolation, or every manual case below. Retain these distinctions in the acceptance report.
 
 Use a disposable OS account and fixture credentials only. Install the candidate
@@ -128,3 +133,5 @@ supports Linux acceptance; it does not satisfy Windows/macOS or container rows.
 Keep #29 open until their evidence is linked, or the owner explicitly changes its
 scope. Native installers, backends and container deployment are owned by the
 linked implementation issues, not claimed as delivered by this procedure.
+
+Runner reference: [GitHub-hosted runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
