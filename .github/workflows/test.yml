@@ -14,6 +14,8 @@ jobs:
         run: bash ci/check-includes.sh
       - name: Check display harness process identity
         run: python3 ci/display/test-process-identity.py
+      - name: Check display typing interruption observer
+        run: python3 ci/display/test-interrupt-type.py
       - run: cargo test --locked --workspace
       - name: Another Linux user cannot drive the desktop
         run: bash ci/cross-user.sh
