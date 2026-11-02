@@ -60,15 +60,27 @@ pub fn validate_response(response: &Value, expected: &Value) -> Result<(), McpEr
     }
 }
 
+/// Only well-formed notifications may invalidate a discovered catalog.
+pub fn is_notification(value: &Value, method: &str) -> bool {
+    value["jsonrpc"] == "2.0"
+        && value.get("id").is_none()
+        && value["method"] == method
+        && value.get("result").is_none()
+        && value.get("error").is_none()
+        && value.get("params").is_none_or(Value::is_object)
+}
+
 /// We advertise no roots/sampling/elicitation capabilities. Ping remains mandatory.
 pub fn server_reply(value: &Value) -> Option<Value> {
     if value.get("result").is_some() || value.get("error").is_some() { return None; }
     let id = value.get("id")?;
     let method = value.get("method")?.as_str()?;
-    if value["jsonrpc"] != "2.0" || !(id.is_string() || id.is_number()) {
+    if value["jsonrpc"] != "2.0" || !(id.is_string() || id.is_i64() || id.is_u64()) {
         return None;
     }
-    Some(if method == "ping" {
+    Some(if value.get("params").is_some_and(|params| !params.is_object()) {
+        serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32602,"message":"Invalid params"}})
+    } else if method == "ping" {
         serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}})
     } else {
         serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Unsupported client method"}})
@@ -79,6 +91,26 @@ pub fn server_reply(value: &Value) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn server_requests_validate_ids_and_params_without_echoing_payloads() {
+        for id in [json!("request"), json!(0), json!(-1), json!(u64::MAX)] {
+            for params in [json!({}), json!({"_meta":{"private":true}})] {
+                let reply = server_reply(&json!({"jsonrpc":"2.0","id":id,"method":"ping","params":params})).unwrap();
+                assert_eq!(reply, json!({"jsonrpc":"2.0","id":id,"result":{}}));
+            }
+            for params in [Value::Null, json!([]), json!("private"), json!(4)] {
+                let reply = server_reply(&json!({"jsonrpc":"2.0","id":id,"method":"ping","params":params})).unwrap();
+                assert_eq!(reply["error"]["code"], -32602);
+                assert!(!reply.to_string().contains("private"));
+            }
+        }
+        for id in [Value::Null, json!(1.5), json!(true), json!([])] {
+            assert!(server_reply(&json!({"jsonrpc":"2.0","id":id,"method":"ping"})).is_none());
+        }
+        assert_eq!(server_reply(&json!({"jsonrpc":"2.0","id":1,"method":"roots/list"})).unwrap()["error"]["code"], -32601);
+        assert!(server_reply(&json!({"jsonrpc":"2.0","method":"ping"})).is_none());
+    }
+
     #[test]
     fn response_envelopes_require_exactly_one_well_formed_outcome() {
         for body in [json!({"result":{}}), json!({"result":{"isError":true}}),

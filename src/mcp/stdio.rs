@@ -778,6 +778,33 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn malformed_notifications_and_ping_params_do_not_stale_stdio_catalog() {
+        let spec = python_spec(r#"
+import sys,json
+for line in sys.stdin:
+ m=json.loads(line)
+ if 'id' not in m: continue
+ if m['method']=='initialize': result={'protocolVersion':'2025-06-18','capabilities':{'tools':{'listChanged':True}}}
+ else:
+  for patch in [{'result':{}},{'error':None},{'params':[]},{'params':None}]:
+   n={'jsonrpc':'2.0','method':'notifications/tools/list_changed'}; n.update(patch)
+   print(json.dumps(n),flush=True)
+  print(json.dumps({'jsonrpc':'2.0','id':'server-ping','method':'ping','params':[]}),flush=True)
+  reply=json.loads(sys.stdin.readline())
+  assert reply['id']=='server-ping' and reply['error']['code']==-32602
+  print(json.dumps({'jsonrpc':'2.0','id':'valid-ping','method':'ping'}),flush=True)
+  reply=json.loads(sys.stdin.readline())
+  assert reply['id']=='valid-ping' and reply['result']=={}
+  result={'tools':[{'name':'a'}]}
+ print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
+"#);
+        let server = attach_one("fixture", &spec).unwrap();
+        assert!(!server.needs_refresh());
+        assert!(server.is_healthy());
+        assert_eq!(server.tools.len(), 1);
+    }
+
+    #[test]
     fn notifications_during_pagination_remain_pending_until_next_pass() {
         let spec = python_spec(
             r#"
