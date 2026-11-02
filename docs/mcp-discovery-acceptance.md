@@ -4,6 +4,11 @@ This ledger separates implemented discovery behavior from platform qualification
 A green portable-source test does not qualify a native visor daemon or desktop.
 #29 is not ready to close while the platform rows below remain unqualified.
 
+The [qualification procedure](mcp-discovery-qualification.md) provides commands,
+installed-platform cases, container isolation checks, and required evidence.
+Discovery implementation can be handed off for acceptance without representing
+the dependent native backends or container deployment as implemented.
+
 ## Acceptance evidence
 
 | Original criterion | Implemented evidence | Remaining qualification |
