@@ -2579,6 +2579,21 @@ scenario_mcp_persistence() {
   done
 }
 
+scenario_mcp_daemon_crash() {
+  ensure_off
+  stop_companion
+  allow_write "$CONFIG/mcp-profiles.json"
+  trap 'python3 "$root/ci/display/mcp-daemon-crash.py" cleanup "$RUNTIME" "$CONFIG" "$REQ_DIR"' EXIT
+  start_visor
+  local pid
+  pid=$(read_state visor.pid)
+  proc_still_ours "$pid" "$VISOR_BIN" || die "crash target is not the harness visor"
+  python3 "$root/ci/display/mcp-daemon-crash.py" before "$RUNTIME" "$CONFIG" "$REQ_DIR" "$pid" "$VISOR_BIN"
+  stop_visor
+  start_visor
+  python3 "$root/ci/display/mcp-daemon-crash.py" after "$RUNTIME" "$CONFIG" "$REQ_DIR"
+}
+
 X11_SCENARIOS=(
   uinput-channel
   key-down-detects
@@ -2599,6 +2614,7 @@ X11_SCENARIOS=(
   held-release
   auto-resume
   mcp-persistence
+  mcp-daemon-crash
   other-user-cannot-drive
 )
 
@@ -2631,7 +2647,7 @@ run_x11() {
       continue
     fi
     case $name in
-      mcp-persistence | mcp-discovery | uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
+      mcp-daemon-crash | mcp-persistence | mcp-discovery | uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
       auto-resume) limit=30 ;;
       key-down-detects) limit=20 ;;
       *) limit=45 ;;
