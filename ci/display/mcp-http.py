@@ -6,6 +6,7 @@ from pathlib import Path
 import runpy
 import sys
 import threading
+import time
 
 UnixHTTP = runpy.run_path(str(Path(__file__).with_name('mcp-discovery.py')))['UnixHTTP']
 runtime, config = map(Path, sys.argv[1:3])
@@ -17,6 +18,9 @@ condition = threading.Condition()
 events = []
 failures = []
 initialized = 0
+changed = threading.Event()
+reopen = threading.Event()
+closed = threading.Event()
 sid = None
 approved = False
 profiles = config / 'mcp-profiles.json'
@@ -55,7 +59,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         assert self.path == path, 'base URL or redirect target contacted'
         assert self.headers.get('Authorization') == 'Bearer ' + private, 'wrong effective authorization'
         assert self.headers.get('X-Fixture') == 'base-retained', 'base header lost'
-        assert self.headers.get('Last-Event-ID') is None, 'configured event ID forwarded'
+        assert self.headers.get('Last-Event-ID') in (None, 'fixture-cursor'), 'configured event ID forwarded'
         if self.command == 'POST':
             size = int(self.headers['Content-Length'])
             assert 0 < size < 65536, 'invalid request size'
@@ -75,29 +79,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 'serverInfo': {'name': 'http-fixture', 'version': '1'}}}, {'Mcp-Session-Id': connection})
             return
         connection = self.headers.get('Mcp-Session-Id')
-        assert connection in ('1', '2'), 'negotiated session ID missing'
+        assert connection in ('1', '2', '3'), 'negotiated session ID missing'
         assert self.headers.get('MCP-Protocol-Version') == protocol, 'negotiated version missing'
         if method == 'notifications/initialized':
             record(('initialized', connection))
             self.reply(202)
         elif method == 'GET':
-            record(('subscription-unsupported', connection))
-            self.reply(405)
+            if connection != '3':
+                record(('subscription-unsupported', connection))
+                self.reply(405)
+                return
+            resumed = self.headers.get('Last-Event-ID') == 'fixture-cursor'
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/event-stream')
+            self.end_headers()
+            self.wfile.flush()
+            record(('sse-resumed' if resumed else 'sse-open', connection))
+            sent = False
+            try:
+                while not closed.wait(0.02):
+                    if not resumed and changed.is_set() and not sent:
+                        self.wfile.write(b'id: fixture-cursor\ndata: {"jsonrpc":"2.0","method":"notifications/tools/list_changed"}\n\n')
+                        self.wfile.flush()
+                        sent = True
+                        record(('sse-notified', connection))
+                    if not resumed and sent and reopen.is_set():
+                        return
+            finally:
+                record(('sse-ended', connection))
         elif method == 'DELETE':
             record(('delete', connection))
+            if connection == '3':
+                closed.set()
             self.reply(405 if connection == '1' else 404)
         elif method == 'tools/list':
             cursor = request.get('params', {}).get('cursor')
             assert cursor in (None, 'page-two'), 'wrong cursor'
             record(('list-first' if cursor is None else 'list-second', connection))
-            tool = 'ping' if cursor is None else 'redirect'
+            tool = ('updated' if connection == '3' and changed.is_set() else 'ping') if cursor is None else 'redirect'
             result = {'tools': [{'name': tool, 'inputSchema': {'type': 'object'}}]}
             if cursor is None:
                 result['nextCursor'] = 'page-two'
             self.reply(200, {'jsonrpc': '2.0', 'id': request['id'], 'result': result})
         elif method == 'tools/call':
             tool = request['params']['name']
-            assert tool in ('ping', 'redirect'), 'unknown tool'
+            assert tool in ('ping', 'redirect', 'updated'), 'unknown tool'
             record(('call-' + tool, connection))
             if tool == 'redirect':
                 self.reply(307, headers={'Location': '/must-not-follow'})
@@ -189,7 +215,36 @@ try:
     sid = None
     wait_for(lambda: ('delete', '2') in events, 'closed session not cleaned up')
     assert events.count(('delete', '1')) == events.count(('delete', '2')) == 1
+    # A third session exercises the supported SSE path with a real stream.
+    session = request(False, 'POST', '/session', {'purpose': 'HTTP subscription qualification',
+        'mcp_profile': profile, 'recipes': [], 'agent': {'name': 'display', 'instructions': ''}, 'skills': []}, 201)
+    sid = session['id']
+    endpoint = f'/session/{sid}/mcp'
+    catalog()
+    wait_for(lambda: ('sse-open', '3') in events, 'subscription did not open')
+    changed.set()
+    wait_for(lambda: ('sse-notified', '3') in events, 'notification not delivered')
+    deadline = time.monotonic() + 8
+    while True:
+        current = request(False, 'GET', endpoint)['servers'][0]
+        if current['healthy'] and [t['name'] for t in current['tools']] == ['updated', 'redirect']:
+            break
+        assert time.monotonic() < deadline, 'notification did not refresh tools'
+        time.sleep(0.05)
+    request(False, 'POST', endpoint + '/call', {'server': 'http-fixture', 'tool': 'updated', 'decision': 'approve', 'arguments': {}})
+    previous_lists = events.count(('list-first', '3'))
+    reopen.set()
+    wait_for(lambda: ('sse-resumed', '3') in events, 'GET did not resume with event ID')
+    wait_for(lambda: events.count(('list-first', '3')) > previous_lists, 'resumed stream did not reconcile catalog')
+    assert initialized == 3, 'GET reconnect reinitialized session'
+    assert events.count(('call-updated', '3')) == 1, 'GET reconnect replayed call'
+    request(False, 'DELETE', f'/session/{sid}', expected=204)
+    sid = None
+    wait_for(lambda: ('delete', '3') in events and events.count(('sse-ended', '3')) == 2,
+             'closed session left subscription open')
+    assert events.count(('delete', '3')) == 1
     assert not failures
+    print('PASS http-subscription background-list-change event-id-resume reconnect-reconciles no-call-replay stream-closes', flush=True)
     print('PASS http trust-no-io url-header-overrides private-values-redacted reserved-headers-replaced negotiated-version pagination optional-get-405 manual-refresh', flush=True)
     print('PASS http-lifecycle denied-no-io redirect-not-followed stale-tools-cleared explicit-reconnect no-call-replay negotiated-delete-405-404', flush=True)
 finally:
@@ -199,6 +254,7 @@ finally:
         if approved:
             request(True, 'POST', '/mcp/trust', {'action': 'revoke', 'profile': profile}, 204)
     finally:
+        closed.set()
         server.shutdown()
         server.server_close()
         worker.join(timeout=3)
