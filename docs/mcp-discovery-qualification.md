@@ -74,6 +74,16 @@ qualifies a child that exits on stdin EOF; it does not establish forced cleanup
 of uncooperative servers, detached descendants, or remote HTTP side effects.
 `mcp-daemon-crash.log` is retained by source and both installed-package jobs.
 
+The `mcp-source-precedence` scenario verifies the live review provenance and
+actual process starts for conflicting user/explicit-source definitions. The user
+definition wins even when disabled; a lower-priority enabled duplicate cannot
+resurrect it. Selected-only definitions attach only when in the profile, and
+excluded definitions never start. Cancelled reviews and source snapshots changed
+after review cannot be approved. Preview/approval start no processes, and the
+fixture private value stays out of API responses. Source and installed-package
+jobs retain `mcp-source-precedence.log`. This does not qualify arbitrary editor
+layer inheritance, remote endpoints, or all profile override types.
+
 ## Installed-platform acceptance
 
 The release workflow's `installed Debian X11` matrix downloads the

@@ -2557,6 +2557,12 @@ scenario_mcp_discovery() {
   python3 "$root/ci/display/mcp-discovery.py" "$RUNTIME" "$CONFIG" "$REQ_DIR"
 }
 
+scenario_mcp_source_precedence() {
+  ensure_off
+  allow_write "$CONFIG/mcp.json" "$CONFIG/mcp-profiles.json"
+  python3 "$root/ci/display/mcp-source-precedence.py" "$RUNTIME" "$CONFIG" "$REQ_DIR"
+}
+
 scenario_mcp_profiles() {
   local mode
   for mode in profiles servers trust status connections; do
@@ -2604,6 +2610,7 @@ X11_SCENARIOS=(
   scroll-browser
   mcp-profiles
   mcp-discovery
+  mcp-source-precedence
   stop-resume-during-type
   uinput-key-pauses-type
   uinput-move-pauses

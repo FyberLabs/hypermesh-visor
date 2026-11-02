@@ -120,6 +120,7 @@ jobs:
           path: |
             qualification/
             display-logs/mcp-discovery.log
+            display-logs/mcp-source-precedence.log
             display-logs/mcp-persistence.log
             display-logs/mcp-daemon-crash.log
           if-no-files-found: warn
