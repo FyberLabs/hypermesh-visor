@@ -471,7 +471,7 @@ mod tests {
         use super::super::stdio::{AttachedServer, McpBundle, RoutingStatus};
         let spec: ServerSpec = serde_json::from_value(json!({"url":"https://unused.invalid"})).unwrap();
         let mut client = test_client("https://unused.invalid".into(), BTreeMap::new());
-        client.negotiated = Some(super::super::protocol::Negotiated { version:"2025-06-18".into(), tools:true, list_changed:true, server_info: Some(json!({"name":"fixture","version":"1"})) });
+        client.negotiated = Some(super::super::protocol::Negotiated { version:"2025-06-18".into(), tools:true, list_changed:true, server_capabilities:json!({"tools":{"listChanged":true},"resources":{}}), server_info: Some(json!({"name":"fixture","version":"1"})) });
         let changes = Arc::clone(&client.changes);
         let tools = super::super::discovery::list_tools(|_| Ok(json!({"result":{"tools":[{"name":"tool"}]}}))).unwrap();
         let server = AttachedServer::from_http("fixture".into(), "http".into(), tools, client, spec);
@@ -481,6 +481,7 @@ mod tests {
         assert_eq!(bundle.servers[0].routing_status(), RoutingStatus::Refreshing);
         assert!(!bundle.servers[0].is_healthy());
         assert_eq!(bundle.servers[0].negotiated.as_ref().unwrap().version, "2025-06-18");
+        assert_eq!(bundle.servers[0].negotiated.as_ref().unwrap().server_capabilities["resources"], json!({}));
         assert!(bundle.healthy_server_names().is_empty());
         assert_eq!(bundle.servers[0].negotiated.as_ref().unwrap().server_info.as_ref().unwrap()["name"], "fixture");
         active.tools.clear();
@@ -1058,6 +1059,7 @@ mod tests {
         };
         let (tools, client) = handshake_http("remote", &spec).unwrap();
         assert_eq!(client.negotiated.as_ref().unwrap().server_info, Some(json!({"name":"h","version":"0"})));
+        assert_eq!(client.negotiated.as_ref().unwrap().server_capabilities, json!({"tools":{}}));
         assert_eq!(tools[0].name, "ping");
     }
 
