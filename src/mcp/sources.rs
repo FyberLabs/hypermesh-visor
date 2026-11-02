@@ -10,15 +10,38 @@ pub struct Location {
     pub path: PathBuf,
     pub status: &'static str,
 }
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // Other variants are exercised by the native discovery CI matrix.
+enum Platform { Linux, Windows, Macos }
+
+fn native_platform() -> Platform {
+    if cfg!(target_os = "windows") { Platform::Windows }
+    else if cfg!(target_os = "macos") { Platform::Macos }
+    else { Platform::Linux }
+}
+
 pub fn list() -> Vec<Location> {
-    locations(
-        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
-        std::env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .as_deref(),
+    let platform = native_platform();
+    let home_key = if matches!(platform, Platform::Windows) { "USERPROFILE" } else { "HOME" };
+    platform_locations(platform,
+        std::env::var_os(home_key).map(PathBuf::from).as_deref(),
+        std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).as_deref(),
+        std::env::var_os("APPDATA").map(PathBuf::from).as_deref(),
     )
 }
+#[cfg(test)]
 fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
+    platform_locations(Platform::Linux, home, xdg, None)
+}
+fn platform_locations(platform: Platform, home: Option<&Path>, xdg: Option<&Path>, appdata: Option<&Path>) -> Vec<Location> {
+    let home = home.filter(|p| p.is_absolute());
+    let linux_config = || xdg.filter(|p| p.is_absolute()).map(Path::to_path_buf)
+        .or_else(|| home.map(|p| p.join(".config")));
+    let editor_config = match platform {
+        Platform::Linux => linux_config(),
+        Platform::Macos => home.map(|p| p.join("Library/Application Support")),
+        Platform::Windows => appdata.filter(|p| p.is_absolute()).map(Path::to_path_buf),
+    };
     let mut out = Vec::new();
     if let Some(home) = home.filter(|p| p.is_absolute()) {
         out.push(Location {
@@ -28,11 +51,7 @@ fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
             status: "missing",
         });
     }
-    if let Some(config) = xdg
-        .filter(|p| p.is_absolute())
-        .map(Path::to_path_buf)
-        .or_else(|| home.filter(|p| p.is_absolute()).map(|p| p.join(".config")))
-    {
+    if let Some(config) = editor_config {
         for (product, id, label) in [
             ("Code", "vscode", "VS Code"),
             ("Code - Insiders", "vscode_insiders", "VS Code Insiders"),
@@ -46,12 +65,17 @@ fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
             });
             add_profiles(&mut out, &user.join("profiles"), id, label);
         }
-        out.push(Location {
-            id: "zed_user".into(),
-            label: "Zed user settings".into(),
-            path: config.join("zed/settings.json"),
-            status: "missing",
-        });
+    }
+    // Zed's Unix settings path is independent of VS Code's native data root.
+    if !matches!(platform, Platform::Windows) {
+        if let Some(config) = linux_config() {
+            out.push(Location {
+                id: "zed_user".into(),
+                label: "Zed user settings".into(),
+                path: config.join("zed/settings.json"),
+                status: "missing",
+            });
+        }
     }
     if let Some(home) = home.filter(|p| p.is_absolute()) {
         out.push(Location {
@@ -418,6 +442,44 @@ fn normalize_opencode(object: &serde_json::Map<String, Value>) -> Result<String,
 mod tests {
     use super::*;
     #[test]
+    fn host_discovery_selects_its_native_platform() {
+        assert_eq!(matches!(native_platform(), Platform::Windows), cfg!(target_os = "windows"));
+        assert_eq!(matches!(native_platform(), Platform::Macos), cfg!(target_os = "macos"));
+    }
+
+    #[test]
+    fn native_editor_roots_and_profiles_are_isolated() {
+        let dir = std::env::temp_dir().join(format!("visor-native-{}", uuid::Uuid::new_v4()));
+        let xdg = dir.join("xdg");
+        let roaming = dir.join("roaming");
+        for (platform, config) in [(Platform::Linux, xdg.clone()),
+            (Platform::Macos, dir.join("Library/Application Support")), (Platform::Windows, roaming.clone())] {
+            let profile = config.join("Code/User/profiles/profile1/mcp.json");
+            std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+            std::fs::write(&profile, "metadata only, deliberately invalid JSON").unwrap();
+            let sources = platform_locations(platform, Some(&dir), Some(&xdg), Some(&roaming));
+            assert_eq!(sources.iter().find(|s| s.id == "vscode_user").unwrap().path, config.join("Code/User/mcp.json"));
+            assert_eq!(sources.iter().find(|s| s.id == "vscode_insiders_user").unwrap().path, config.join("Code - Insiders/User/mcp.json"));
+            let listed = sources.iter().find(|s| s.id == "vscode_profile:profile1").unwrap();
+            assert_eq!(listed.path, profile);
+            assert_eq!(listed.status, "available_for_review");
+            assert_eq!(sources.iter().find(|s| s.id == "cursor_global").unwrap().path, dir.join(".cursor/mcp.json"));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_editor_discovery_never_guesses_missing_roots() {
+        let root = std::env::temp_dir();
+        for appdata in [None, Some(Path::new("relative"))] {
+            let sources = platform_locations(Platform::Windows, Some(&root), Some(&root), appdata);
+            assert!(!sources.iter().any(|s| s.id.starts_with("vscode")));
+        }
+        assert!(platform_locations(Platform::Macos, None, None, Some(&root)).is_empty());
+        assert!(platform_locations(Platform::Windows, None, Some(&root), None).is_empty());
+    }
+
+    #[test]
     fn known_sources_are_metadata_only_and_do_not_scan_projects() {
         let dir = std::env::temp_dir().join(format!("visor-sources-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(dir.join(".cursor")).unwrap();
@@ -609,6 +671,7 @@ mod tests {
         }
         std::fs::create_dir_all(root.join("nested/hidden")).unwrap();
         std::fs::write(root.join("nested/hidden/mcp.json"), "{}").unwrap();
+        #[cfg(unix)]
         std::os::unix::fs::symlink(root.join("a-first"), root.join("link")).unwrap();
         let sources = locations(None, Some(&dir));
         let ids: Vec<_> = sources.iter().map(|s| s.id.as_str()).collect();

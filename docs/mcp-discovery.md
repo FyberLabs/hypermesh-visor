@@ -329,10 +329,11 @@ terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
   cannot preserve a stale match. Failure to find a healthy match retains desktop mode. Input
   authorization and physical-user pause still apply.
 
-Issue #29 remains open for additional documented discovery sources, additional editor integration, native stable
-identity coverage beyond the current Linux probes, automatic server reconnect
-policy, and native Windows/macOS discovery. The implemented protocol surface and
-remaining compatibility limits are described below.
+Issue #29 remains open for the native runtime and container qualification gates
+in the [acceptance ledger](mcp-discovery-acceptance.md). Reconnect currently uses
+the explicit policy described below. Additional integrations and optional MCP
+features are compatibility extensions, not evidence that native-platform
+acceptance has completed.
 
 ## Attachment diagnostics
 
@@ -773,3 +774,27 @@ task execution are not started by this change. A server without tools still has
 no tool-routing eligibility. Compact companion/status summaries are unchanged.
 Catalog refresh and failed connections retain the historical summary; successful
 reconnect replaces it. Consult routing_status separately for current availability.
+
+## Native editor configuration roots
+
+The shared source enumerator chooses VS Code and Insiders user/profile roots by
+host OS, following the [VS Code profile locations](https://code.visualstudio.com/docs/configure/profiles):
+
+| Host | VS Code root | Home-scoped integrations |
+| --- | --- | --- |
+| Linux | absolute XDG_CONFIG_HOME, otherwise HOME/.config | HOME |
+| macOS | HOME/Library/Application Support | HOME |
+| Windows | absolute APPDATA | USERPROFILE |
+
+The product subdirectory is Code or Code - Insiders, followed by User/mcp.json
+or a bounded concrete User/profiles/<id>/mcp.json. Windows does not fall back to
+HOME/XDG when APPDATA is missing or relative. macOS does not use APPDATA/XDG for
+VS Code. Portable installations and custom --user-data-dir locations still need
+explicit file selection. Named profiles remain independent source snapshots;
+active-profile inheritance is not inferred.
+
+Native CI compiles and tests the same sources.rs, jsonc.rs, and error.rs on Linux,
+Windows, and macOS, including real filesystem enumeration. The small CI crate
+is not a native visor build: daemon trust storage, focused-app probes, companion,
+and input/capture acceptance still depend on #18/#25/#26. Zed's existing Unix
+configuration lookup remains separate; Windows Zed discovery is not claimed.
