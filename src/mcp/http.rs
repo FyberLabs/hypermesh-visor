@@ -407,6 +407,30 @@ mod tests {
     }
 
     #[test]
+    fn malformed_sse_notifications_do_not_invalidate_catalogs() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let worker = thread::spawn(move || {
+            let mut stream = accept_bounded(&listener);
+            let raw = read_http_request(&mut stream);
+            let request: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            let mut body = String::new();
+            for patch in [json!({"result":{}}), json!({"error":null}), json!({"params":[]})] {
+                let mut notification = json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"});
+                notification.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+                body.push_str(&format!("data: {notification}\n\n"));
+            }
+            body.push_str(&format!("data: {}\n\n", json!({"jsonrpc":"2.0","id":request["id"],"result":{}})));
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        });
+        let mut client = test_client(url, BTreeMap::new());
+        client.changes.enabled.store(true, Ordering::Release);
+        client.call("tools/list", json!({})).unwrap();
+        assert_eq!(client.changes.generation(), 0);
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn malformed_http_and_sse_envelopes_disconnect_but_rpc_errors_keep_health() {
         for sse in [false, true] {
             for (outcome, valid_error) in [

@@ -701,3 +701,17 @@ JSON-RPC errors remain ordinary operation rejections: a tool-call rejection
 does not itself destroy a healthy catalog. Valid tool results with `isError`
 retain their existing semantics. Requests and tool calls are never replayed.
 This validates the envelope, not arbitrary tool input/output JSON Schemas.
+
+## Inbound notification and request validation
+
+Catalog invalidation accepts only negotiated, well-formed tool-list notifications:
+JSON-RPC 2.0, no ID or result/error fields, and absent or object parameters.
+Malformed notifications are ignored without a reply or catalog invalidation.
+This check is shared by stdio and HTTP SSE readers.
+
+Server requests require string or integer IDs. Valid requests with non-object
+parameters receive a generic Invalid params error (-32602), including ping;
+valid ping still succeeds and unsupported client methods return -32601. Invalid
+IDs and hybrid response/request envelopes receive no server-request reply.
+Payloads are not echoed in errors. This does not enable roots, sampling,
+elicitation, or automatic reconnect.
