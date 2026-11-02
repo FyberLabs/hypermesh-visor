@@ -59,6 +59,7 @@ class UnixHTTP(http.client.HTTPConnection):
 
 def main(runtime, config, scratch):
     import tkinter as tk
+    from Xlib import Xatom, display
     control = runtime / "control.sock"
     companion = runtime / "companion.sock"
     sid = None
@@ -92,7 +93,12 @@ def main(runtime, config, scratch):
             if predicate():
                 return
             time.sleep(0.05)
-        raise AssertionError(description)
+        current = status() or {}
+        diagnostic = {"session_matches": current.get("id") == sid,
+                      "prefer_mcp": current.get("prefer_mcp"),
+                      "reason": current.get("mcp_match", {}).get("reason"),
+                      "has_executable": bool((current.get("focused") or {}).get("executable"))}
+        raise AssertionError(f"{description}: {diagnostic}")
 
     def status():
         return request(companion, "GET", "/mcp/status")["session"]
@@ -115,7 +121,13 @@ def main(runtime, config, scratch):
             for name, kind, value in [("_NET_WM_PID", "32c", str(os.getpid())),
                                       ("WM_CLIENT_MACHINE", "8s", socket.gethostname())]:
                 subprocess.run(["xprop", "-id", window, "-f", name, kind, "-set", name, value], check=True)
-            subprocess.run(["xprop", "-root", "-f", "_NET_ACTIVE_WINDOW", "32x", "-set", "_NET_ACTIVE_WINDOW", window], check=True)
+            # EWMH requires WINDOW, not xprop's CARDINAL/32x property type.
+            x = display.Display()
+            try:
+                x.screen().root.change_property(x.intern_atom("_NET_ACTIVE_WINDOW"), Xatom.WINDOW, 32, [int(window)])
+                x.sync()
+            finally:
+                x.close()
             subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
             preview = request(companion, "POST", "/mcp/discovery", {"profile": profile, "project_path": str(source)})
             assert not marker.exists(), "preview started a server"
