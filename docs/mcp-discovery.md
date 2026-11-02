@@ -755,3 +755,21 @@ Visor uses its own bounded timeouts and never starts an OAuth flow or reads ADC.
 Persistent trust retains source provenance and pins full original bytes. Edits,
 including comment-only changes, require renewed review after restart. Source
 selection and normalization never authorize execution by themselves.
+
+## Advertised server capabilities
+
+The session MCP API includes `server_capabilities` from the last successful
+initialization. It projects only known tools, resources, prompts, logging,
+completions, and task capability fields from the
+[MCP ServerCapabilities schema](https://modelcontextprotocol.io/specification/2025-11-25/schema#servercapabilities).
+Absent capabilities remain absent; empty objects and explicit false flags remain
+distinct. Known object/boolean fields are validated before attachment. Unknown
+fields and experimental payloads are discarded, so the summary contains no
+server-supplied strings or arbitrary extension data and has a fixed maximum shape.
+
+This is advertised support, not enabled visor functionality or authorization.
+Resource/prompt discovery, reads, subscriptions, logging setup, completion, and
+task execution are not started by this change. A server without tools still has
+no tool-routing eligibility. Compact companion/status summaries are unchanged.
+Catalog refresh and failed connections retain the historical summary; successful
+reconnect replaces it. Consult routing_status separately for current availability.

@@ -12,6 +12,8 @@ pub struct Negotiated {
     // Session API exposes this explicitly; compact status serialization excludes it.
     #[serde(skip)]
     pub server_info: Option<Value>,
+    #[serde(skip)]
+    pub server_capabilities: Value,
 }
 
 pub fn negotiate(response: &Value) -> Result<Negotiated, McpError> {
@@ -35,9 +37,11 @@ pub fn negotiate(response: &Value) -> Result<Negotiated, McpError> {
     {
         return Err(McpError::message("MCP invalid tools capability"));
     }
+    let server_capabilities = capability_summary(&result["capabilities"])?;
     let server_info = implementation_info(result.get("serverInfo"))?;
     Ok(Negotiated {
         server_info,
+        server_capabilities,
         version: version.into(),
         tools: tools.is_some(),
         list_changed: tools
@@ -45,6 +49,33 @@ pub fn negotiate(response: &Value) -> Result<Negotiated, McpError> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+// Fixed schema projection: retain no remote strings, extension payloads, or
+// arbitrary keys. Presence and false values stay distinct from absence.
+fn capability_summary(value: &Value) -> Result<Value, McpError> {
+    let shape = serde_json::json!({
+        "tools":{"listChanged":false}, "prompts":{"listChanged":false},
+        "resources":{"subscribe":false,"listChanged":false},
+        "logging":{}, "completions":{},
+        "tasks":{"list":{},"cancel":{},"requests":{"tools":{"call":{}}}}
+    });
+    fn project(value: &Value, shape: &Value) -> Result<Value, McpError> {
+        if shape.is_boolean() {
+            return value.as_bool().map(Value::Bool)
+                .ok_or_else(|| McpError::message("MCP invalid server capability flag"));
+        }
+        let object = value.as_object()
+            .ok_or_else(|| McpError::message("MCP invalid server capability object"))?;
+        let mut result = serde_json::Map::new();
+        for (key, child_shape) in shape.as_object().unwrap() {
+            if let Some(child) = object.get(key) {
+                result.insert(key.clone(), project(child, child_shape)?);
+            }
+        }
+        Ok(Value::Object(result))
+    }
+    project(value, &shape)
 }
 
 // Retain only documented implementation metadata, never initialize instructions.
@@ -120,6 +151,35 @@ pub fn server_reply(value: &Value) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn capability_discovery_preserves_presence_and_ignores_extensions() {
+        let caps = serde_json::json!({"resources":{"subscribe":false,"listChanged":true,"extension":"private"},
+            "prompts":{},"logging":{"extra":"private"},"completions":{},
+            "tasks":{"list":{},"cancel":{},"requests":{"tools":{"call":{}}}},
+            "experimental":{"private":{"secret":"private"}},"future":"private"});
+        let summary = capability_summary(&caps).unwrap();
+        assert_eq!(summary, serde_json::json!({"resources":{"subscribe":false,"listChanged":true},
+            "prompts":{},"logging":{},"completions":{},
+            "tasks":{"list":{},"cancel":{},"requests":{"tools":{"call":{}}}}}));
+        let negotiated = negotiate(&serde_json::json!({"result":{"protocolVersion":VERSION,"capabilities":caps}})).unwrap();
+        assert!(!negotiated.tools);
+        assert_eq!(negotiated.server_capabilities, summary);
+        assert!(!serde_json::to_string(&negotiated).unwrap().contains("resources"));
+        assert_eq!(capability_summary(&serde_json::json!({})).unwrap(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn malformed_known_capabilities_reject_initialization_without_payloads() {
+        for caps in [serde_json::json!({"resources":null}), serde_json::json!({"prompts":[]}),
+            serde_json::json!({"resources":{"subscribe":"private"}}),
+            serde_json::json!({"prompts":{"listChanged":0}}), serde_json::json!({"logging":true}),
+            serde_json::json!({"completions":"private"}), serde_json::json!({"tasks":{"list":false}}),
+            serde_json::json!({"tasks":{"requests":{"tools":{"call":null}}}})] {
+            let error = negotiate(&serde_json::json!({"result":{"protocolVersion":VERSION,"capabilities":caps}})).unwrap_err().to_string();
+            assert!(!error.contains("private"));
+        }
+    }
+
     #[test]
     fn implementation_metadata_is_bounded_validated_and_excluded_from_status() {
         let info = json!({"name":"server","version":"1","title":"Title","description":"Text",
