@@ -9,6 +9,15 @@ installed-platform cases, container isolation checks, and required evidence.
 Discovery implementation can be handed off for acceptance without representing
 the dependent native backends or container deployment as implemented.
 
+## Recorded qualification
+
+The [2026-11-02 merged-candidate record](qualification/2026-11-02-b08fffa/README.md)
+contains inspected post-merge evidence for native x86_64 and ARM64 Debian/X11
+packages at `b08fffabe0fd5ccf359085af56d9aa06501d33c6`, with package/executable
+hashes, workflow links, retained sanitized excerpts and outstanding cases.
+Both installed suites pass, including real-daemon trust persistence. This is a
+CI candidate qualification, not release publication or complete #29 acceptance.
+
 ## Acceptance evidence
 
 | Original criterion | Implemented evidence | Remaining qualification |
@@ -23,7 +32,7 @@ the dependent native backends or container deployment as implemented.
 
 | Platform | Discovery source enumeration | Identity/trust/lifecycle in a shipped runtime | Owner/dependency |
 | --- | --- | --- | --- |
-| Linux X11 | Native fixture tests and existing released code | Live harness exercises selected-source trust, paginated attach, executable matching, disconnect/reconnect without tool replay, and binding fallback | #29 |
+| Linux X11 | Native fixture tests | Installed Debian packages pass on native hosted x86_64/ARM64: discovery, matching, lifecycle, binding recovery and restart persistence. See the recorded evidence; RPM, physical hardware, login autostart and remaining manual cases are not qualified | #29 |
 | Linux Wayland | Same Linux source resolver | Unit-tested Sway/Hyprland hints; automation remains refused and the refusal is tested. GNOME/KDE portal qualification is not complete | #17 |
 | Windows | Shared source/JSONC code runs on native Windows CI; APPDATA/USERPROFILE roots | Unqualified: full daemon, secure trust persistence, focused-app probe, transport cleanup, physical-user gate | #18, #25 |
 | macOS | Shared source/JSONC code runs on native macOS CI; Application Support/HOME roots | Unqualified: full daemon, secure trust persistence, bundle/executable focus, permissions, transport cleanup | #18, #26 |
