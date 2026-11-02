@@ -2565,6 +2565,12 @@ scenario_mcp_source_precedence() {
   python3 "$root/ci/display/mcp-source-precedence.py" "$RUNTIME" "$CONFIG" "$REQ_DIR"
 }
 
+scenario_mcp_http() {
+  ensure_off
+  allow_write "$CONFIG/mcp-profiles.json"
+  python3 "$root/ci/display/mcp-http.py" "$RUNTIME" "$CONFIG"
+}
+
 scenario_mcp_profiles() {
   local mode
   for mode in profiles servers trust status connections; do
@@ -2613,6 +2619,7 @@ X11_SCENARIOS=(
   mcp-profiles
   mcp-discovery
   mcp-source-precedence
+  mcp-http
   stop-resume-during-type
   uinput-key-pauses-type
   uinput-move-pauses
@@ -2656,7 +2663,7 @@ run_x11() {
       continue
     fi
     case $name in
-      mcp-daemon-crash | mcp-persistence | mcp-discovery | uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
+      mcp-http | mcp-daemon-crash | mcp-persistence | mcp-discovery | uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
       auto-resume) limit=30 ;;
       key-down-detects) limit=20 ;;
       *) limit=45 ;;
