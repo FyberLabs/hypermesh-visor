@@ -46,9 +46,7 @@ impl HttpClient {
             &self.changes,
             method == "initialize",
         )?;
-        if response.get("id") != Some(&json!(id)) || response["jsonrpc"] != "2.0" {
-            return Err(McpError::message("MCP HTTP response id/version mismatch"));
-        }
+        super::protocol::validate_response(&response, &json!(id))?;
         Ok(response)
     }
 }
@@ -404,6 +402,42 @@ mod tests {
                     thread::sleep(Duration::from_millis(5));
                 }
                 Err(e) => panic!("accept: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_http_and_sse_envelopes_disconnect_but_rpc_errors_keep_health() {
+        for sse in [false, true] {
+            for (outcome, valid_error) in [
+                (json!({"result":{},"error":{"code":-1,"message":"private"}}), false),
+                (json!({"result":[]}), false),
+                (json!({"error":{"code":1.5,"message":"private"}}), false),
+                (json!({"error":{"code":-32601,"message":"private","data":null}}), true),
+            ] {
+                let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+                let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+                let worker = thread::spawn(move || {
+                    let mut stream = accept_bounded(&listener);
+                    let raw = read_http_request(&mut stream);
+                    let request: Value = serde_json::from_str(raw.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+                    assert_eq!(request["method"], "tools/call");
+                    let mut response = outcome;
+                    response["jsonrpc"] = json!("2.0");
+                    response["id"] = request["id"].clone();
+                    let body = if sse { format!("data: {response}\n\n") } else { response.to_string() };
+                    let mime = if sse { "text/event-stream" } else { "application/json" };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                });
+                let spec: ServerSpec = serde_json::from_value(json!({"url":url})).unwrap();
+                let client = test_client(url, BTreeMap::new());
+                let tools = super::super::discovery::list_tools(|_| Ok(json!({"result":{"tools":[{"name":"ping"}]}}))).unwrap();
+                let mut server = super::super::stdio::AttachedServer::from_http("fixture".into(), "http".into(), tools, client, spec);
+                let error = server.call_tool("ping", json!({})).unwrap_err().to_string();
+                assert!(!error.contains("private"));
+                assert_eq!(server.is_healthy(), valid_error);
+                assert_eq!(server.tools.is_empty(), !valid_error);
+                worker.join().unwrap();
             }
         }
     }

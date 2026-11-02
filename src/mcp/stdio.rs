@@ -59,10 +59,7 @@ impl StdioClient {
             .responses
             .recv_timeout(std::time::Duration::from_secs(15))
             .map_err(|_| McpError::message("MCP response timeout or reader disconnected"))?;
-        if response.get("id") != Some(&json!(id)) || response.get("jsonrpc") != Some(&json!("2.0"))
-        {
-            return Err(McpError::message("MCP stdio response id/version mismatch"));
-        }
+        super::protocol::validate_response(&response, &json!(id))?;
         Ok(response)
     }
 }
@@ -728,6 +725,37 @@ while True:
             headers: BTreeMap::new(),
             cwd: None,
             enabled: None,
+        }
+    }
+
+    #[test]
+    fn malformed_stdio_envelopes_fail_initialization_discovery_and_calls() {
+        for stage in ["initialize", "tools/list", "tools/call", "refresh", "valid-error"] {
+            let script = r#"
+import sys,json
+stage = 'STAGE'
+listed = 0
+for line in sys.stdin:
+ m=json.loads(line)
+ if 'id' not in m: continue
+ method=m['method']
+ if method=='tools/list': listed += 1
+ result = {'protocolVersion':'2025-06-18','capabilities':{'tools':{}}} if method=='initialize' else {'tools':[{'name':'ping'}]}
+ response={'jsonrpc':'2.0','id':m['id'],'result':result}
+ if method==stage or (stage=='refresh' and method=='tools/list' and listed>1): response['error']={'code':-1,'message':'private'}
+ if stage=='valid-error' and method=='tools/call': response={'jsonrpc':'2.0','id':m['id'],'error':{'code':-1,'message':'private'}}
+ print(json.dumps(response),flush=True)
+"#.replace("STAGE", stage);
+            let attached = attach_one("fixture", &python_spec(&script));
+            if stage == "initialize" || stage == "tools/list" {
+                assert!(attached.is_err());
+            } else {
+                let mut server = attached.unwrap();
+                let error = if stage == "refresh" { server.refresh(false).unwrap_err() } else { server.call_tool("ping", json!({})).unwrap_err() }.to_string();
+                assert!(!error.contains("private"));
+                assert_eq!(server.is_healthy(), stage == "valid-error");
+                assert_eq!(server.tools.is_empty(), stage != "valid-error");
+            }
         }
     }
 
