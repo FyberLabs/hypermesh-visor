@@ -1199,14 +1199,15 @@ query_state() {
 button_is_down() {
   # query-state only opens extension devices. XTEST is where injected
   # buttons land; the virtual core pointer is not one of those devices.
-  query_state "$XTEST_POINTER" | grep -q 'button\[1\]=down'
+  # Consume all output: grep -q can SIGPIPE query_state under pipefail.
+  query_state "$XTEST_POINTER" | grep 'button\[1\]=down' >/dev/null
 }
 
 key_is_down() {
   local code=$1
   # The whole token. A shorter pattern would treat key[1]=down as key 1
   # inside key[10]=down, or stop at the first bracket.
-  query_state "$XTEST_KEYBOARD" | grep -q "key\\[$code\\]=down"
+  query_state "$XTEST_KEYBOARD" | grep "key\\[$code\\]=down" >/dev/null
 }
 
 # KeyPress records only. KeyRelease and a later event's keysym do not count.
