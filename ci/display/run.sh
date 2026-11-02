@@ -2173,6 +2173,13 @@ scenario_uinput_channel() {
   ensure_off
 }
 
+# Redirect at the external command, after the background shell is established.
+# Bash may close function-scoped descriptors or replace background stdin.
+observe_type_interrupt() {
+  python3 "$root/ci/display/interrupt-type.py" "$1" "$2" 1 0 "$3" "$4" "$5" \
+    <&"$UINPUT_OUT" >&"$UINPUT_IN"
+}
+
 scenario_uinput_key_pauses_type() {
   ensure_companion
   focus_xev
@@ -2184,24 +2191,33 @@ PY
   local attempt code n
   for attempt in 1 2 3; do
     ensure_running
+    # Let the companion observe running before the physical event, as in
+    # uinput-move-pauses. This delay is before typing, never inside it.
+    sleep 0.5
     xev_mark
+    local ready="$REQ_DIR/type-observer-$attempt.ready"
+    local evidence="$REQ_DIR/type-observer-$attempt.json"
+    allow_write "$ready" "$evidence" "$PROC/uinput.cmd.lock"
+    rm -f "$ready"
+    spawn_request observe_type_interrupt "$XEV_LOG" "$XEV_AT" \
+      "$PROC/uinput.cmd.lock" "$ready" "$evidence"
+    local observer_pid=$SPAWN_PID
+    local spins=0
+    until [[ -f $ready ]]; do
+      kill -0 "$observer_pid" 2>/dev/null || die "type observer exited before readiness"
+      (( spins++ < 500 )) || die "type observer readiness timeout"
+      sleep 0.01
+    done
     spawn_request http_code "$REQ_DIR/type.code" POST "$BASE/session/$SID/type" @"$REQ_DIR/long-type.json"
     local curl_pid=$SPAWN_PID
-    sleep 0.05
-    local spins=0
-    while kill -0 "$curl_pid" 2>/dev/null; do
-      uinput_cmd "key F12"
-      spins=$((spins + 1))
-      if (( spins > 100 )); then
-        break
-      fi
-      sleep 0.02
-    done
     wait "$curl_pid" || true
+    local observer_ok=0
+    wait "$observer_pid" && observer_ok=1
+    cat "$evidence"
     code=$(cat "$REQ_DIR/type.code")
     n=$(sent_after keystrokes)
     echo "attempt $attempt status $code sent ${n:-none}"
-    if [[ $code == 409 && -n $n && $n -gt 0 && $n -lt 4000 ]]; then
+    if [[ $observer_ok == 1 && $code == 409 && -n $n && $n -gt 0 && $n -lt 4000 ]]; then
       sleep 0.3
       local qpress
       # One KeyPress per character down. Release lines and other events
