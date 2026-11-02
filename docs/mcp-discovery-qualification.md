@@ -80,7 +80,13 @@ definition wins even when disabled; a lower-priority enabled duplicate cannot
 resurrect it. Selected-only definitions attach only when in the profile, and
 excluded definitions never start. Cancelled reviews and source snapshots changed
 after review cannot be approved. Preview/approval start no processes, and the
-fixture private value stays out of API responses. Source and installed-package
+fixture private value stays out of API responses. Child probes also verify
+profile command/cwd/environment overrides on the winning user definition, base
+environment preservation on a selected-only definition, override provenance only
+on winning definitions, and that environment overrides do not enable a disabled
+entry. A profile changed between preview and approval must also be rejected.
+The cwd contains a space; argument-string parsing and HTTP header/URL overrides
+are not qualified by these cases. Source and installed-package
 jobs retain `mcp-source-precedence.log`. This does not qualify arbitrary editor
 layer inheritance, remote endpoints, or all profile override types.
 
