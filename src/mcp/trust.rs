@@ -589,6 +589,18 @@ mod tests {
                 r#"{/*reviewed*/"mcpServers":{"new":{"url":"https://example.com/mcp","transport":"http"}}}"#,
             ),
             (
+                "windsurf_user",
+                r#"{/*reviewed*/"mcpServers":{"new":{"command":"never-run","disabled":true}}}"#,
+            ),
+            (
+                "windsurf_next_user",
+                r#"{/*reviewed*/"mcpServers":{"new":{"url":"https://example.com/mcp","type":"http"}}}"#,
+            ),
+            (
+                "windsurf_insiders_user",
+                r#"{/*reviewed*/"mcpServers":{"new":{"command":"never-run"}}}"#,
+            ),
+            (
                 "junie_user",
                 r#"{/*reviewed*/"mcpServers":{"new":{"url":"https://example.com/mcp","type":"streamable-http"}}}"#,
             ),

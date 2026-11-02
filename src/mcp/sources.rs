@@ -69,6 +69,20 @@ fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
             status: "missing",
         });
     }
+    if let Some(home) = home.filter(|p| p.is_absolute()) {
+        for (channel, id, label) in [
+            ("windsurf", "windsurf_user", "Windsurf stable user configuration"),
+            ("windsurf-next", "windsurf_next_user", "Windsurf Next user configuration"),
+            ("windsurf-insiders", "windsurf_insiders_user", "Windsurf Insiders user configuration"),
+        ] {
+            out.push(Location {
+                id: id.into(),
+                label: label.into(),
+                path: home.join(".codeium").join(channel).join("mcp_config.json"),
+                status: "missing",
+            });
+        }
+    }
     for location in &mut out {
         if location.status == "use_explicit_path" {
             continue;
@@ -100,6 +114,9 @@ pub(super) fn valid_source_kind(kind: &str) -> bool {
             | "zed_user"
             | "devin_user"
             | "junie_user"
+            | "windsurf_user"
+            | "windsurf_next_user"
+            | "windsurf_insiders_user"
     ) || ["vscode_profile:", "vscode_insiders_profile:"]
         .iter()
         .any(|prefix| kind.strip_prefix(prefix).is_some_and(profile_id))
@@ -320,13 +337,34 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested/.cursor")).unwrap();
         std::fs::write(dir.join("nested/.cursor/mcp.json"), "must not discover").unwrap();
         let sources = locations(Some(&dir), Some(&dir.join("xdg")));
-        assert_eq!(sources.len(), 6);
+        assert_eq!(sources.len(), 9);
         assert_eq!(sources[0].status, "available_for_review");
         assert_eq!(sources[1].path, dir.join("xdg/Code/User/mcp.json"));
         assert_eq!(sources[1].status, "missing");
         assert!(locations(Some(Path::new("relative")), None).is_empty());
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn windsurf_channels_are_explicit_metadata_only_user_sources() {
+        let dir = std::env::temp_dir().join(format!("visor-windsurf-{}", uuid::Uuid::new_v4()));
+        for channel in ["windsurf", "windsurf-next", "windsurf-insiders", "unknown"] {
+            let folder = dir.join(".codeium").join(channel);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("mcp_config.json"), "not parsed or executed by listing").unwrap();
+        }
+        let sources = locations(Some(&dir), Some(&dir.join("unrelated-xdg")));
+        for (id, channel) in [("windsurf_user", "windsurf"), ("windsurf_next_user", "windsurf-next"), ("windsurf_insiders_user", "windsurf-insiders")] {
+            let source = sources.iter().find(|s| s.id == id).unwrap();
+            assert_eq!(source.path, dir.join(".codeium").join(channel).join("mcp_config.json"));
+            assert_eq!(source.status, "available_for_review");
+            assert!(valid_source_kind(id));
+        }
+        assert_eq!(sources.iter().filter(|s| s.id.starts_with("windsurf")).count(), 3);
+        assert!(!valid_source_kind("windsurf_unknown_user"));
+        assert!(!locations(None, Some(&dir)).iter().any(|s| s.id.starts_with("windsurf")));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn profiles_are_sorted_bounded_and_never_follow_directory_links() {
         let dir = std::env::temp_dir().join(format!("visor-profiles-{}", uuid::Uuid::new_v4()));

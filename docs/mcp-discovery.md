@@ -198,6 +198,9 @@ Known locations on Linux:
 | `zed_user` | `<config>/zed/settings.json` |
 | `junie_user` | `~/.junie/mcp/mcp.json` |
 | `devin_user` | `~/.config/devin/mcp_config.json` |
+| `windsurf_user` | `~/.codeium/windsurf/mcp_config.json` |
+| `windsurf_next_user` | `~/.codeium/windsurf-next/mcp_config.json` |
+| `windsurf_insiders_user` | `~/.codeium/windsurf-insiders/mcp_config.json` |
 | `cursor_global` | `~/.cursor/mcp.json` |
 | `vscode_user` | `<config>/Code/User/mcp.json` |
 | `vscode_insiders_user` | `<config>/Code - Insiders/User/mcp.json` |
@@ -582,3 +585,23 @@ approved URLs. In particular, SVG content and remote sources must not be treated
 as safe merely because discovery accepted their field types. The desktop status
 dialog receives no tool icons or catalogs. Future rendering requires a separate
 resource trust and image handling policy. Icon metadata grants no tool approval.
+
+## Windsurf user channels
+
+The source chooser lists stable, Next, and Insiders configurations separately,
+using the fixed home-relative paths documented in the
+[vendor configuration-import reference](https://docs.devin.ai/cli/reference/configuration/read-config-from#windsurf).
+These are independent source IDs; visor does not infer an active editor channel,
+merge channels, scan project folders, or migrate files to Devin's newer user
+configuration. `XDG_CONFIG_HOME` does not relocate these home-relative files.
+
+Selecting a source uses the existing strict external importer and explicit trust
+review. Compatible `mcpServers` command and Streamable HTTP definitions are
+accepted; unsupported policy, OAuth, legacy SSE, and variable settings require
+a compatible export. Editor approval state, disabled-tool lists, and permissions
+are never silently inherited or discarded. Listing does not parse or execute
+servers. Persistent approvals pin original bytes and the selected source kind;
+changes, including comments, require renewed review after restart. User server
+definitions, disabled flags, and visor profile membership keep their existing
+precedence. Windows/macOS discovery and custom channel locations remain outside
+this Linux source chooser.
