@@ -204,7 +204,7 @@ def main(runtime, config, scratch):
                 def selected():
                     current = status()
                     match = current["mcp_match"]
-                    return (current["mcp"] == winner and current["prefer_mcp"] is True
+                    return (current.get("mcp") == winner and current["prefer_mcp"] is True
                             and match.get("binding_index") == index
                             and match["identity_matches"] == identities
                             and match["healthy_matches"] == healthy)
