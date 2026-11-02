@@ -53,6 +53,15 @@ fixture secret. Sessions are closed before each restart: crash recovery with a
 live in-flight session is not asserted. Both source and installed-package jobs
 retain `mcp-persistence.log` alongside the discovery log.
 
+The `mcp-daemon-crash` scenario kills the actual daemon with SIGKILL only after
+an MCP fixture records an in-flight call's side effect. Linux pidfds pin the
+exact daemon and child processes. It checks failed delivery to the client, exit
+of the pipe-aware stdio child, absence of old sessions after restart, restoration
+of unchanged trust on an explicit new session, and no replay of the call. This
+qualifies a child that exits on stdin EOF; it does not establish forced cleanup
+of uncooperative servers, detached descendants, or remote HTTP side effects.
+`mcp-daemon-crash.log` is retained by source and both installed-package jobs.
+
 ## Installed-platform acceptance
 
 The release workflow's `installed Debian X11` matrix downloads the
