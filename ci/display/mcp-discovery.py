@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -58,7 +59,6 @@ class UnixHTTP(http.client.HTTPConnection):
 
 
 def main(runtime, config, scratch):
-    import tkinter as tk
     from Xlib import Xatom, display
     control = runtime / "control.sock"
     companion = runtime / "companion.sock"
@@ -68,10 +68,38 @@ def main(runtime, config, scratch):
     profiles = config / "mcp-profiles.json"
     bindings = config / "mcp-bindings.json"
     backups = {path: path.read_bytes() if path.exists() else None for path in (profiles, bindings)}
-    root = tk.Tk(className="VisorMcpDiscovery")
-    root.title("Visor MCP discovery acceptance")
-    root.geometry("300x100+100+100")
-    tk.Label(root, text="Local MCP discovery fixture").pack()
+    windows = []
+
+    def stop_window(process):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+
+    def focus(window, pid):
+        for name, kind, value in [("_NET_WM_PID", "32c", str(pid)),
+                                  ("WM_CLIENT_MACHINE", "8s", socket.gethostname())]:
+            subprocess.run(["xprop", "-id", window, "-f", name, kind, "-set", name, value], check=True)
+        x = display.Display()
+        try:
+            x.screen().root.change_property(x.intern_atom("_NET_ACTIVE_WINDOW"), Xatom.WINDOW, 32, [int(window)])
+            x.sync()
+        finally:
+            x.close()
+        subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
+
+    def start_window(directory, number):
+        ready = directory / f"window-{number}"
+        process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--window", str(ready)])
+        windows.append(process)
+        until(lambda: ready.exists() and ready.read_text().strip(), "fixture window not ready")
+        assert process.poll() is None
+        window = ready.read_text().strip()
+        focus(window, process.pid)
+        return process, window
 
     def request(path, method, endpoint, payload=None, expected=200):
         connection = UnixHTTP(path)
@@ -89,7 +117,6 @@ def main(runtime, config, scratch):
     def until(predicate, description):
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
-            root.update()
             if predicate():
                 return
             time.sleep(0.05)
@@ -116,19 +143,7 @@ def main(runtime, config, scratch):
                 "default": {"servers": []}, profile: {"servers": ["fixture"]}}}))
             bindings.write_text(json.dumps({"bindings": [
                 {"server": "fixture", "executable": str(Path(sys.executable).resolve())}]}))
-            root.update()
-            window = subprocess.check_output(["xdotool", "search", "--name", "^Visor MCP discovery acceptance$"], text=True).splitlines()[0]
-            for name, kind, value in [("_NET_WM_PID", "32c", str(os.getpid())),
-                                      ("WM_CLIENT_MACHINE", "8s", socket.gethostname())]:
-                subprocess.run(["xprop", "-id", window, "-f", name, kind, "-set", name, value], check=True)
-            # EWMH requires WINDOW, not xprop's CARDINAL/32x property type.
-            x = display.Display()
-            try:
-                x.screen().root.change_property(x.intern_atom("_NET_ACTIVE_WINDOW"), Xatom.WINDOW, 32, [int(window)])
-                x.sync()
-            finally:
-                x.close()
-            subprocess.run(["xdotool", "windowfocus", "--sync", window], check=True)
+            app, window = start_window(directory, 1)
             preview = request(companion, "POST", "/mcp/discovery", {"profile": profile, "project_path": str(source)})
             assert not marker.exists(), "preview started a server"
             assert "MCP_DISCOVERY_PRIVATE_SENTINEL" not in json.dumps(preview)
@@ -147,6 +162,35 @@ def main(runtime, config, scratch):
             assert matched["mcp_match"]["reason"] == "matched"
             assert matched["focused"]["executable"] == str(Path(sys.executable).resolve())
             assert "MCP_DISCOVERY_PRIVATE_SENTINEL" not in json.dumps(matched)
+            # Same title, different executable: title alone must not retain MCP routing.
+            xmessage = shutil.which("xmessage")
+            assert xmessage is not None
+            other = subprocess.Popen([xmessage, "-title", "Visor MCP discovery acceptance", "Unrelated app"])
+            windows.append(other)
+            other_window = []
+            def find_other():
+                result = subprocess.run(["xdotool", "search", "--onlyvisible", "--name",
+                    "^Visor MCP discovery acceptance$"], capture_output=True, text=True)
+                other_window[:] = [w for w in result.stdout.splitlines() if w != window]
+                return bool(other_window)
+            until(find_other, "same-title app did not map")
+            focus(other_window[0], other.pid)
+            until(lambda: (status().get("focused") or {}).get("executable") == str(Path(xmessage).resolve()),
+                  "unrelated app executable not observed")
+            assert status()["prefer_mcp"] is False, "same title matched another executable"
+            assert request(control, "GET", endpoint)["servers"][0]["healthy"] is True
+            stop_window(other)
+            focus(window, app.pid)
+            until(lambda: status()["prefer_mcp"] is True, "bound app did not regain routing")
+            old_pid = app.pid
+            stop_window(app)
+            # Leave the destroyed window hint in place to exercise stale-focus clearing.
+            until(lambda: status()["prefer_mcp"] is False, "destroyed app retained routing")
+            app, window = start_window(directory, 2)
+            assert app.pid != old_pid
+            until(lambda: status()["prefer_mcp"] is True, "restarted app did not regain routing")
+            assert marker.read_text().count("start ") == 1, "focus transitions restarted MCP"
+            print("PASS identity same-title-rejected app-exit-clears-routing app-restart-recovers healthy-attachment-retained", flush=True)
             # Read-only catalog refresh must retain routing and not restart the process.
             request(control, "POST", endpoint + "/refresh", {"server": "fixture", "action": "refresh"}, 204)
             until(lambda: status()["prefer_mcp"] is True, "catalog refresh did not restore matching")
@@ -190,7 +234,8 @@ def main(runtime, config, scratch):
             if approved:
                 request(companion, "POST", "/mcp/trust", {"action": "revoke", "profile": profile}, 204)
         finally:
-            root.destroy()
+            for process in reversed(windows):
+                stop_window(process)
             subprocess.run(["xprop", "-root", "-remove", "_NET_ACTIVE_WINDOW"], check=False)
             for path, contents in backups.items():
                 if contents is None:
@@ -203,5 +248,16 @@ def main(runtime, config, scratch):
 if __name__ == "__main__":
     if sys.argv[1] == "--server":
         server(sys.argv[2])
+    elif sys.argv[1] == "--window":
+        import tkinter as tk
+        root = tk.Tk(className="VisorMcpDiscovery")
+        root.title("Visor MCP discovery acceptance")
+        root.geometry("300x100+100+100")
+        tk.Label(root, text="Local MCP discovery fixture").pack()
+        root.update()
+        window = subprocess.check_output(["xdotool", "search", "--onlyvisible", "--name",
+            "^Visor MCP discovery acceptance$"], text=True).splitlines()[0]
+        Path(sys.argv[2]).write_text(window)
+        root.mainloop()
     else:
         main(*(Path(arg) for arg in sys.argv[1:4]))

@@ -37,6 +37,13 @@ The real X11 fixture tests:
 - Preview and approval do not spawn a server; private sentinel values stay absent
   from preview and compact status.
 - A paginated catalog attaches to a real process and routes by exact executable.
+- A separate `xmessage` process with the same window title does not match the
+  bound Python app. Returning focus restores routing without restarting MCP.
+- Terminating the bound app while leaving its stale active-window hint clears
+  routing. A new app process restores the executable match while the MCP
+  attachment remains healthy. These are X11 routing hints, not authenticated
+  application identity; the harness supplies EWMH properties without a window
+  manager.
 - Catalog refresh retains the catalog without spawning another process.
 - A denied call produces no server event; a lost reply clears routing and tools.
 - Explicit reconnect starts one replacement and never replays the lost call.
