@@ -70,7 +70,7 @@ pub fn list_tools(
 }
 
 // Icons remain untrusted metadata: no URI resolution, image decoding, or rendering.
-fn optional_icons(tool: &Value) -> Result<Option<Value>, McpError> {
+pub(super) fn optional_icons(tool: &Value) -> Result<Option<Value>, McpError> {
     let Some(value) = tool.get("icons") else { return Ok(None); };
     let icons = value.as_array().ok_or_else(|| McpError::message("MCP icons must be an array"))?;
     for icon in icons {
