@@ -83,6 +83,14 @@ fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
             });
         }
     }
+    if let Some(home) = home.filter(|p| p.is_absolute()) {
+        out.push(Location {
+            id: "opencode_user".into(),
+            label: "OpenCode user configuration".into(),
+            path: home.join(".config/opencode/opencode.json"),
+            status: "missing",
+        });
+    }
     for location in &mut out {
         if location.status == "use_explicit_path" {
             continue;
@@ -114,6 +122,7 @@ pub(super) fn valid_source_kind(kind: &str) -> bool {
             | "zed_user"
             | "devin_user"
             | "junie_user"
+            | "opencode_user"
             | "windsurf_user"
             | "windsurf_next_user"
             | "windsurf_insiders_user"
@@ -193,16 +202,17 @@ pub(super) fn normalize(raw: &str) -> Result<String, McpError> {
     let object = value
         .as_object()
         .ok_or_else(|| McpError::message("MCP import must be an object"))?;
-    let keys: Vec<_> = ["mcpServers", "servers", "context_servers"]
+    let keys: Vec<_> = ["mcpServers", "servers", "context_servers", "mcp"]
         .into_iter()
         .filter(|key| object.contains_key(*key))
         .collect();
     if keys.len() != 1 {
         return Err(McpError::message(
-            "MCP import requires exactly one servers, mcpServers, or context_servers map",
+            "MCP import requires exactly one supported MCP server map",
         ));
     }
     let key = keys[0];
+    if key == "mcp" { return normalize_opencode(object); }
     // Zed stores MCP definitions in its general settings file. Only ignore
     // explicitly harmless presentation settings; never drop policy or layers.
     if object.keys().any(|k| {
@@ -322,6 +332,60 @@ pub(super) fn normalize(raw: &str) -> Result<String, McpError> {
     Ok(json!({"mcpServers":servers}).to_string())
 }
 
+// OpenCode has its own command/environment schema and default OAuth behavior.
+// Require a self-contained MCP-only export; never silently discard editor policy.
+fn normalize_opencode(object: &serde_json::Map<String, Value>) -> Result<String, McpError> {
+    if object.keys().any(|k| !matches!(k.as_str(), "mcp" | "$schema")) {
+        return Err(McpError::message("OpenCode import requires an MCP-only compatible export"));
+    }
+    let servers = object["mcp"].as_object().ok_or_else(|| McpError::message("OpenCode MCP servers must be a map"))?;
+    let mut normalized = serde_json::Map::new();
+    for (name, server) in servers {
+        let entry = server.as_object().ok_or_else(|| McpError::message("Invalid OpenCode MCP server"))?;
+        let mut out = serde_json::Map::new();
+        match entry.get("type").and_then(Value::as_str) {
+            Some("local") => {
+                if entry.keys().any(|k| !matches!(k.as_str(), "type" | "command" | "environment" | "enabled")) {
+                    return Err(McpError::message("Unsupported OpenCode local settings"));
+                }
+                let command = entry.get("command").and_then(Value::as_array)
+                    .filter(|a| !a.is_empty() && a.iter().all(Value::is_string))
+                    .ok_or_else(|| McpError::message("OpenCode command must be a nonempty text array"))?;
+                if command[0].as_str().unwrap().trim().is_empty() {
+                    return Err(McpError::message("OpenCode executable must not be empty"));
+                }
+                out.insert("type".into(), json!("stdio"));
+                out.insert("command".into(), command[0].clone());
+                out.insert("args".into(), json!(&command[1..]));
+                if let Some(env) = entry.get("environment") { out.insert("env".into(), env.clone()); }
+            }
+            Some("remote") => {
+                if entry.keys().any(|k| !matches!(k.as_str(), "type" | "url" | "headers" | "enabled" | "oauth")) {
+                    return Err(McpError::message("Unsupported OpenCode remote settings"));
+                }
+                if entry.get("oauth") != Some(&Value::Bool(false)) {
+                    return Err(McpError::message("OpenCode remote import requires explicit oauth:false; OAuth credentials are not imported"));
+                }
+                let url = entry.get("url").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| McpError::message("OpenCode remote URL must be text"))?;
+                out.insert("type".into(), json!("http"));
+                out.insert("url".into(), json!(url));
+                if let Some(headers) = entry.get("headers") { out.insert("headers".into(), headers.clone()); }
+            }
+            _ => return Err(McpError::message("OpenCode import requires explicit local or remote type")),
+        }
+        if let Some(enabled) = entry.get("enabled") { out.insert("enabled".into(), enabled.clone()); }
+        // OpenCode expands these forms before execution; visor must not run their
+        // literal text or accidentally apply its different environment semantics.
+        let text = Value::Object(out.clone()).to_string();
+        if text.contains("{env:") || text.contains("{file:") || text.contains("${") {
+            return Err(McpError::message("Unsupported OpenCode variable substitution"));
+        }
+        normalized.insert(name.clone(), Value::Object(out));
+    }
+    normalize(&json!({"mcpServers":normalized}).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,7 +401,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested/.cursor")).unwrap();
         std::fs::write(dir.join("nested/.cursor/mcp.json"), "must not discover").unwrap();
         let sources = locations(Some(&dir), Some(&dir.join("xdg")));
-        assert_eq!(sources.len(), 9);
+        assert_eq!(sources.len(), 10);
         assert_eq!(sources[0].status, "available_for_review");
         assert_eq!(sources[1].path, dir.join("xdg/Code/User/mcp.json"));
         assert_eq!(sources[1].status, "missing");
@@ -363,6 +427,53 @@ mod tests {
         assert!(!valid_source_kind("windsurf_unknown_user"));
         assert!(!locations(None, Some(&dir)).iter().any(|s| s.id.starts_with("windsurf")));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opencode_listing_does_not_parse_or_scan_project_configs() {
+        let dir = std::env::temp_dir().join(format!("visor-opencode-{}", uuid::Uuid::new_v4()));
+        let path = dir.join(".config/opencode/opencode.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "not parsed by listing").unwrap();
+        let sources = locations(Some(&dir), Some(&dir.join("other")));
+        let source = sources.iter().find(|s| s.id == "opencode_user").unwrap();
+        assert_eq!(source.path, path);
+        assert_eq!(source.status, "available_for_review");
+        assert!(valid_source_kind("opencode_user"));
+        assert!(!locations(None, Some(&dir)).iter().any(|s| s.id == "opencode_user"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn opencode_maps_command_arguments_environment_and_explicit_remote_auth() {
+        let raw = r#"{/*reviewed*/"mcp":{
+            "local":{"type":"local","command":["never-run","one argument","--flag"],"environment":{"KEY":"value"},"enabled":false},
+            "remote":{"type":"remote","url":"https://example.com/mcp","oauth":false,"headers":{"Authorization":"private"}}
+        }}"#;
+        let parsed: Value = serde_json::from_str(&normalize(raw).unwrap()).unwrap();
+        assert_eq!(parsed["mcpServers"]["local"], json!({"type":"stdio","command":"never-run","args":["one argument","--flag"],"env":{"KEY":"value"},"enabled":false}));
+        assert_eq!(parsed["mcpServers"]["remote"], json!({"type":"http","url":"https://example.com/mcp","headers":{"Authorization":"private"}}));
+    }
+
+    #[test]
+    fn opencode_rejects_layers_policy_auth_and_substitutions() {
+        for raw in [
+            json!({"mcp":{},"permission":{"*":"deny"}}),
+            json!({"mcp":{},"mcpServers":{}}),
+            json!({"mcp":{"x":{"enabled":true}}}),
+            json!({"mcp":{"x":{"type":"local","command":[]}}}),
+            json!({"mcp":{"x":{"type":"local","command":"private"}}}),
+            json!({"mcp":{"x":{"type":"local","command":["x",4]}}}),
+            json!({"mcp":{"x":{"type":"local","command":["x"],"timeout":5000}}}),
+            json!({"mcp":{"x":{"type":"local","command":["x","{file:private}"]}}}),
+            json!({"mcp":{"x":{"type":"local","command":["x"],"environment":{"X":"{env:private}"}}}}),
+            json!({"mcp":{"x":{"type":"remote","url":"https://example.com"}}}),
+            json!({"mcp":{"x":{"type":"remote","url":"https://example.com","oauth":{}}}}),
+            json!({"mcp":{"x":{"type":"remote","url":"{env:private}","oauth":false}}}),
+        ] {
+            let error = normalize(&raw.to_string()).unwrap_err().to_string();
+            assert!(!error.contains("private"));
+        }
     }
 
     #[test]

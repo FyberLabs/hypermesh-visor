@@ -601,6 +601,10 @@ mod tests {
                 r#"{/*reviewed*/"mcpServers":{"new":{"command":"never-run"}}}"#,
             ),
             (
+                "opencode_user",
+                r#"{/*reviewed*/"mcp":{"new":{"type":"local","command":["never-run","argument"],"enabled":false}}}"#,
+            ),
+            (
                 "junie_user",
                 r#"{/*reviewed*/"mcpServers":{"new":{"url":"https://example.com/mcp","type":"streamable-http"}}}"#,
             ),
