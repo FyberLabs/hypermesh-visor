@@ -305,6 +305,7 @@ impl AppState {
                     .map(|(server, _)| server.name.clone()).collect(),
                 mcp_attachments: attachments.iter().take(SESSION_LIST_MAX).map(|(server, status)| McpAttachment {
                     name: clip_text(&server.name, SESSION_TEXT_MAX),
+                    server_id: connection_server_id(&server.name),
                     routing_status: *status,
                     protocol: server.negotiated.clone(),
                 }).collect(),
@@ -550,9 +551,16 @@ struct ChosenSession {
     idle_ms: u64,
 }
 
+// Do not turn a clipped display label into a target, or trim into another ID.
+fn connection_server_id(name: &str) -> Option<String> {
+    (!name.is_empty() && name.len() <= 512 && name.trim() == name).then(|| name.to_string())
+}
+
 #[derive(Serialize)]
 struct McpAttachment {
     name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_id: Option<String>,
     routing_status: mcp::RoutingStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     protocol: Option<mcp::NegotiatedProtocol>,
@@ -4214,7 +4222,7 @@ while True:
         let companion: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(companion["session"]["prefer_mcp"], false);
         assert_eq!(companion["session"]["mcp_match"]["reason"], "focus_unavailable");
-        assert_eq!(companion["session"]["mcp_attachments"][0], serde_json::json!({"name":"fixture","routing_status":"ready","protocol":{"version":"2024-11-05","tools":true,"list_changed":false}}));
+        assert_eq!(companion["session"]["mcp_attachments"][0], serde_json::json!({"name":"fixture","server_id":"fixture","routing_status":"ready","protocol":{"version":"2024-11-05","tools":true,"list_changed":false}}));
         assert_eq!(companion["session"]["mcp_attachments_omitted"], 0);
         assert_eq!(companion["session"]["mcp_match"]["bindings_status"], "ready");
         assert!(companion["session"].get("mcp").is_none() || companion["session"]["mcp"].is_null());
@@ -5347,6 +5355,14 @@ while True:
             "a start replayed after the poll expired must not enter running"
         );
         let _ = dir;
+    }
+
+    #[test]
+    fn connection_targets_never_use_clipped_or_trimmed_server_names() {
+        assert_eq!(connection_server_id("editor"), Some("editor".into()));
+        for name in ["".to_string(), " editor".into(), "editor ".into(), "x".repeat(513), "é".repeat(257)] {
+            assert!(connection_server_id(&name).is_none());
+        }
     }
 
     #[tokio::test]

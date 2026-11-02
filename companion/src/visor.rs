@@ -370,6 +370,28 @@ pub fn mcp_status_request() -> Result<serde_json::Value, String> {
         .map_err(|_| "Invalid status response".into())
 }
 
+pub fn mcp_connection_request(session: &str, server: &str, reconnect: bool) -> Result<(), String> {
+    let request = connection_request(session, server, reconnect)?;
+    let socket = socket_path().ok_or("Companion socket unavailable")?;
+    let Exchange::Body(response) = exchange_read_timeout(&socket, &request, Duration::from_secs(40)) else {
+        return Err("Connection action outcome unknown. Inspect MCP status before retrying.".into());
+    };
+    if !status_ok(&response) {
+        return Err("Connection action failed or was rejected. Inspect MCP status before retrying.".into());
+    }
+    Ok(())
+}
+
+fn connection_request(session: &str, server: &str, reconnect: bool) -> Result<String, String> {
+    if session.len() != 36 || !session.bytes().enumerate().all(|(i,b)| {
+        if [8,13,18,23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() }
+    }) || server.is_empty() || server.len() > 512 || server.trim() != server {
+        return Err("Invalid MCP connection target".into());
+    }
+    let body = serde_json::json!({"server":server,"action":if reconnect {"reconnect"} else {"refresh"}}).to_string();
+    Ok(format!("POST /session/{session}/mcp/refresh HTTP/1.1\r\nhost: hypermesh\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()))
+}
+
 pub fn trust_request(
     path: &str,
     body: Option<serde_json::Value>,
@@ -597,6 +619,16 @@ mod tests {
 
     use super::*;
     use crate::automation::{Link, VisorPhase};
+
+    #[test]
+    fn connection_posts_validate_paths_and_encode_exact_server_ids() {
+        let id = "12345678-1234-1234-1234-123456789abc";
+        let request = connection_request(id, "quote\"\nserver", true).unwrap();
+        let body: serde_json::Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({"server":"quote\"\nserver","action":"reconnect"}));
+        assert!(connection_request("../companion", "server", false).is_err());
+        assert!(connection_request(id, " server ", false).is_err());
+    }
 
     #[test]
     fn a_missed_poll_does_not_confirm_a_pointer_mismatch() {
