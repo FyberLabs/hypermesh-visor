@@ -9,6 +9,9 @@ pub struct Negotiated {
     pub version: String,
     pub tools: bool,
     pub list_changed: bool,
+    // Session API exposes this explicitly; compact status serialization excludes it.
+    #[serde(skip)]
+    pub server_info: Option<Value>,
 }
 
 pub fn negotiate(response: &Value) -> Result<Negotiated, McpError> {
@@ -32,7 +35,9 @@ pub fn negotiate(response: &Value) -> Result<Negotiated, McpError> {
     {
         return Err(McpError::message("MCP invalid tools capability"));
     }
+    let server_info = implementation_info(result.get("serverInfo"))?;
     Ok(Negotiated {
+        server_info,
         version: version.into(),
         tools: tools.is_some(),
         list_changed: tools
@@ -40,6 +45,30 @@ pub fn negotiate(response: &Value) -> Result<Negotiated, McpError> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     })
+}
+
+// Retain only documented implementation metadata, never initialize instructions.
+fn implementation_info(value: Option<&Value>) -> Result<Option<Value>, McpError> {
+    let Some(value) = value else { return Ok(None); }; // Compatibility with older/minimal servers.
+    if !value.is_object() || value.to_string().len() > 16 * 1024 {
+        return Err(McpError::message("MCP invalid or oversized server info"));
+    }
+    let mut info = serde_json::Map::new();
+    for key in ["name", "version"] {
+        let text = value.get(key).and_then(Value::as_str)
+            .ok_or_else(|| McpError::message("MCP server info requires text name/version"))?;
+        info.insert(key.into(), Value::String(text.into()));
+    }
+    for key in ["title", "description", "websiteUrl"] {
+        if let Some(text) = value.get(key) {
+            if !text.is_string() { return Err(McpError::message("MCP server info metadata must be text")); }
+            info.insert(key.into(), text.clone());
+        }
+    }
+    if let Some(icons) = super::discovery::optional_icons(value)? {
+        info.insert("icons".into(), icons);
+    }
+    Ok(Some(Value::Object(info)))
 }
 
 /// Validate correlated MCP response envelopes without echoing remote data.
@@ -91,6 +120,28 @@ pub fn server_reply(value: &Value) -> Option<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn implementation_metadata_is_bounded_validated_and_excluded_from_status() {
+        let info = json!({"name":"server","version":"1","title":"Title","description":"Text",
+            "websiteUrl":"https://invalid.example/private","icons":[{"src":"data:image/png;base64,AA=="}],
+            "unknown":"private-extra"});
+        let negotiated = negotiate(&json!({"result":{"protocolVersion":VERSION,"capabilities":{},"serverInfo":info,"instructions":"private-instructions"}})).unwrap();
+        let retained = negotiated.server_info.as_ref().unwrap();
+        assert_eq!(retained["name"], "server");
+        assert_eq!(retained["icons"], info["icons"]);
+        assert!(retained.get("unknown").is_none());
+        let summary = serde_json::to_value(&negotiated).unwrap();
+        assert_eq!(summary, json!({"version":VERSION,"tools":false,"list_changed":false}));
+        for info in [Value::Null, json!({}), json!({"name":"private","version":1}),
+            json!({"name":"private","version":"1","title":null}),
+            json!({"name":"private","version":"1","icons":[{"src":5}]}),
+            json!({"name":"private","version":"1","description":"x".repeat(16*1024)})] {
+            let error = implementation_info(Some(&info)).unwrap_err().to_string();
+            assert!(!error.contains("private"));
+        }
+        assert!(implementation_info(None).unwrap().is_none());
+    }
+
     #[test]
     fn server_requests_validate_ids_and_params_without_echoing_payloads() {
         for id in [json!("request"), json!(0), json!(-1), json!(u64::MAX)] {

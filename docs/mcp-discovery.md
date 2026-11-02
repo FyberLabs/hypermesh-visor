@@ -715,3 +715,21 @@ valid ping still succeeds and unsupported client methods return -32601. Invalid
 IDs and hybrid response/request envelopes receive no server-request reply.
 Payloads are not echoed in errors. This does not enable roots, sampling,
 elicitation, or automatic reconnect.
+
+## Server implementation metadata
+
+The session MCP API exposes optional `server_info` from the last successful
+initialization. It retains the server's reported name/version and optional title,
+description, websiteUrl, and icons. Present serverInfo must fit within 16 KiB,
+contain text name/version, and have valid optional field types. Missing serverInfo
+remains absent for compatibility with minimal servers. Malformed or oversized
+metadata rejects initialization without echoing remote values.
+
+These are untrusted server claims, not authenticated app identity, source
+provenance, approval, or routing selectors. Unknown top-level fields and initialize
+instructions are not retained. URLs and icons are opaque: no fetching, navigation,
+rendering, or URI safety claim is added. The field is excluded from compact
+companion/status summaries. Refresh placeholders and failures retain the last
+successful metadata; catalog refresh does not renegotiate it, and successful
+reconnect replaces it. Always consult routing_status before treating an attachment
+as current. See the [MCP Implementation schema](https://modelcontextprotocol.io/specification/2025-11-25/schema#implementation).

@@ -730,7 +730,7 @@ while True:
 
     #[test]
     fn malformed_stdio_envelopes_fail_initialization_discovery_and_calls() {
-        for stage in ["initialize", "tools/list", "tools/call", "refresh", "valid-error"] {
+        for stage in ["initialize", "tools/list", "tools/call", "refresh", "valid-error", "server-info"] {
             let script = r#"
 import sys,json
 stage = 'STAGE'
@@ -741,13 +741,14 @@ for line in sys.stdin:
  method=m['method']
  if method=='tools/list': listed += 1
  result = {'protocolVersion':'2025-06-18','capabilities':{'tools':{}}} if method=='initialize' else {'tools':[{'name':'ping'}]}
+ if stage=='server-info' and method=='initialize': result['serverInfo']={'name':'private','version':3}
  response={'jsonrpc':'2.0','id':m['id'],'result':result}
  if method==stage or (stage=='refresh' and method=='tools/list' and listed>1): response['error']={'code':-1,'message':'private'}
  if stage=='valid-error' and method=='tools/call': response={'jsonrpc':'2.0','id':m['id'],'error':{'code':-1,'message':'private'}}
  print(json.dumps(response),flush=True)
 "#.replace("STAGE", stage);
             let attached = attach_one("fixture", &python_spec(&script));
-            if stage == "initialize" || stage == "tools/list" {
+            if stage == "initialize" || stage == "tools/list" || stage == "server-info" {
                 assert!(attached.is_err());
             } else {
                 let mut server = attached.unwrap();
@@ -886,7 +887,7 @@ for line in sys.stdin:
  m=json.loads(line); method=m['method']
  if 'id' not in m: continue
  result={}
- if method=='initialize': result={'protocolVersion':'2024-11-05','capabilities':{'tools':{'listChanged':False}}}
+ if method=='initialize': result={'protocolVersion':'2024-11-05','capabilities':{'tools':{'listChanged':False}},'serverInfo':{'name':'fixture','version':version.read_text()}}
  elif method=='tools/list':
   v=version.read_text()
   if v=='fail':
@@ -931,6 +932,7 @@ for line in sys.stdin:
         assert_eq!(server.tools[1].name, "new-b");
         assert_eq!(server.routing_status(), RoutingStatus::Ready);
         assert_eq!(server.negotiated.as_ref().unwrap().version, "2024-11-05");
+        assert_eq!(server.negotiated.as_ref().unwrap().server_info.as_ref().unwrap()["version"], "old");
         assert_eq!(server.tools[1].input_schema.as_ref().unwrap()["properties"], json!({"new":{"type":"string"}}));
         fs::write(&version, "required").unwrap();
         server.refresh(false).unwrap();
@@ -944,6 +946,7 @@ for line in sys.stdin:
         assert!(!server.is_healthy());
         assert_eq!(server.routing_status(), RoutingStatus::Disconnected);
         assert_eq!(server.negotiated.as_ref().unwrap().version, "2024-11-05");
+        assert_eq!(server.negotiated.as_ref().unwrap().server_info.as_ref().unwrap()["version"], "old");
         fs::write(&version, "new").unwrap();
         server.refresh(true).unwrap();
         fs::write(&version, "fail").unwrap();
@@ -954,6 +957,7 @@ for line in sys.stdin:
         fs::write(&version, "again").unwrap();
         server.refresh(true).unwrap();
         assert_eq!(server.tools[0].name, "again-a");
+        assert_eq!(server.negotiated.as_ref().unwrap().server_info.as_ref().unwrap()["version"], "again");
         assert!(server.call_tool("again-a", json!({})).is_err());
         assert!(!server.is_healthy());
         assert_eq!(fs::read_to_string(&calls).unwrap(), "once\n");

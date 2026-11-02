@@ -1115,6 +1115,8 @@ struct SessionMcpServer {
     routing_status: mcp::RoutingStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     protocol: Option<mcp::NegotiatedProtocol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_info: Option<serde_json::Value>,
     name: String,
     transport: String,
     healthy: bool,
@@ -1290,6 +1292,7 @@ async fn session_mcp(
                 refreshing: server.refreshing,
                 routing_status,
                 protocol: server.negotiated.clone(),
+                server_info: server.negotiated.as_ref().and_then(|protocol| protocol.server_info.clone()),
                 name: server.name.clone(),
                 transport: server.transport.clone(),
                 healthy: routing_status.is_healthy(),
@@ -4204,6 +4207,7 @@ while True:
         assert_eq!(mcp["servers"][0]["name"], "fixture");
         assert_eq!(mcp["servers"][0]["healthy"], true);
         assert_eq!(mcp["servers"][0]["routing_status"], "ready");
+        assert_eq!(mcp["servers"][0]["server_info"], serde_json::json!({"name":"fixture","version":"0"}));
         assert_eq!(mcp["servers"][0]["protocol"], serde_json::json!({"version":"2024-11-05","tools":true,"list_changed":false}));
         assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
         assert_eq!(mcp["servers"][0]["tools"][0]["icons"], serde_json::json!([{"src":"https://invalid.example/icon.svg","mimeType":"image/svg+xml","sizes":["any"],"theme":"dark"}]));
