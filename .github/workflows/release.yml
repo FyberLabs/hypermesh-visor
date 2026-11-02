@@ -51,9 +51,22 @@ jobs:
           if-no-files-found: error
 
   installed-x11:
-    name: installed Debian X11 qualification
+    name: installed Debian X11 (${{ matrix.asset }})
     needs: packages
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            asset: x86_64
+            deb_arch: amd64
+          - runner: ubuntu-24.04-arm
+            asset: aarch64
+            deb_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    env:
+      QUALIFICATION_ARCH: ${{ matrix.asset }}
+      QUALIFICATION_DEB_ARCH: ${{ matrix.deb_arch }}
     timeout-minutes: 12
     steps:
       - name: Checkout
@@ -67,10 +80,13 @@ jobs:
 
       - name: Install the candidate and display dependencies
         run: |
+          test "$(uname -m)" = "$QUALIFICATION_ARCH"
+          test "$(dpkg --print-architecture)" = "$QUALIFICATION_DEB_ARCH"
+          test "$(dpkg-deb -f "dist/hypermesh-visor-${QUALIFICATION_ARCH}.deb" Architecture)" = "$QUALIFICATION_DEB_ARCH"
           (cd dist && sha256sum --check checksums.txt)
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            ./dist/hypermesh-visor-x86_64.deb \
+            "./dist/hypermesh-visor-${QUALIFICATION_ARCH}.deb" \
             xserver-xorg-core xserver-xorg-video-dummy \
             xserver-xorg-input-libinput xserver-xorg-input-evdev \
             x11-utils x11-apps x11-xserver-utils xinput xdotool \
@@ -86,7 +102,7 @@ jobs:
             cat /etc/os-release
             uname -m
             dpkg-query -W hypermesh-visor xserver-xorg-core
-            sha256sum dist/hypermesh-visor-x86_64.deb \
+            sha256sum "dist/hypermesh-visor-${QUALIFICATION_ARCH}.deb" \
               /usr/bin/hypermesh-visor /usr/bin/hypermesh-companion
           } > qualification/candidate.txt
 
@@ -100,7 +116,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: installed-x11-${{ github.sha }}
+          name: installed-x11-${{ matrix.asset }}-${{ github.sha }}
           path: |
             qualification/
             display-logs/mcp-discovery.log
@@ -111,7 +127,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: installed-x11-failure-${{ github.sha }}
+          name: installed-x11-failure-${{ matrix.asset }}-${{ github.sha }}
           path: display-logs/
           if-no-files-found: ignore
 
