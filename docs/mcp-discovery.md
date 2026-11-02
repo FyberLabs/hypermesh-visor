@@ -632,3 +632,33 @@ reviewing a source does not execute it.
 
 References: [OpenCode MCP configuration](https://opencode.ai/docs/mcp-servers/)
 and [configuration locations and layers](https://opencode.ai/docs/config/).
+
+## Desktop connection recovery
+
+Choose **MCP connections** or run `hypermesh-companion --mcp-connections` to
+select an existing session attachment, choose **Refresh** or **Reconnect**, and
+confirm. The chooser reads the same heartbeat-free `GET /mcp/status` snapshot as
+MCP status. The status dialog itself remains read-only. The chooser captures the
+driving session (or most recently used session) and exact server ID; a later
+focus/session change does not retarget the confirmed request.
+
+Refresh reads the current connection's catalog; it cannot restart a disconnected
+server. Reconnect closes the previous connection and can restart its local
+process using the existing session's saved configuration. It does not load new
+profile edits or replay a tool call. Existing session lifetime/trust semantics
+remain unchanged. Use a newly reviewed session to apply configuration changes.
+
+Only the bounded status list is shown. Refreshing attachments are excluded;
+closed sessions and concurrent refreshes are rejected by the existing lifecycle
+API. Optional `server_id` metadata is provided only when the original ID fits
+the 512-byte API limit without trimming. Missing, clipped-only, or otherwise
+unaddressable targets are excluded rather than inferred from display labels.
+Older daemons without exact IDs require an update for these controls.
+
+Confirmation sends one POST to `/session/{id}/mcp/refresh` on the same-user
+companion socket. It does not register an automation heartbeat. Cancellation at
+any selection/confirmation stage sends no POST. Errors and timeouts are never
+retried automatically: an action may finish after the dialog times out, so
+inspect MCP status before retrying. Successful completion is followed by a
+notice to inspect current status; it does not guarantee that an app binding now
+matches or that the server has directly callable tools.
