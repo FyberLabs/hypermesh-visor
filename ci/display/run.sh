@@ -2535,6 +2535,11 @@ PY
   echo "other user cannot drive the control socket, the companion socket, or the opted-in port"
 }
 
+scenario_mcp_discovery() {
+  allow_write "$CONFIG/mcp-profiles.json" "$CONFIG/mcp-bindings.json"
+  python3 "$root/ci/display/mcp-discovery.py" "$RUNTIME" "$CONFIG" "$REQ_DIR"
+}
+
 scenario_mcp_profiles() {
   local mode
   for mode in profiles servers trust status connections; do
@@ -2551,6 +2556,7 @@ X11_SCENARIOS=(
   scroll-editor
   scroll-browser
   mcp-profiles
+  mcp-discovery
   stop-resume-during-type
   uinput-key-pauses-type
   uinput-move-pauses
@@ -2592,7 +2598,7 @@ run_x11() {
       continue
     fi
     case $name in
-      uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
+      mcp-discovery | uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
       auto-resume) limit=30 ;;
       key-down-detects) limit=20 ;;
       *) limit=45 ;;
