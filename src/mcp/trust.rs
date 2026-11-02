@@ -605,6 +605,10 @@ mod tests {
                 r#"{/*reviewed*/"mcp":{"new":{"type":"local","command":["never-run","argument"],"enabled":false}}}"#,
             ),
             (
+                "kiro_user",
+                r#"{/*reviewed*/"mcpServers":{"new":{"command":"never-run","disabled":true}}}"#,
+            ),
+            (
                 "junie_user",
                 r#"{/*reviewed*/"mcpServers":{"new":{"url":"https://example.com/mcp","type":"streamable-http"}}}"#,
             ),

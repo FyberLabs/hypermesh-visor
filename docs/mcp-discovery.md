@@ -197,6 +197,7 @@ Known locations on Linux:
 | --- | --- |
 | `zed_user` | `<config>/zed/settings.json` |
 | `junie_user` | `~/.junie/mcp/mcp.json` |
+| `kiro_user` | `~/.kiro/settings/mcp.json` |
 | `devin_user` | `~/.config/devin/mcp_config.json` |
 | `opencode_user` | `~/.config/opencode/opencode.json` |
 | `windsurf_user` | `~/.codeium/windsurf/mcp_config.json` |
@@ -662,3 +663,24 @@ retried automatically: an action may finish after the dialog times out, so
 inspect MCP status before retrying. Successful completion is followed by a
 notice to inspect current status; it does not guarantee that an app binding now
 matches or that the server has directly callable tools.
+
+## Kiro user MCP configuration
+
+The source chooser lists `~/.kiro/settings/mcp.json` as `kiro_user`, following
+the [Kiro configuration reference](https://kiro.dev/docs/mcp/configuration/).
+Listing examines file metadata only; workspace and agent configurations are not
+scanned or merged. The fixed home-relative location is independent of
+`XDG_CONFIG_HOME`. No server starts during listing or trust review.
+
+Compatible `mcpServers` command/URL definitions use the existing strict importer.
+Disabled flags, literal arguments, environment values, and headers are preserved
+under visor's existing profile and user-definition precedence. Kiro-specific
+`autoApprove`, `disabledTools` (including empty lists), `oauth`, `oauthScopes`,
+and `${VARIABLE}` substitutions are rejected rather than discarded or interpreted
+as visor policy. Provide an explicit compatible export when those settings are
+present; Kiro login state and tool permissions do not transfer to visor. Legacy
+SSE and unsupported fields retain the existing rejection behavior.
+
+Approvals retain Kiro source provenance and hash the full original file. A source
+change, even a comment-only edit, requires renewed review after restart. Existing
+sessions keep their snapshots; discovery does not automatically reconnect them.
