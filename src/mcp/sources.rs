@@ -91,6 +91,14 @@ fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
             status: "missing",
         });
     }
+    if let Some(home) = home.filter(|p| p.is_absolute()) {
+        out.push(Location {
+            id: "kiro_user".into(),
+            label: "Kiro user MCP configuration".into(),
+            path: home.join(".kiro/settings/mcp.json"),
+            status: "missing",
+        });
+    }
     for location in &mut out {
         if location.status == "use_explicit_path" {
             continue;
@@ -122,6 +130,7 @@ pub(super) fn valid_source_kind(kind: &str) -> bool {
             | "zed_user"
             | "devin_user"
             | "junie_user"
+            | "kiro_user"
             | "opencode_user"
             | "windsurf_user"
             | "windsurf_next_user"
@@ -401,7 +410,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested/.cursor")).unwrap();
         std::fs::write(dir.join("nested/.cursor/mcp.json"), "must not discover").unwrap();
         let sources = locations(Some(&dir), Some(&dir.join("xdg")));
-        assert_eq!(sources.len(), 10);
+        assert_eq!(sources.len(), 11);
         assert_eq!(sources[0].status, "available_for_review");
         assert_eq!(sources[1].path, dir.join("xdg/Code/User/mcp.json"));
         assert_eq!(sources[1].status, "missing");
@@ -473,6 +482,50 @@ mod tests {
         ] {
             let error = normalize(&raw.to_string()).unwrap_err().to_string();
             assert!(!error.contains("private"));
+        }
+    }
+
+    #[test]
+    fn kiro_lists_only_the_fixed_user_source_without_parsing_it() {
+        let dir = std::env::temp_dir().join(format!("visor-kiro-{}", uuid::Uuid::new_v4()));
+        let path = dir.join(".kiro/settings/mcp.json");
+        let project = dir.join("project/.kiro/settings/mcp.json");
+        for file in [&path, &project] {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "not parsed by listing").unwrap();
+        }
+        let sources = locations(Some(&dir), Some(&dir.join("other-xdg")));
+        let source = sources.iter().find(|s| s.id == "kiro_user").unwrap();
+        assert_eq!(source.path, path);
+        assert_eq!(source.status, "available_for_review");
+        assert!(valid_source_kind("kiro_user"));
+        assert!(!sources.iter().any(|s| s.path == project));
+        assert!(!locations(None, Some(&dir)).iter().any(|s| s.id == "kiro_user"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(locations(Some(&dir), None).iter().find(|s| s.id == "kiro_user").unwrap().status, "unavailable");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn kiro_compatible_definitions_preserve_disabled_and_reject_editor_policy() {
+        let raw = json!({"mcpServers":{
+            "local":{"command":"never-run","args":["one argument"],"disabled":true},
+            "remote":{"url":"https://example.com/mcp","headers":{"Authorization":"private"}}
+        }});
+        let parsed: Value = serde_json::from_str(&normalize(&raw.to_string()).unwrap()).unwrap();
+        assert_eq!(parsed["mcpServers"]["local"]["enabled"], false);
+        assert_eq!(parsed["mcpServers"]["local"]["args"], json!(["one argument"]));
+        assert_eq!(parsed["mcpServers"]["remote"]["headers"]["Authorization"], "private");
+        for extra in [json!({"autoApprove":[]}), json!({"autoApprove":["*"]}),
+            json!({"disabledTools":["dangerous"]}), json!({"disabledTools":[]}),
+            json!({"oauth":{}}), json!({"oauthScopes":["private"]}),
+            json!({"env":{"TOKEN":"${PRIVATE_TOKEN}"}}),
+            json!({"headers":{"Authorization":"Bearer ${PRIVATE_TOKEN}"}})] {
+            let mut server = extra;
+            server["command"] = json!("never-run");
+            let error = normalize(&json!({"mcpServers":{"local":server}}).to_string()).unwrap_err().to_string();
+            assert!(!error.contains("PRIVATE_TOKEN") && !error.contains("dangerous"));
         }
     }
 
