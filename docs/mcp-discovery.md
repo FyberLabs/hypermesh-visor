@@ -564,3 +564,21 @@ Protocol references: [lifecycle and capabilities](https://modelcontextprotocol.i
 and [Streamable HTTP transport](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
 
 Pagination follows the [MCP cursor contract](https://modelcontextprotocol.io/specification/2024-11-05/server/utilities/pagination).
+
+## Tool icon metadata
+
+Tool catalogs preserve optional `icons` arrays using the
+[MCP 2025-11-25 icon fields](https://modelcontextprotocol.io/specification/2025-11-25/schema#icon):
+required text `src`, optional text `mimeType`, text-array `sizes`, and `light` or
+`dark` `theme`. Missing arrays stay absent; explicit empty arrays stay empty.
+Unknown fields remain untrusted data. Malformed known field types reject the
+whole catalog; icons count toward the existing 8 MiB catalog limit. Refresh and
+reconnect replace them with the new catalog, and the session MCP API preserves
+them alongside schemas and annotations.
+
+Visor does not resolve or fetch icon URIs, decode data URIs, validate image
+content or size syntax, or render icons. Source strings are opaque metadata, not
+approved URLs. In particular, SVG content and remote sources must not be treated
+as safe merely because discovery accepted their field types. The desktop status
+dialog receives no tool icons or catalogs. Future rendering requires a separate
+resource trust and image handling policy. Icon metadata grants no tool approval.

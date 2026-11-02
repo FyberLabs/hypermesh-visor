@@ -912,7 +912,7 @@ mod tests {
                     "tools/list" => {
                         if req["params"].get("cursor").is_none() {
                             generation += 1;
-                            json!({"tools":[{"name":format!("{generation}-a"),"title":format!("Generation {generation}"),"inputSchema":{"type":"object","properties":{"generation":{"const":generation}}},"outputSchema":{"type":"object"}}],"nextCursor":" +/= "})
+                            json!({"tools":[{"name":format!("{generation}-a"),"title":format!("Generation {generation}"),"icons":[{"src":format!("https://invalid.example/{generation}.png")}],"inputSchema":{"type":"object","properties":{"generation":{"const":generation}}},"outputSchema":{"type":"object"}}],"nextCursor":" +/= "})
                         } else {
                             assert_eq!(req["params"]["cursor"], " +/= ");
                             json!({"tools":[{"name":format!("{generation}-b")}]})
@@ -946,6 +946,7 @@ mod tests {
         assert_eq!(server.tools[0].name, "2-a");
         assert_eq!(server.tools[0].input_schema.as_ref().unwrap()["properties"]["generation"]["const"], 2);
         assert_eq!(server.tools[0].title.as_deref(), Some("Generation 2"));
+        assert_eq!(server.tools[0].icons, Some(json!([{"src":"https://invalid.example/2.png"}])));
         assert_eq!(server.tools[0].output_schema, Some(json!({"type":"object"})));
         assert!(server.call_tool("2-a", json!({})).is_err());
         assert!(server.tools.is_empty());
@@ -953,6 +954,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         server.refresh(true).unwrap();
         assert_eq!(server.tools[1].name, "3-b");
+        assert_eq!(server.tools[0].icons, Some(json!([{"src":"https://invalid.example/3.png"}])));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         stop.store(true, Ordering::SeqCst);
         worker.join().unwrap();

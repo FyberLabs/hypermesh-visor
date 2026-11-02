@@ -25,6 +25,8 @@ pub struct ToolInfo {
     pub annotations: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Value>,
 }
 
 impl ToolInfo {
