@@ -99,6 +99,14 @@ fn locations(home: Option<&Path>, xdg: Option<&Path>) -> Vec<Location> {
             status: "missing",
         });
     }
+    if let Some(home) = home.filter(|p| p.is_absolute()) {
+        out.push(Location {
+            id: "antigravity_user".into(),
+            label: "Antigravity user MCP configuration".into(),
+            path: home.join(".gemini/config/mcp_config.json"),
+            status: "missing",
+        });
+    }
     for location in &mut out {
         if location.status == "use_explicit_path" {
             continue;
@@ -131,6 +139,7 @@ pub(super) fn valid_source_kind(kind: &str) -> bool {
             | "devin_user"
             | "junie_user"
             | "kiro_user"
+            | "antigravity_user"
             | "opencode_user"
             | "windsurf_user"
             | "windsurf_next_user"
@@ -275,6 +284,16 @@ pub(super) fn normalize(raw: &str) -> Result<String, McpError> {
                 }
             }
         }
+        if let Some(url) = entry.remove("serverUrl") {
+            if key != "mcpServers" || entry.contains_key("url") || entry.contains_key("command")
+                || entry.get("type").is_some_and(|kind| kind != "http")
+                || !url.as_str().is_some_and(|url| !url.trim().is_empty())
+            {
+                return Err(McpError::message("Invalid or conflicting MCP serverUrl"));
+            }
+            entry.insert("url".into(), url);
+            entry.insert("type".into(), json!("http"));
+        }
         if key == "context_servers" {
             let command = entry
                 .get("command")
@@ -410,7 +429,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("nested/.cursor")).unwrap();
         std::fs::write(dir.join("nested/.cursor/mcp.json"), "must not discover").unwrap();
         let sources = locations(Some(&dir), Some(&dir.join("xdg")));
-        assert_eq!(sources.len(), 11);
+        assert_eq!(sources.len(), 12);
         assert_eq!(sources[0].status, "available_for_review");
         assert_eq!(sources[1].path, dir.join("xdg/Code/User/mcp.json"));
         assert_eq!(sources[1].status, "missing");
@@ -482,6 +501,55 @@ mod tests {
         ] {
             let error = normalize(&raw.to_string()).unwrap_err().to_string();
             assert!(!error.contains("private"));
+        }
+    }
+
+    #[test]
+    fn antigravity_discovery_is_global_metadata_only() {
+        let dir = std::env::temp_dir().join(format!("visor-antigravity-{}", uuid::Uuid::new_v4()));
+        let path = dir.join(".gemini/config/mcp_config.json");
+        let ignored = [dir.join(".agents/mcp_config.json"), dir.join(".gemini/antigravity/mcp_config.json")];
+        for file in std::iter::once(&path).chain(ignored.iter()) {
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, "not parsed by listing").unwrap();
+        }
+        let sources = locations(Some(&dir), Some(&dir.join("other-xdg")));
+        let source = sources.iter().find(|s| s.id == "antigravity_user").unwrap();
+        assert_eq!(source.path, path);
+        assert_eq!(source.status, "available_for_review");
+        assert!(!sources.iter().any(|s| ignored.contains(&s.path)));
+        assert!(valid_source_kind("antigravity_user"));
+        assert!(!locations(None, Some(&dir)).iter().any(|s| s.id == "antigravity_user"));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(locations(Some(&dir), None).iter().find(|s| s.id == "antigravity_user").unwrap().status, "unavailable");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn antigravity_server_url_preserves_literals_and_rejects_conflicts_and_policy() {
+        let raw = json!({"mcpServers":{
+            "local":{"command":"never-run","args":["one argument"],"env":{"TOKEN":"literal"}},
+            "remote":{"serverUrl":"https://example.com/mcp","headers":{"Authorization":"private"},"disabled":true}
+        }});
+        let parsed: Value = serde_json::from_str(&normalize(&raw.to_string()).unwrap()).unwrap();
+        assert_eq!(parsed["mcpServers"]["remote"]["type"], "http");
+        assert_eq!(parsed["mcpServers"]["remote"]["url"], "https://example.com/mcp");
+        assert_eq!(parsed["mcpServers"]["remote"]["enabled"], false);
+        assert_eq!(parsed["mcpServers"]["remote"]["headers"]["Authorization"], "private");
+        assert_eq!(parsed["mcpServers"]["local"]["args"], json!(["one argument"]));
+        for patch in [json!({"serverUrl":null}), json!({"serverUrl":" "}), json!({"url":"https://other.invalid"}),
+            json!({"command":"never-run"}), json!({"type":"stdio"}), json!({"type":"sse"}),
+            json!({"authProviderType":"google_credentials"}), json!({"oauth":{}}),
+            json!({"enabledTools":[]}), json!({"disabledTools":[]}), json!({"timeoutSeconds":0}),
+            json!({"serverUrl":"https://${PRIVATE_HOST}/mcp"})] {
+            let mut server = json!({"serverUrl":"https://example.com/mcp"});
+            server.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
+            let error = normalize(&json!({"mcpServers":{"remote":server}}).to_string()).unwrap_err().to_string();
+            assert!(!error.contains("PRIVATE_HOST") && !error.contains("google_credentials"));
+        }
+        for key in ["servers", "context_servers"] {
+            assert!(normalize(&json!({key:{"remote":{"serverUrl":"https://example.com/mcp"}}}).to_string()).is_err());
         }
     }
 

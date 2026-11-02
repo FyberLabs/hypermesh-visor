@@ -197,6 +197,7 @@ Known locations on Linux:
 | --- | --- |
 | `zed_user` | `<config>/zed/settings.json` |
 | `junie_user` | `~/.junie/mcp/mcp.json` |
+| `antigravity_user` | `~/.gemini/config/mcp_config.json` |
 | `kiro_user` | `~/.kiro/settings/mcp.json` |
 | `devin_user` | `~/.config/devin/mcp_config.json` |
 | `opencode_user` | `~/.config/opencode/opencode.json` |
@@ -733,3 +734,24 @@ companion/status summaries. Refresh placeholders and failures retain the last
 successful metadata; catalog refresh does not renegotiate it, and successful
 reconnect replaces it. Always consult routing_status before treating an attachment
 as current. See the [MCP Implementation schema](https://modelcontextprotocol.io/specification/2025-11-25/schema#implementation).
+
+
+## Antigravity global configuration
+
+The source chooser lists `~/.gemini/config/mcp_config.json` as
+`antigravity_user`, following [Google's MCP reference](https://antigravity.google/docs/mcp).
+Listing reads metadata only; it does not parse files or contact/start servers.
+Workspace `.agents` files, plugin configurations, legacy locations, and OAuth token
+stores are not scanned or merged. Use an explicitly selected compatible export
+for other locations.
+
+Within an external `mcpServers` map, `serverUrl` normalizes to a Streamable HTTP
+URL. Conflicting URL/command/transport fields and invalid values are rejected.
+Literal arguments, headers, and disabled state are preserved. Unsupported
+`authProviderType`, OAuth, tool allow/deny lists (including empty lists), and
+`timeoutSeconds` fail import; editor permissions and login state do not transfer.
+Visor uses its own bounded timeouts and never starts an OAuth flow or reads ADC.
+
+Persistent trust retains source provenance and pins full original bytes. Edits,
+including comment-only changes, require renewed review after restart. Source
+selection and normalization never authorize execution by themselves.
