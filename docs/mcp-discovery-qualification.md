@@ -44,6 +44,11 @@ The real X11 fixture tests:
   attachment remains healthy. These are X11 routing hints, not authenticated
   application identity; the harness supplies EWMH properties without a window
   manager.
+- Two healthy attachments demonstrate explicit first-match order; reversing
+  rules changes the winner. An unavailable first target is skipped, and a
+  matching class with a mismatched executable does not match. Status must report
+  the expected winning index and identity/health counts. Rule edits neither
+  restart servers nor execute tools.
 - Catalog refresh retains the catalog without spawning another process.
 - A denied call produces no server event; a lost reply clears routing and tools.
 - Explicit reconnect starts one replacement and never replays the lost call.

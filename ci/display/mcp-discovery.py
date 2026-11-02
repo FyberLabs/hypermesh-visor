@@ -135,21 +135,25 @@ def main(runtime, config, scratch):
             directory = Path(directory)
             marker = directory / "server-events"
             source = directory / "selected.json"
-            source.write_text(json.dumps({"mcpServers": {"fixture": {
-                "command": sys.executable, "args": [str(Path(__file__).resolve()), "--server", str(marker)],
-                "env": {"PRIVATE_TEST_VALUE": "MCP_DISCOVERY_PRIVATE_SENTINEL"}}}}))
+            secondary_marker = directory / "secondary-events"
+            def definition(events):
+                return {"command": sys.executable,
+                    "args": [str(Path(__file__).resolve()), "--server", str(events)],
+                    "env": {"PRIVATE_TEST_VALUE": "MCP_DISCOVERY_PRIVATE_SENTINEL"}}
+            source.write_text(json.dumps({"mcpServers": {
+                "fixture": definition(marker), "fixture_second": definition(secondary_marker)}}))
             # Isolated harness configuration only; restore it in finally.
             profiles.write_text(json.dumps({"active": "default", "profiles": {
-                "default": {"servers": []}, profile: {"servers": ["fixture"]}}}))
+                "default": {"servers": []}, profile: {"servers": ["fixture", "fixture_second"]}}}))
             bindings.write_text(json.dumps({"bindings": [
                 {"server": "fixture", "executable": str(Path(sys.executable).resolve())}]}))
             app, window = start_window(directory, 1)
             preview = request(companion, "POST", "/mcp/discovery", {"profile": profile, "project_path": str(source)})
-            assert not marker.exists(), "preview started a server"
+            assert not marker.exists() and not secondary_marker.exists(), "preview started a server"
             assert "MCP_DISCOVERY_PRIVATE_SENTINEL" not in json.dumps(preview)
             request(companion, "POST", "/mcp/trust", {"action": "approve", "review_id": preview["review_id"]}, 204)
             approved = True
-            assert not marker.exists(), "approval started a server"
+            assert not marker.exists() and not secondary_marker.exists(), "approval started a server"
             session_request = {"purpose": "live MCP discovery", "mcp_profile": profile,
                 "recipes": [], "agent": {"name": "display", "instructions": ""}, "skills": []}
             session = request(control, "POST", "/session", session_request, 201)
@@ -191,6 +195,35 @@ def main(runtime, config, scratch):
             until(lambda: status()["prefer_mcp"] is True, "restarted app did not regain routing")
             assert marker.read_text().count("start ") == 1, "focus transitions restarted MCP"
             print("PASS identity same-title-rejected app-exit-clears-routing app-restart-recovers healthy-attachment-retained", flush=True)
+            # Qualify ordering and all-selector behavior through the real daemon.
+            executable = str(Path(sys.executable).resolve())
+            def rule(server):
+                return {"server": server, "executable": executable}
+            def set_rules(rules, winner, index, identities, healthy):
+                bindings.write_text(json.dumps({"bindings": rules}))
+                def selected():
+                    current = status()
+                    match = current["mcp_match"]
+                    return (current["mcp"] == winner and current["prefer_mcp"] is True
+                            and match.get("binding_index") == index
+                            and match["identity_matches"] == identities
+                            and match["healthy_matches"] == healthy)
+                until(selected, "binding precedence or selector result did not update")
+            set_rules([rule("fixture_second"), rule("fixture")], "fixture_second", 0, 2, 2)
+            set_rules([rule("fixture"), rule("fixture_second")], "fixture", 0, 2, 2)
+            set_rules([rule("unavailable"), rule("fixture_second"), rule("fixture")],
+                      "fixture_second", 1, 3, 2)
+            wm_class = status()["focused"]["wm_class"]
+            assert wm_class
+            # A matching class cannot compensate for a different executable.
+            set_rules([{"server": "fixture_second", "wm_class": wm_class,
+                        "executable": str(Path(xmessage).resolve())}, rule("fixture")],
+                      "fixture", 1, 1, 1)
+            set_rules([rule("fixture")], "fixture", 0, 1, 1)
+            assert marker.read_text().count("start ") == 1
+            assert secondary_marker.read_text().count("start ") == 1
+            assert "call " not in secondary_marker.read_text()
+            print("PASS bindings ordered-healthy-winner unavailable-skipped all-selectors-required no-restart-no-call", flush=True)
             # Read-only catalog refresh must retain routing and not restart the process.
             request(control, "POST", endpoint + "/refresh", {"server": "fixture", "action": "refresh"}, 204)
             until(lambda: status()["prefer_mcp"] is True, "catalog refresh did not restore matching")
