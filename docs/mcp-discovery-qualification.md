@@ -85,6 +85,13 @@ profile command/cwd/environment overrides on the winning user definition, base
 environment preservation on a selected-only definition, override provenance only
 on winning definitions, and that environment overrides do not enable a disabled
 entry. A profile changed between preview and approval must also be rejected.
+A compatible `mcp.json` in the daemon working directory names a server included
+in the profile. With no explicit project selection, review must fail for the
+unknown member without starting it. Removing that member permits review and
+attachment of only the user source. After revoking the explicit grant, a new
+review without a path must also drop the previous selection while still attaching
+the user source. The daemon cwd and fixture are in harness-owned runtime storage; this does not
+qualify every editor workspace layout.
 The cwd contains a space; argument-string parsing and HTTP header/URL overrides
 are not qualified by these cases. Source and installed-package
 jobs retain `mcp-source-precedence.log`. This does not qualify arbitrary editor
