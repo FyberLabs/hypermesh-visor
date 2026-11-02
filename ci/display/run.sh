@@ -2564,6 +2564,21 @@ scenario_mcp_profiles() {
   done
 }
 
+scenario_mcp_persistence() {
+  ensure_off
+  stop_companion
+  allow_write "$CONFIG/mcp-profiles.json"
+  trap 'python3 "$root/ci/display/mcp-persistence.py" cleanup "$RUNTIME" "$CONFIG" "$REQ_DIR"' EXIT
+  start_visor
+  python3 "$root/ci/display/mcp-persistence.py" prepare "$RUNTIME" "$CONFIG" "$REQ_DIR"
+  local phase
+  for phase in unchanged changed revoked; do
+    stop_visor
+    start_visor
+    python3 "$root/ci/display/mcp-persistence.py" "$phase" "$RUNTIME" "$CONFIG" "$REQ_DIR"
+  done
+}
+
 X11_SCENARIOS=(
   uinput-channel
   key-down-detects
@@ -2583,6 +2598,7 @@ X11_SCENARIOS=(
   watchdog-pauses
   held-release
   auto-resume
+  mcp-persistence
   other-user-cannot-drive
 )
 
@@ -2615,7 +2631,7 @@ run_x11() {
       continue
     fi
     case $name in
-      mcp-discovery | uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
+      mcp-persistence | mcp-discovery | uinput-key-pauses-type | held-release | stop-resume-during-type | other-user-cannot-drive) limit=60 ;;
       auto-resume) limit=30 ;;
       key-down-detects) limit=20 ;;
       *) limit=45 ;;
