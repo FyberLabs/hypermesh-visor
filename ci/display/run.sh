@@ -2193,7 +2193,7 @@ PY
     allow_write "$ready" "$evidence" "$PROC/uinput.cmd.lock"
     rm -f "$ready"
     spawn_request python3 "$root/ci/display/interrupt-type.py" "$XEV_LOG" "$XEV_AT" \
-      "$UINPUT_IN" "$UINPUT_OUT" "$PROC/uinput.cmd.lock" "$ready" >"$evidence"
+      3 4 "$PROC/uinput.cmd.lock" "$ready" 3>&"$UINPUT_IN" 4<&"$UINPUT_OUT" >"$evidence"
     local observer_pid=$SPAWN_PID
     local spins=0
     until [[ -f $ready ]]; do

@@ -2,6 +2,7 @@
 """Exercise observer ordering and bounded failures without a display or uinput."""
 import importlib.util
 import os
+import subprocess
 from pathlib import Path
 import tempfile
 import threading
@@ -14,7 +15,7 @@ spec.loader.exec_module(observer)
 
 
 class InterruptTests(unittest.TestCase):
-    def run_observer(self, emit, ack=b"ok\n"):
+    def run_observer(self, emit, ack=b"ok\n", child=False):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             log, ready = base / "xev", base / "ready"
@@ -23,8 +24,21 @@ class InterruptTests(unittest.TestCase):
             cr, cw = os.pipe()
             ar, aw = os.pipe()
             result = []
-            worker = threading.Thread(target=lambda: result.append(observer.interrupt(
-                log, offset, cw, ar, base / "lock", ready, timeout=0.5)))
+            def run():
+                if child:
+                    # Exercise the explicit descriptor duplication at exec, not
+                    # just Python threads sharing open descriptors.
+                    completed = subprocess.run([
+                        "bash", "-c",
+                        'python3 "$1" "$2" "$3" 3 4 "$6" "$7" 3>&"$4" 4<&"$5"',
+                        "observer", str(Path(__file__).with_name("interrupt-type.py")),
+                        str(log), str(offset), str(cw), str(ar), str(base / "lock"), str(ready),
+                    ], pass_fds=(cw, ar), capture_output=True, text=True, timeout=6)
+                    import json
+                    result.append(json.loads(completed.stdout))
+                else:
+                    result.append(observer.interrupt(log, offset, cw, ar, base / "lock", ready, timeout=0.5))
+            worker = threading.Thread(target=run)
             try:
                 worker.start()
                 deadline = time.monotonic() + 1
@@ -62,6 +76,9 @@ class InterruptTests(unittest.TestCase):
         self.assertTrue(result["acknowledged"])
         self.assertLessEqual(result["first_q_ms"], result["key_sent_ms"])
         self.assertLessEqual(result["key_sent_ms"], result["elapsed_ms"])
+
+    def test_subprocess_receives_explicit_pipe_descriptors(self):
+        self.assertTrue(self.run_observer(True, child=True)["acknowledged"])
 
     def test_no_new_input_times_out_without_injection(self):
         result = self.run_observer(False)
