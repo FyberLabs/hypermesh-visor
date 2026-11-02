@@ -684,3 +684,20 @@ SSE and unsupported fields retain the existing rejection behavior.
 Approvals retain Kiro source provenance and hash the full original file. A source
 change, even a comment-only edit, requires renewed review after restart. Existing
 sessions keep their snapshots; discovery does not automatically reconnect them.
+
+## Response envelope validation
+
+HTTP JSON, HTTP SSE, and stdio responses share envelope validation before
+initialization, discovery, refresh, or tool-result handling. Responses must
+match the request ID and JSON-RPC version and contain exactly one outcome:
+an object `result`, or an object `error` with an integer `code` and text
+`message`. Hybrid request/response messages are not treated as server requests.
+See the [MCP base protocol](https://modelcontextprotocol.io/specification/2025-11-25/basic#responses).
+
+Malformed correlated responses fail the operation; existing attachment failure
+handling disconnects and clears stale tools. Invalid initial discovery prevents
+attachment. Error messages do not echo remote result/error contents. Valid
+JSON-RPC errors remain ordinary operation rejections: a tool-call rejection
+does not itself destroy a healthy catalog. Valid tool results with `isError`
+retain their existing semantics. Requests and tool calls are never replayed.
+This validates the envelope, not arbitrary tool input/output JSON Schemas.
