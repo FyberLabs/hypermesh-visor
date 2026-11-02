@@ -22,7 +22,9 @@ runtime, config, scratch = map(Path, sys.argv[1:4])
 profile = 'display-source-precedence'
 user = config / 'mcp.json'
 profiles = config / 'mcp-profiles.json'
-backups = {p: p.read_bytes() if p.exists() else None for p in (user, profiles)}
+# run.sh launches the daemon from the checkout root. Preserve any local file.
+ambient = Path(__file__).resolve().parents[2] / 'mcp.json'
+backups = {p: p.read_bytes() if p.exists() else None for p in (user, profiles, ambient)}
 sid = None
 approved = False
 sentinel = 'MCP_SOURCE_PRECEDENCE_PRIVATE_SENTINEL'
@@ -52,6 +54,7 @@ try:
             return {'command': sys.executable, 'args': [
                 str(Path(__file__).resolve()), '--base-probe', str(marker)],
                 'env': {'PRIVATE_TEST_VALUE': sentinel}, 'enabled': enabled}
+        ambient.write_text(json.dumps({'mcpServers': {'ambient': definition('ambient-unselected')}}))
         overridden = definition('user-winner')
         overridden['command'] = str(directory / 'must-not-execute')
         overridden['args'][1] = '--override-probe'
@@ -69,7 +72,7 @@ try:
             'excluded': definition('selected-excluded')}}))
         profile_data = {'active': 'default', 'profiles': {
             'default': {'servers': []}, profile: {
-                'servers': ['duplicate', 'disabled', 'selected_only'],
+                'servers': ['duplicate', 'disabled', 'selected_only', 'ambient'],
                 'config': {
                     'duplicate': {'command': sys.executable, 'cwd': str(override_cwd),
                                   'env.PRIVATE_TEST_VALUE': 'MCP_PROFILE_OVERRIDE_PRIVATE_SENTINEL'},
@@ -119,6 +122,27 @@ try:
             assert len(events) == 1 and events[0].startswith('start '), 'unexpected startup or tool call'
         request(False, 'DELETE', f'/session/{sid}', expected=204)
         sid = None
+        # Omit project selection after revoking the previous explicit grant.
+        # A named profile member does not authorize scanning the daemon cwd.
+        request(True, 'POST', '/mcp/trust', {'action': 'revoke', 'profile': profile}, 204)
+        approved = False
+        unselected = request(True, 'POST', '/mcp/discovery', {'profile': profile})
+        assert {(s['source'], s['name']) for s in unselected['servers']} == {
+            ('user', 'duplicate'), ('user', 'disabled')}, 'unselected project imported'
+        request(True, 'POST', '/mcp/trust', {'action': 'approve', 'review_id': unselected['review_id']}, 204)
+        approved = True
+        session = request(False, 'POST', '/session', {'purpose': 'project opt-in qualification',
+            'mcp_profile': profile, 'recipes': [], 'agent': {'name': 'display', 'instructions': ''}, 'skills': []}, 201)
+        sid = session['id']
+        catalog = request(False, 'GET', f'/session/{sid}/mcp')
+        assert [server['name'] for server in catalog['servers']] == ['duplicate']
+        assert catalog['servers'][0]['healthy']
+        assert not markers['ambient-unselected'].exists(), 'ambient project executed'
+        assert len(markers['user-winner'].read_text().splitlines()) == 2
+        assert len(markers['selected-winner'].read_text().splitlines()) == 1, 'old selection retained'
+        request(False, 'DELETE', f'/session/{sid}', expected=204)
+        sid = None
+        print('PASS project-opt-in cwd-not-imported named-member-not-authorized previous-selection-not-retained user-still-attaches', flush=True)
         print('PASS profile-overrides command cwd environment provenance disabled-stays-disabled unchanged-source-isolated stale-profile-review-denied', flush=True)
         print('PASS source-precedence user-wins disabled-not-resurrected profile-exclusion selected-only-attaches', flush=True)
         print('PASS source-review cancel-denied changed-snapshot-denied no-start-before-attach private-values-redacted', flush=True)
