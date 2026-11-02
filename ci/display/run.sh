@@ -2173,6 +2173,13 @@ scenario_uinput_channel() {
   ensure_off
 }
 
+# Redirect at the external command, after the background shell is established.
+# Bash may close function-scoped descriptors or replace background stdin.
+observe_type_interrupt() {
+  python3 "$root/ci/display/interrupt-type.py" "$1" "$2" 1 0 "$3" "$4" "$5" \
+    <&"$UINPUT_OUT" >&"$UINPUT_IN"
+}
+
 scenario_uinput_key_pauses_type() {
   ensure_companion
   focus_xev
@@ -2192,8 +2199,8 @@ PY
     local evidence="$REQ_DIR/type-observer-$attempt.json"
     allow_write "$ready" "$evidence" "$PROC/uinput.cmd.lock"
     rm -f "$ready"
-    spawn_request python3 "$root/ci/display/interrupt-type.py" "$XEV_LOG" "$XEV_AT" \
-      1 0 "$PROC/uinput.cmd.lock" "$ready" "$evidence" <&"$UINPUT_OUT" >&"$UINPUT_IN"
+    spawn_request observe_type_interrupt "$XEV_LOG" "$XEV_AT" \
+      "$PROC/uinput.cmd.lock" "$ready" "$evidence"
     local observer_pid=$SPAWN_PID
     local spins=0
     until [[ -f $ready ]]; do

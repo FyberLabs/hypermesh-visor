@@ -30,7 +30,7 @@ class InterruptTests(unittest.TestCase):
                     # just Python threads sharing open descriptors.
                     completed = subprocess.run([
                         "bash", "-c",
-                        'spawn_request() { "$@" & child=$!; }; spawn_request python3 "$1" "$2" "$3" 1 0 "$6" "$7" "$8" <&"$5" >&"$4"; wait "$child"',
+                        'spawn_request() { "$@" & child=$!; }; observe() { python3 "$1" "$2" "$3" 1 0 "$6" "$7" "$8" <&"$5" >&"$4"; }; spawn_request observe "$@"; wait "$child"',
                         "observer", str(Path(__file__).with_name("interrupt-type.py")),
                         str(log), str(offset), str(cw), str(ar), str(base / "lock"), str(ready), str(base / "result"),
                     ], pass_fds=(cw, ar), capture_output=True, text=True, timeout=6)
@@ -78,7 +78,8 @@ class InterruptTests(unittest.TestCase):
         self.assertLessEqual(result["key_sent_ms"], result["elapsed_ms"])
 
     def test_subprocess_receives_explicit_pipe_descriptors(self):
-        self.assertTrue(self.run_observer(True, child=True)["acknowledged"])
+        result = self.run_observer(True, child=True)
+        self.assertTrue(result["acknowledged"], result)
 
     def test_no_new_input_times_out_without_injection(self):
         result = self.run_observer(False)
