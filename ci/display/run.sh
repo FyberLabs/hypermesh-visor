@@ -2536,6 +2536,8 @@ PY
 }
 
 scenario_mcp_discovery() {
+  # Route status to the newly opened fixture session rather than the prior driver.
+  ensure_off
   allow_write "$CONFIG/mcp-profiles.json" "$CONFIG/mcp-bindings.json"
   python3 "$root/ci/display/mcp-discovery.py" "$RUNTIME" "$CONFIG" "$REQ_DIR"
 }
