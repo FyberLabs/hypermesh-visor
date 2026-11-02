@@ -329,10 +329,11 @@ terminal display. Reviews allow at most 128 candidates, 256 KiB per source file,
   cannot preserve a stale match. Failure to find a healthy match retains desktop mode. Input
   authorization and physical-user pause still apply.
 
-Issue #29 remains open for additional documented discovery sources, additional editor integration, native stable
-identity coverage beyond the current Linux probes, automatic server reconnect
-policy, and native Windows/macOS discovery. The implemented protocol surface and
-remaining compatibility limits are described below.
+Issue #29 remains open for the native runtime and container qualification gates
+in the [acceptance ledger](mcp-discovery-acceptance.md). Reconnect currently uses
+the explicit policy described below. Additional integrations and optional MCP
+features are compatibility extensions, not evidence that native-platform
+acceptance has completed.
 
 ## Attachment diagnostics
 
