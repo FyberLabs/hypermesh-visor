@@ -30,12 +30,12 @@ class InterruptTests(unittest.TestCase):
                     # just Python threads sharing open descriptors.
                     completed = subprocess.run([
                         "bash", "-c",
-                        'python3 "$1" "$2" "$3" 3 4 "$6" "$7" 3>&"$4" 4<&"$5"',
+                        'spawn_request() { "$@" & child=$!; }; spawn_request python3 "$1" "$2" "$3" 1 0 "$6" "$7" "$8" <&"$5" >&"$4"; wait "$child"',
                         "observer", str(Path(__file__).with_name("interrupt-type.py")),
-                        str(log), str(offset), str(cw), str(ar), str(base / "lock"), str(ready),
+                        str(log), str(offset), str(cw), str(ar), str(base / "lock"), str(ready), str(base / "result"),
                     ], pass_fds=(cw, ar), capture_output=True, text=True, timeout=6)
                     import json
-                    result.append(json.loads(completed.stdout))
+                    result.append(json.loads((base / "result").read_text()))
                 else:
                     result.append(observer.interrupt(log, offset, cw, ar, base / "lock", ready, timeout=0.5))
             worker = threading.Thread(target=run)

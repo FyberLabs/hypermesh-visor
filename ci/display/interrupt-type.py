@@ -39,8 +39,10 @@ def interrupt(log, offset, command_fd, ack_fd, lock, ready, timeout=5):
                             if time.monotonic() >= deadline:
                                 raise TimeoutError("uinput lock deadline")
                             time.sleep(0.001)
+                    evidence["stage"] = "send_key"
                     os.write(command_fd, b"key F12\n")
                     evidence["key_sent_ms"] = (time.monotonic_ns() - started) / 1e6
+                    evidence["stage"] = "read_ack"
                     ack = b""
                     while not ack.endswith(b"\n"):
                         remaining = deadline - time.monotonic()
@@ -68,5 +70,5 @@ def interrupt(log, offset, command_fd, ack_fd, lock, ready, timeout=5):
 if __name__ == "__main__":
     result = interrupt(sys.argv[1], int(sys.argv[2]), int(sys.argv[3]),
                        int(sys.argv[4]), sys.argv[5], sys.argv[6])
-    print(json.dumps(result), flush=True)
+    Path(sys.argv[7]).write_text(json.dumps(result) + "\n")
     sys.exit(0 if result["acknowledged"] else 1)
