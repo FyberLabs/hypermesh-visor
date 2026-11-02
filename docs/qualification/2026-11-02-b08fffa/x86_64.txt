@@ -1,0 +1,15 @@
+revision=b08fffabe0fd5ccf359085af56d9aa06501d33c6
+run=https://github.com/FyberLabs/hypermesh-visor/actions/runs/41475250190 attempt=1
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+x86_64
+hypermesh-visor	0.1.0~ci.b08fffabe0fd-1
+xserver-xorg-core	2:21.1.12-1ubuntu1.9
+526984d6a2a8610c7c2101cc718f21f1ea8f7276b076717d35a1dcfc69346373  dist/hypermesh-visor-x86_64.deb
+c5764d765397c0047b7ef84811e22d63c6b796b235e5f9be80d4ed4a20ecf01e  /usr/bin/hypermesh-visor
+ceffba111251c01d70f7e2ee83997fbb64665272b9c983aadae93482cda25057  /usr/bin/hypermesh-companion
+PASS discovery trust pagination executable-match refresh disconnect reconnect no-replay binding-fallback recovery revocation
+PASS persistence unchanged-restore changed-source-denied reapproval durable-revocation private-receipt
+PHYSICAL driver=libinput
+display scenarios passed
+harness listeners (cleanup): ss -ltnp has no harness TCP socket
+self-check: /dev/uinput 600 root:root unchanged and not world-writable; no harness process left
