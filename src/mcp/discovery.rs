@@ -49,6 +49,7 @@ pub fn list_tools(
                 output_schema: optional_schema(tool, "outputSchema")?,
                 annotations: optional_annotations(tool)?,
                 execution: optional_execution(tool)?,
+                icons: optional_icons(tool)?,
             });
         }
         match result.get("nextCursor") {
@@ -66,6 +67,27 @@ pub fn list_tools(
         }
     }
     Err(McpError::message("MCP tool page limit exceeded"))
+}
+
+// Icons remain untrusted metadata: no URI resolution, image decoding, or rendering.
+fn optional_icons(tool: &Value) -> Result<Option<Value>, McpError> {
+    let Some(value) = tool.get("icons") else { return Ok(None); };
+    let icons = value.as_array().ok_or_else(|| McpError::message("MCP icons must be an array"))?;
+    for icon in icons {
+        if !icon.is_object() || !icon.get("src").is_some_and(Value::is_string) {
+            return Err(McpError::message("MCP icon must contain a text source"));
+        }
+        if icon.get("mimeType").is_some_and(|v| !v.is_string()) {
+            return Err(McpError::message("MCP icon MIME type must be text"));
+        }
+        if icon.get("sizes").is_some_and(|v| !v.as_array().is_some_and(|sizes| sizes.iter().all(Value::is_string))) {
+            return Err(McpError::message("MCP icon sizes must be a text array"));
+        }
+        if icon.get("theme").is_some_and(|v| !matches!(v.as_str(), Some("light" | "dark"))) {
+            return Err(McpError::message("MCP icon theme is unsupported"));
+        }
+    }
+    Ok(Some(value.clone()))
 }
 
 // Preserve schema data without evaluating references or fetching remote content.
@@ -221,6 +243,47 @@ mod tests {
                 .to_string();
             assert!(!error.contains("private"));
         }
+    }
+
+    #[test]
+    fn icons_survive_pagination_as_opaque_data_without_defaults() {
+        let icons = json!([
+            {"src":"https://invalid.example/private.svg","mimeType":"image/svg+xml","sizes":["any","48x48"],"theme":"dark","extension":{"untrusted":true}},
+            {"src":"data:image/png;base64,not-decoded","theme":"light"}
+        ]);
+        let mut page = 0;
+        let tools = list_tools(|_| {
+            page += 1;
+            Ok(if page == 1 { json!({"result":{"tools":[{"name":"icons","icons":icons}],"nextCursor":"next"}}) }
+            else { json!({"result":{"tools":[{"name":"empty","icons":[]},{"name":"absent"}]}}) })
+        }).unwrap();
+        let exported = serde_json::to_value(tools).unwrap();
+        assert_eq!(exported[0]["icons"], icons);
+        assert_eq!(exported[1]["icons"], json!([]));
+        assert!(exported[2].get("icons").is_none());
+        assert_eq!(page, 2);
+    }
+
+    #[test]
+    fn malformed_icons_reject_catalog_without_echoing_sources() {
+        for icons in [json!(null), json!({}), json!("private"), json!([null]), json!([{}]),
+            json!([{"src":4}]), json!([{"src":"private","mimeType":null}]),
+            json!([{"src":"private","sizes":"48x48"}]), json!([{"src":"private","sizes":[4]}]),
+            json!([{"src":"private","theme":"unknown"}]), json!([{"src":"private","theme":null}])] {
+            let mut page = 0;
+            let error = list_tools(|_| {
+                page += 1;
+                Ok(if page == 1 { json!({"result":{"tools":[{"name":"valid"}],"nextCursor":"next"}}) }
+                else { json!({"result":{"tools":[{"name":"bad","icons":icons}]}}) })
+            }).unwrap_err().to_string();
+            assert!(!error.contains("private"));
+        }
+    }
+
+    #[test]
+    fn icon_payloads_count_toward_catalog_byte_limit() {
+        let error = list_tools(|_| Ok(json!({"result":{"tools":[{"name":"large","icons":[{"src":"x".repeat(8*1024*1024)}]}]}}))).unwrap_err();
+        assert!(error.to_string().contains("catalog too large"));
     }
 
     #[test]

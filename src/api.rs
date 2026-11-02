@@ -4151,7 +4151,7 @@ while True:
     elif method == "notifications/initialized":
         pass
     elif method == "tools/list":
-        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","inputSchema":{"type":"object"},"annotations":{"readOnlyHint":True,"destructiveHint":False},"execution":{"taskSupport":"optional"}},{"name":"task-only","execution":{"taskSupport":"required"}}]}})
+        send({"jsonrpc":"2.0","id":msg["id"],"result":{"tools":[{"name":"ping","description":"ping","icons":[{"src":"https://invalid.example/icon.svg","mimeType":"image/svg+xml","sizes":["any"],"theme":"dark"}],"inputSchema":{"type":"object"},"annotations":{"readOnlyHint":True,"destructiveHint":False},"execution":{"taskSupport":"optional"}},{"name":"task-only","execution":{"taskSupport":"required"}}]}})
     elif method == "tools/call":
         send({"jsonrpc":"2.0","id":msg["id"],"result":{"content":[{"type":"text","text":"pong"}]}})
 "#,
@@ -4198,6 +4198,7 @@ while True:
         assert_eq!(mcp["servers"][0]["routing_status"], "ready");
         assert_eq!(mcp["servers"][0]["protocol"], serde_json::json!({"version":"2024-11-05","tools":true,"list_changed":false}));
         assert_eq!(mcp["servers"][0]["tools"][0]["name"], "ping");
+        assert_eq!(mcp["servers"][0]["tools"][0]["icons"], serde_json::json!([{"src":"https://invalid.example/icon.svg","mimeType":"image/svg+xml","sizes":["any"],"theme":"dark"}]));
         assert_eq!(mcp["servers"][0]["tools"][0]["inputSchema"], serde_json::json!({"type":"object"}));
         assert_eq!(mcp["servers"][0]["tools"][0]["annotations"]["readOnlyHint"], true);
         assert_eq!(mcp["servers"][0]["tools"][1]["execution"]["taskSupport"], "required");
