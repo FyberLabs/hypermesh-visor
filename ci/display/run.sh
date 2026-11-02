@@ -947,7 +947,8 @@ start_visor() {
   if [[ $tcp == tcp ]]; then
     args=(--tcp --listen 127.0.0.1:0)
   fi
-  "$VISOR_BIN" "${args[@]}" \
+  # Keep cwd-based discovery fixtures inside harness-owned storage.
+  ( cd "$RUNTIME" && exec "$VISOR_BIN" "${args[@]}" ) \
     >"$DISPLAY_LOG_DIR/visor.out" 2>"$DISPLAY_LOG_DIR/visor.err" &
   VISOR_PID=$!
   note_started "$VISOR_PID" "$VISOR_BIN"

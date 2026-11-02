@@ -89,7 +89,8 @@ A compatible `mcp.json` in the daemon working directory names a server included
 in the profile. With no explicit project selection it must be absent from review
 and attachment, and must never start. After revoking the explicit grant, a new
 review without a path must also drop the previous selection while still attaching
-the user source. This tests the checkout cwd, not every editor workspace layout.
+the user source. The daemon cwd and fixture are in harness-owned runtime storage; this does not
+qualify every editor workspace layout.
 The cwd contains a space; argument-string parsing and HTTP header/URL overrides
 are not qualified by these cases. Source and installed-package
 jobs retain `mcp-source-precedence.log`. This does not qualify arbitrary editor

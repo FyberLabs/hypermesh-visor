@@ -22,8 +22,8 @@ runtime, config, scratch = map(Path, sys.argv[1:4])
 profile = 'display-source-precedence'
 user = config / 'mcp.json'
 profiles = config / 'mcp-profiles.json'
-# run.sh launches the daemon from the checkout root. Preserve any local file.
-ambient = Path(__file__).resolve().parents[2] / 'mcp.json'
+# run.sh launches the daemon from harness-owned runtime storage.
+ambient = runtime / 'mcp.json'
 backups = {p: p.read_bytes() if p.exists() else None for p in (user, profiles, ambient)}
 sid = None
 approved = False
