@@ -135,8 +135,9 @@ def main(runtime, config, scratch):
             request(companion, "POST", "/mcp/trust", {"action": "approve", "review_id": preview["review_id"]}, 204)
             approved = True
             assert not marker.exists(), "approval started a server"
-            session = request(control, "POST", "/session", {"purpose": "live MCP discovery", "mcp_profile": profile,
-                "recipes": [], "agent": {"name": "display", "instructions": ""}, "skills": []}, 201)
+            session_request = {"purpose": "live MCP discovery", "mcp_profile": profile,
+                "recipes": [], "agent": {"name": "display", "instructions": ""}, "skills": []}
+            session = request(control, "POST", "/session", session_request, 201)
             sid = session["id"]
             endpoint = f"/session/{sid}/mcp"
             catalog = request(control, "GET", endpoint)
@@ -146,6 +147,11 @@ def main(runtime, config, scratch):
             assert matched["mcp_match"]["reason"] == "matched"
             assert matched["focused"]["executable"] == str(Path(sys.executable).resolve())
             assert "MCP_DISCOVERY_PRIVATE_SENTINEL" not in json.dumps(matched)
+            # Read-only catalog refresh must retain routing and not restart the process.
+            request(control, "POST", endpoint + "/refresh", {"server": "fixture", "action": "refresh"}, 204)
+            until(lambda: status()["prefer_mcp"] is True, "catalog refresh did not restore matching")
+            assert [tool["name"] for tool in request(control, "GET", endpoint)["servers"][0]["tools"]] == ["ping", "crash"]
+            assert marker.read_text().count("start ") == 1
             first_start = marker.read_text()
             request(control, "POST", endpoint + "/call", {"server": "fixture", "tool": "ping", "decision": "deny", "arguments": {}})
             assert marker.read_text() == first_start, "denied call reached server"
@@ -161,7 +167,22 @@ def main(runtime, config, scratch):
             bindings.write_text('{"bindings":[{"server":"fixture","executable_path":"private"}]}')
             until(lambda: status()["mcp_match"]["reason"] == "bindings_unavailable", "bad binding retained a match")
             assert request(control, "GET", endpoint)["servers"][0]["healthy"] is True
-            print("PASS discovery trust pagination executable-match disconnect reconnect no-replay binding-fallback", flush=True)
+            bindings.write_text(json.dumps({"bindings": [
+                {"server": "fixture", "executable": str(Path(sys.executable).resolve())}]}))
+            until(lambda: status()["prefer_mcp"] is True, "corrected binding did not recover matching")
+            # Revocation blocks future sessions, while the existing attachment
+            # retains the explicitly documented session snapshot.
+            request(companion, "POST", "/mcp/trust", {"action": "revoke", "profile": profile}, 204)
+            approved = False
+            events = marker.read_text()
+            request(control, "POST", "/session", session_request, 403)
+            assert marker.read_text() == events, "revoked profile started a process"
+            request(control, "POST", endpoint + "/call", {"server": "fixture", "tool": "ping", "decision": "approve", "arguments": {}})
+            assert marker.read_text().count("call ping") == 1
+            assert marker.read_text().count("call crash") == 1
+            request(control, "DELETE", f"/session/{sid}", expected=204)
+            sid = None
+            print("PASS discovery trust pagination executable-match refresh disconnect reconnect no-replay binding-fallback recovery revocation", flush=True)
     finally:
         try:
             if sid is not None:

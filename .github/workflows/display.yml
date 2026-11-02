@@ -60,6 +60,14 @@ jobs:
             exit 1
           fi
 
+      - name: Upload MCP qualification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mcp-discovery-x11-${{ github.sha }}
+          path: display-logs/mcp-discovery.log
+          if-no-files-found: warn
+
       - name: Upload logs and captures
         if: failure()
         uses: actions/upload-artifact@v4
