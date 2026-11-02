@@ -198,6 +198,7 @@ Known locations on Linux:
 | `zed_user` | `<config>/zed/settings.json` |
 | `junie_user` | `~/.junie/mcp/mcp.json` |
 | `devin_user` | `~/.config/devin/mcp_config.json` |
+| `opencode_user` | `~/.config/opencode/opencode.json` |
 | `windsurf_user` | `~/.codeium/windsurf/mcp_config.json` |
 | `windsurf_next_user` | `~/.codeium/windsurf-next/mcp_config.json` |
 | `windsurf_insiders_user` | `~/.codeium/windsurf-insiders/mcp_config.json` |
@@ -605,3 +606,29 @@ changes, including comments, require renewed review after restart. User server
 definitions, disabled flags, and visor profile membership keep their existing
 precedence. Windows/macOS discovery and custom channel locations remain outside
 this Linux source chooser.
+
+## OpenCode user configuration
+
+The source chooser lists the documented `~/.config/opencode/opencode.json` user
+file. JSONC exports can also be selected by explicit path. Listing is metadata
+only; no project, custom environment path, remote organizational configuration,
+inline configuration, or managed layer is discovered or merged. The source ID
+and original file bytes are pinned by the existing persistent trust review.
+
+The external importer accepts an MCP-only `mcp` map (plus optional `$schema`).
+Local entries require `type: local` and a nonempty string-array `command`; the
+first element becomes the executable and remaining elements remain separate
+arguments. `environment` maps to `env`, and `enabled` is preserved. Remote
+entries require `type: remote`, a URL, and explicit `oauth: false`; headers are
+preserved and transport becomes Streamable HTTP. No OAuth session is imported
+and no legacy SSE fallback is added.
+
+Other root settings, permission/tool policy, partial inherited entries, timeout
+settings, unsupported fields, and OpenCode `{env:...}`/`{file:...}` substitutions
+are rejected. Export a self-contained compatible configuration for review.
+Visor does not silently drop editor policy or translate substitution behavior.
+User definitions and visor profiles retain existing precedence; selecting or
+reviewing a source does not execute it.
+
+References: [OpenCode MCP configuration](https://opencode.ai/docs/mcp-servers/)
+and [configuration locations and layers](https://opencode.ai/docs/config/).
