@@ -104,6 +104,7 @@ jobs:
           path: |
             qualification/
             display-logs/mcp-discovery.log
+            display-logs/mcp-persistence.log
           if-no-files-found: warn
 
       - name: Upload failure diagnostics

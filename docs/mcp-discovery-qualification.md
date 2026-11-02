@@ -44,6 +44,15 @@ The real X11 fixture tests:
 - Revocation prevents a new session from starting a process; the existing
   attachment retains its documented snapshot until explicitly closed.
 
+The separate `mcp-persistence` scenario stops and starts the real daemon three
+times using the same private configuration directory. It verifies that unchanged
+approvals restore, comment-only source changes require renewed approval, renewed
+approval attaches successfully, and revocation survives another restart without
+starting a process. It also checks receipt ownership/mode and absence of the
+fixture secret. Sessions are closed before each restart: crash recovery with a
+live in-flight session is not asserted. Both source and installed-package jobs
+retain `mcp-persistence.log` alongside the discovery log.
+
 ## Installed-platform acceptance
 
 The release workflow's `installed Debian X11 qualification` job downloads the
@@ -58,8 +67,7 @@ hashes, OS and Xorg package versions, run/attempt, full harness result, and MCP
 scenario log. A failed or absent job is not installed-package acceptance.
 This exercises Ubuntu 24.04 x86_64 with dummy Xorg and kernel uinput. It does not
 qualify RPM installation, ARM hardware, graphical-login autostart, native
-Windows/macOS, container isolation, or every manual case below (notably daemon
-restart persistence). Retain these distinctions in the acceptance report.
+Windows/macOS, container isolation, or every manual case below. Retain these distinctions in the acceptance report.
 
 Use a disposable OS account and fixture credentials only. Install the candidate
 package through its documented installer. Record package checksum, source SHA,
