@@ -4,6 +4,7 @@
 #   bash ci/display/run.sh x11
 #   bash ci/display/run.sh x11 inject-lands
 #   bash ci/display/run.sh wayland
+#   bash ci/display/run.sh --installed x11
 #
 # X11 physical input is a kernel uinput pointer and keyboard. Xorg's dummy
 # video driver plus libinput (or the evdev driver on those same nodes) exposes
@@ -79,8 +80,18 @@ if [[ -z ${XDG_RUNTIME_DIR:-} ]]; then
   export XDG_RUNTIME_DIR=$HARNESS_XDG
   HARNESS_ROOTS+=("$HARNESS_XDG")
 fi
-VISOR_BIN=$root/target/debug/hypermesh-visor
-COMPANION_BIN=$root/target/debug/hypermesh-companion
+BINARY_MODE=source
+if [[ ${1:-} == --installed ]]; then
+  BINARY_MODE=installed
+  shift
+fi
+if [[ $BINARY_MODE == installed ]]; then
+  VISOR_BIN=/usr/bin/hypermesh-visor
+  COMPANION_BIN=/usr/bin/hypermesh-companion
+else
+  VISOR_BIN=$root/target/debug/hypermesh-visor
+  COMPANION_BIN=$root/target/debug/hypermesh-companion
+fi
 # Cross-scenario process state. Scenario bodies run in subshells, so a shell
 # variable set there never reaches the parent or the next scenario.
 PROC=$STATE/procs
@@ -1739,9 +1750,13 @@ probe_physical_move() {
 }
 
 build_bins() {
-  cargo build --locked --workspace --bins
-  [[ -x $VISOR_BIN ]] || die "visor binary missing after cargo build"
-  [[ -x $COMPANION_BIN ]] || die "companion binary missing after cargo build"
+  if [[ $BINARY_MODE == source ]]; then
+    cargo build --locked --workspace --bins
+  fi
+  [[ -x $VISOR_BIN ]] || die "visor binary missing ($BINARY_MODE mode)"
+  [[ -x $COMPANION_BIN ]] || die "companion binary missing ($BINARY_MODE mode)"
+  echo "display binaries: $BINARY_MODE $VISOR_BIN $COMPANION_BIN"
+  sha256sum "$VISOR_BIN" "$COMPANION_BIN"
 }
 
 start_socket_helper() {
@@ -2803,7 +2818,7 @@ run_wayland() {
 }
 
 usage() {
-  echo "usage: bash ci/display/run.sh x11 [scenario] | wayland [scenario]" >&2
+  echo "usage: bash ci/display/run.sh [--installed] x11 [scenario] | wayland [scenario]" >&2
   exit 2
 }
 
