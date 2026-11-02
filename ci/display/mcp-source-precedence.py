@@ -72,7 +72,7 @@ try:
             'excluded': definition('selected-excluded')}}))
         profile_data = {'active': 'default', 'profiles': {
             'default': {'servers': []}, profile: {
-                'servers': ['duplicate', 'disabled', 'selected_only', 'ambient'],
+                'servers': ['duplicate', 'disabled', 'selected_only'],
                 'config': {
                     'duplicate': {'command': sys.executable, 'cwd': str(override_cwd),
                                   'env.PRIVATE_TEST_VALUE': 'MCP_PROFILE_OVERRIDE_PRIVATE_SENTINEL'},
@@ -126,6 +126,12 @@ try:
         # A named profile member does not authorize scanning the daemon cwd.
         request(True, 'POST', '/mcp/trust', {'action': 'revoke', 'profile': profile}, 204)
         approved = False
+        profile_data['profiles'][profile]['servers'] = ['duplicate', 'disabled', 'ambient']
+        profiles.write_text(json.dumps(profile_data))
+        request(True, 'POST', '/mcp/discovery', {'profile': profile}, 502)
+        assert not markers['ambient-unselected'].exists(), 'unknown member caused execution'
+        profile_data['profiles'][profile]['servers'] = ['duplicate', 'disabled']
+        profiles.write_text(json.dumps(profile_data))
         unselected = request(True, 'POST', '/mcp/discovery', {'profile': profile})
         assert {(s['source'], s['name']) for s in unselected['servers']} == {
             ('user', 'duplicate'), ('user', 'disabled')}, 'unselected project imported'
