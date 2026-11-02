@@ -46,6 +46,21 @@ The real X11 fixture tests:
 
 ## Installed-platform acceptance
 
+The release workflow's `installed Debian X11 qualification` job downloads the
+packages from the same workflow run, checks their SHA-256 manifest, installs the
+x86_64 Debian package with apt, and verifies installed package files. It runs the
+full X11 harness with `bash ci/display/run.sh --installed x11`. This mode uses
+only `/usr/bin/hypermesh-visor` and `/usr/bin/hypermesh-companion`; it never builds
+or falls back to checkout binaries. Tag publication waits for this job.
+
+The `installed-x11-<sha>` artifact records the candidate/package and executable
+hashes, OS and Xorg package versions, run/attempt, full harness result, and MCP
+scenario log. A failed or absent job is not installed-package acceptance.
+This exercises Ubuntu 24.04 x86_64 with dummy Xorg and kernel uinput. It does not
+qualify RPM installation, ARM hardware, graphical-login autostart, native
+Windows/macOS, container isolation, or every manual case below (notably daemon
+restart persistence). Retain these distinctions in the acceptance report.
+
 Use a disposable OS account and fixture credentials only. Install the candidate
 package through its documented installer. Record package checksum, source SHA,
 OS/build, desktop/compositor, application version, and enabled permissions. First
