@@ -30,6 +30,11 @@ CI candidate qualification, not release publication or complete #29 acceptance.
 
 ## Platform gates
 
+The [2026-11-02 readiness observations](qualification/2026-11-02-platform-readiness.md)
+confirm access to assigned Windows/Apple Silicon hosts and a Linux container
+engine. The remaining blockers are native runtime and container implementation;
+host availability does not qualify those gates.
+
 | Platform | Discovery source enumeration | Identity/trust/lifecycle in a shipped runtime | Owner/dependency |
 | --- | --- | --- | --- |
 | Linux X11 | Native fixture tests | Installed Debian packages pass on native hosted x86_64/ARM64: discovery, matching, lifecycle, binding recovery and restart persistence. See the recorded evidence; RPM, physical hardware, login autostart and remaining manual cases are not qualified | #29 |
