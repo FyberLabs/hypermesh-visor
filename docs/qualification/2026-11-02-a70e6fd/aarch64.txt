@@ -1,0 +1,26 @@
+revision=a70e6fdbd7b9f7c737fbdf911b6a09c8a2ce56dd
+run=https://github.com/FyberLabs/hypermesh-visor/actions/runs/41549877673 attempt=1
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+aarch64
+hypermesh-visor	0.1.0~ci.a70e6fdbd7b9-1
+xserver-xorg-core	2:21.1.12-1ubuntu1.9
+4ac9851b161eed59c2d02e67f9f882b5e9a9df424227510d0ad17f3f7c495edc  dist/hypermesh-visor-aarch64.deb
+0fc091f5acc43b50071d9eeda9fd374b00d9cac525a8e9cf0b3073719ada2047  /usr/bin/hypermesh-visor
+0d56baf6c9f19c8dac54f658f23fe3f47a616fdb577b8eafe74f07ba0a13067e  /usr/bin/hypermesh-companion
+PASS identity same-title-rejected app-exit-clears-routing app-restart-recovers healthy-attachment-retained
+PASS bindings ordered-healthy-winner unavailable-skipped all-selectors-required no-restart-no-call
+PASS discovery trust pagination executable-match refresh disconnect reconnect no-replay binding-fallback recovery revocation
+PASS project-opt-in cwd-not-imported named-member-not-authorized previous-selection-not-retained user-still-attaches
+PASS profile-overrides command cwd environment provenance disabled-stays-disabled unchanged-source-isolated stale-profile-review-denied
+PASS source-precedence user-wins disabled-not-resurrected profile-exclusion selected-only-attaches
+PASS source-review cancel-denied changed-snapshot-denied no-start-before-attach private-values-redacted
+PASS http-subscription background-list-change event-id-resume reconnect-reconciles no-call-replay stream-closes
+PASS http trust-no-io url-header-overrides private-values-redacted reserved-headers-replaced negotiated-version pagination optional-get-405 manual-refresh
+PASS http-lifecycle denied-no-io redirect-not-followed stale-tools-cleared explicit-reconnect no-call-replay negotiated-delete-405-404
+PASS persistence unchanged-restore changed-source-denied reapproval durable-revocation private-receipt
+PASS abrupt-daemon-death in-flight-disconnect pipe-aware-child-exit
+PASS crash-restart old-session-absent no-replay explicit-new-session trust-restored
+PHYSICAL driver=libinput
+display scenarios passed
+harness listeners (cleanup): ss -ltnp has no harness TCP socket
+self-check: /dev/uinput 600 root:root unchanged and not world-writable; no harness process left
