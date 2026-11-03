@@ -118,8 +118,62 @@ func handle(_ request: [String: Any]) async throws -> [String: Any] {
     default: throw NativeError.invalid
     }
 }
+@MainActor final class SetupController: NSObject {
+    var window: NSWindow!
+    var status: NSTextField!
+    func show() {
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 600, height: 280),
+                          styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "Hypermesh Visor Development — Permissions"
+        window.isReleasedWhenClosed = false
+        let content = window.contentView!
+        let intro = NSTextField(wrappingLabelWithString: "Development helper for native desktop testing. This is not the finished Visor app. Grant only the permissions you want to test.")
+        intro.frame = NSRect(x: 24, y: 205, width: 552, height: 52)
+        content.addSubview(intro)
+        status = NSTextField(wrappingLabelWithString: "")
+        status.frame = NSRect(x: 24, y: 133, width: 552, height: 60)
+        content.addSubview(status)
+        for (index, pair) in [("Screen Recording", #selector(screen)), ("Accessibility", #selector(accessibility)), ("Input Monitoring", #selector(input))].enumerated() {
+            let button = NSButton(title: pair.0, target: self, action: pair.1)
+            button.frame = NSRect(x: 24 + index * 185, y: 85, width: 175, height: 32)
+            content.addSubview(button)
+        }
+        let refreshButton = NSButton(title: "Refresh Status", target: self, action: #selector(refresh))
+        refreshButton.frame = NSRect(x: 24, y: 30, width: 150, height: 32)
+        content.addSubview(refreshButton)
+        let quitButton = NSButton(title: "Quit", target: NSApplication.shared, action: #selector(NSApplication.terminate(_:)))
+        quitButton.frame = NSRect(x: 470, y: 30, width: 100, height: 32)
+        content.addSubview(quitButton)
+        refresh()
+        window.center(); window.makeKeyAndOrderFront(nil)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+    @objc func refresh() {
+        status.stringValue = "Screen Recording: \(CGPreflightScreenCaptureAccess() ? "allowed" : "not allowed")\nAccessibility: \(CGPreflightPostEventAccess() ? "allowed" : "not allowed")\nInput Monitoring: \(CGPreflightListenEventAccess() ? "allowed" : "not allowed")"
+    }
+    func settings(_ pane: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?" + pane) {
+            NSWorkspace.shared.open(url)
+        }
+        refresh()
+    }
+    @objc func screen() { _ = CGRequestScreenCaptureAccess(); settings("Privacy_ScreenCapture") }
+    @objc func accessibility() { _ = CGRequestPostEventAccess(); settings("Privacy_Accessibility") }
+    @objc func input() { _ = CGRequestListenEventAccess(); settings("Privacy_ListenEvent") }
+}
+@MainActor func runSetup() {
+    let app = NSApplication.shared
+    app.setActivationPolicy(.regular)
+    let controller = SetupController()
+    controller.show()
+    withExtendedLifetime(controller) { app.run() }
+}
 @main struct NativeDesktop {
-    static func main() async {
+    @MainActor static func main() async {
+        if CommandLine.arguments.contains("--setup") || (Bundle.main.bundleIdentifier == "sh.hyperme.visor.development" && isatty(STDIN_FILENO) == 0 && CommandLine.arguments.count == 1 && ProcessInfo.processInfo.environment["HYPERMESH_NATIVE_BRIDGE"] != "1") {
+            runSetup()
+            return
+        }
         if CommandLine.arguments.contains("--permissions") {
             _ = CGRequestScreenCaptureAccess(); _ = CGRequestPostEventAccess(); _ = CGRequestListenEventAccess()
             return

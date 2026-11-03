@@ -14,6 +14,25 @@ TMPDIR=/tmp cargo test --locked --workspace
 printf '{"action":"info"}\n' | target/debug/hypermesh-native-desktop
 ```
 
+For a visible, installed permission setup app, run:
+
+```sh
+bash native/macos/install-development.sh
+```
+
+This installs `~/Applications/Hypermesh Visor Development.app` and opens its
+permission setup window. Use its buttons to request Screen Recording,
+Accessibility and Input Monitoring, then refresh status. It uses local ad-hoc
+signing only, not Developer ID signing or notarization. The installer refuses to
+overwrite an existing bundle. Replacing the development executable can require
+permissions to be granted again. To uninstall, quit the development app and remove
+that bundle; revoke its entries in System Settings if desired.
+
+The installed app is the permission/test helper only, not the finished companion.
+For JSON-line bridge use of its executable, set `HYPERMESH_NATIVE_BRIDGE=1`;
+normal app launch opens setup. Granting permissions to this bundle does not prove
+that a different temporary executable or the future packaged app has permission.
+
 The daemon finds the helper beside its executable. It uses ScreenCaptureKit for
 screenshots, tagged CoreGraphics events for input, and native process identity.
 The helper requires the relevant OS permissions; it does not bypass denial.
