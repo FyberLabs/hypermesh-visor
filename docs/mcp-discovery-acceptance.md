@@ -11,6 +11,13 @@ the dependent native backends or container deployment as implemented.
 
 ## Recorded qualification
 
+The [consolidated candidate record](qualification/2026-11-02-a70e6fd/README.md)
+retains inspected native x86_64/ARM64 package evidence for source selection,
+identity/precedence, profile overrides, HTTP/SSE lifecycle, durable trust and
+in-flight crash recovery. Its full candidate/package hashes and sanitized PASS
+excerpts are immutable evidence; its acceptance disposition remains blocked on
+the native runtime/container gates below.
+
 The [2026-11-02 merged-candidate record](qualification/2026-11-02-b08fffa/README.md)
 contains inspected post-merge evidence for native x86_64 and ARM64 Debian/X11
 packages at `b08fffabe0fd5ccf359085af56d9aa06501d33c6`, with package/executable
@@ -29,6 +36,11 @@ CI candidate qualification, not release publication or complete #29 acceptance.
 | Ambiguity, unavailable servers, untrusted projects, restarts, fallback, secret-safe diagnostics | binding/config/trust suites; API trust and stale-focus tests; stdio/HTTP lost-reply tests; live no-replay and invalid-binding fallback | Same workflow on native platforms and chosen isolated container desktop |
 
 ## Platform gates
+
+The [2026-11-02 readiness observations](qualification/2026-11-02-platform-readiness.md)
+confirm access to assigned Windows/Apple Silicon hosts and a Linux container
+engine. The remaining blockers are native runtime and container implementation;
+host availability does not qualify those gates.
 
 | Platform | Discovery source enumeration | Identity/trust/lifecycle in a shipped runtime | Owner/dependency |
 | --- | --- | --- | --- |

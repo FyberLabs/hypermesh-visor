@@ -92,10 +92,35 @@ attachment of only the user source. After revoking the explicit grant, a new
 review without a path must also drop the previous selection while still attaching
 the user source. The daemon cwd and fixture are in harness-owned runtime storage; this does not
 qualify every editor workspace layout.
-The cwd contains a space; argument-string parsing and HTTP header/URL overrides
-are not qualified by these cases. Source and installed-package
+The cwd contains a space; argument-string parsing is not qualified by these cases. HTTP header/URL
+overrides are exercised separately below. Source and installed-package
 jobs retain `mcp-source-precedence.log`. This does not qualify arbitrary editor
 layer inheritance, remote endpoints, or all profile override types.
+
+The `mcp-http` scenario serves an ephemeral loopback-only HTTP endpoint for the
+real daemon. Preview and approval must produce no HTTP traffic. The endpoint
+verifies effective URL/Authorization overrides, preserved base headers, replacement
+of configured connection-owned headers, negotiated protocol/session headers,
+paginated tools, and manual refresh after optional GET returns 405. It rejects
+any request to the base URL or redirect target. A tool redirect must fail without
+following it, clear stale tools, and require explicit reconnect without replay.
+The fixture observes negotiated-session DELETE on replacement and closure, with
+405/404 responses; local closure must still succeed. API responses are scanned
+for the private header/path sentinel. The listener is closed before the scenario
+returns. A third session serves a real SSE subscription, changes its catalog,
+closes the first stream, and requires a resumed GET with the observed event ID.
+The daemon must refresh tools in the background, reconcile after reconnection,
+keep the same MCP session, avoid replaying a tool call, and close the resumed
+stream on session deletion. The resumed stream stays open after DELETE: only
+observed client EOF/reset satisfies cleanup, within 20 seconds covering the
+existing 15-second HTTP read deadline. Fixture teardown is a separate signal and
+cannot satisfy the closure assertion. Both source and installed jobs retain
+`mcp-http.log`. The fixture regression keeps its client open after DELETE to
+verify this negative case, then verifies genuine disconnect and teardown separately.
+
+This qualifies local HTTP interoperability, not TLS, external providers, or guaranteed remote cleanup under queue saturation or
+network failure. HTTP DELETE remains best effort; a server response does not
+prove remote resources were destroyed.
 
 ## Installed-platform acceptance
 
