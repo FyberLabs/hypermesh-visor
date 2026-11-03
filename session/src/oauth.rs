@@ -443,7 +443,13 @@ pub fn accept_callback(
         }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                // BSD accepts inherit O_NONBLOCK; request I/O needs bounded blocking.
+                stream.set_nonblocking(false)
+                    .map_err(|err| AuthError::message(err.to_string()))?;
+                stream.set_read_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|err| AuthError::message(err.to_string()))?;
+                stream.set_write_timeout(Some(Duration::from_secs(5)))
+                    .map_err(|err| AuthError::message(err.to_string()))?;
                 let request = read_http(&mut stream).unwrap_or_default();
                 let path = request_path(&request);
                 if !path.starts_with("/callback") {
@@ -717,6 +723,33 @@ mod tests {
         let err = server.join().unwrap().unwrap_err();
         assert!(matches!(err, AuthError::StateMismatch));
         assert!(uri.contains("/callback"));
+    }
+
+    #[test]
+    fn loopback_waits_for_delayed_and_fragmented_callback_headers() {
+        let (listener, _) = bind_loopback().unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            accept_callback(listener, "expected", Duration::from_secs(5))
+        });
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+        client.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut byte = [0];
+        // Neither an idle accepted socket nor a partial header is a 404 request.
+        for fragment in [b"".as_slice(), b"GET /callback?code=private-code&state=wrong HTTP/1.1\r\n"] {
+            client.write_all(fragment).unwrap();
+            let error = client.read(&mut byte).expect_err("server replied before complete headers");
+            assert!(matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut));
+        }
+        client.write_all(b"Host: localhost\r\nConnection: close\r\n\r\n").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 400 "));
+        assert!(response.contains("state did not match"));
+        assert!(!response.contains("private-code"));
+        assert!(matches!(server.join().unwrap(), Err(AuthError::StateMismatch)));
     }
 
     #[test]
