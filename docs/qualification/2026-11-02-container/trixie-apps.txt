@@ -1,0 +1,4 @@
+PASS terminal typed-through-visor
+PASS editor typed-and-saved-through-visor
+PASS browser typed-and-submitted-through-visor
+PASS screenshot real-private-desktop
