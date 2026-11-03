@@ -117,8 +117,9 @@ def main(runtime, config, scratch):
     def until(predicate, description):
         deadline = time.monotonic() + 8
         while time.monotonic() < deadline:
-            if predicate():
-                return
+            result = predicate()
+            if result:
+                return result
             time.sleep(0.05)
         current = status() or {}
         diagnostic = {"session_matches": current.get("id") == sid,
@@ -161,10 +162,13 @@ def main(runtime, config, scratch):
             endpoint = f"/session/{sid}/mcp"
             catalog = request(control, "GET", endpoint)
             assert [tool["name"] for tool in catalog["servers"][0]["tools"]] == ["ping", "crash"]
-            until(lambda: status()["prefer_mcp"] is True, "real executable identity did not select MCP")
-            matched = status()
-            assert matched["mcp_match"]["reason"] == "matched"
-            assert matched["focused"]["executable"] == str(Path(sys.executable).resolve())
+            def initial_match():
+                current = status()
+                if (current["prefer_mcp"] is True and current["mcp_match"]["reason"] == "matched"
+                        and (current.get("focused") or {}).get("executable") == str(Path(sys.executable).resolve())):
+                    return current
+                return None
+            matched = until(initial_match, "real executable identity did not select MCP")
             assert "MCP_DISCOVERY_PRIVATE_SENTINEL" not in json.dumps(matched)
             # Same title, different executable: title alone must not retain MCP routing.
             xmessage = shutil.which("xmessage")
