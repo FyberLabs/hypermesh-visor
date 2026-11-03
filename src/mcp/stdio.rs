@@ -31,7 +31,11 @@ pub struct ToolInfo {
 
 impl ToolInfo {
     fn supports_direct_call(&self) -> bool {
-        self.execution.as_ref().and_then(|v| v.get("taskSupport")).and_then(Value::as_str) != Some("required")
+        self.execution
+            .as_ref()
+            .and_then(|v| v.get("taskSupport"))
+            .and_then(Value::as_str)
+            != Some("required")
     }
 }
 
@@ -154,7 +158,7 @@ pub struct AttachedServer {
     pub name: String,
     pub transport: String,
     pub tools: Vec<ToolInfo>,
-    child: Option<Child>,
+    child: Option<Mutex<Child>>,
     client: Option<StdioClient>,
     http: Option<HttpClient>,
     spec: ServerSpec,
@@ -202,7 +206,8 @@ impl Drop for AttachedServer {
     fn drop(&mut self) {
         self.client.take();
         self.http.take();
-        if let Some(mut child) = self.child.take() {
+        if let Some(child) = self.child.take() {
+            let mut child = child.into_inner().unwrap_or_else(|e| e.into_inner());
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -230,13 +235,25 @@ impl AttachedServer {
     }
 
     pub fn routing_status(&self) -> RoutingStatus {
-        if self.refreshing { return RoutingStatus::Refreshing; }
-        if !self.connection_alive() || self.changes().is_some_and(|c| c.failed.load(Ordering::Acquire)) {
+        if self.refreshing {
+            return RoutingStatus::Refreshing;
+        }
+        if !self.connection_alive()
+            || self
+                .changes()
+                .is_some_and(|c| c.failed.load(Ordering::Acquire))
+        {
             return RoutingStatus::Disconnected;
         }
-        if self.needs_refresh() { return RoutingStatus::CatalogStale; }
-        if self.tools.is_empty() { return RoutingStatus::NoTools; }
-        if !self.tools.iter().any(ToolInfo::supports_direct_call) { return RoutingStatus::TaskRequired; }
+        if self.needs_refresh() {
+            return RoutingStatus::CatalogStale;
+        }
+        if self.tools.is_empty() {
+            return RoutingStatus::NoTools;
+        }
+        if !self.tools.iter().any(ToolInfo::supports_direct_call) {
+            return RoutingStatus::TaskRequired;
+        }
         RoutingStatus::Ready
     }
 
@@ -253,15 +270,12 @@ impl AttachedServer {
                 let Some(child) = self.child.as_ref() else {
                     return false;
                 };
-                let pid = child.id() as i32;
-                // kill(pid, 0) also succeeds for zombies. Do not advertise them.
-                std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                // Query/reap our owned child instead of relying on Linux /proc.
+                // A poisoned lock or OS error is an unavailable attachment.
+                child
+                    .lock()
                     .ok()
-                    .and_then(|stat| {
-                        stat.rsplit_once(')')
-                            .map(|(_, rest)| rest.trim_start().starts_with('Z'))
-                    })
-                    .is_some_and(|zombie| !zombie)
+                    .is_some_and(|mut child| matches!(child.try_wait(), Ok(None)))
             }
             "http" | "sse" => self.http.is_some(),
             _ => false,
@@ -272,7 +286,8 @@ impl AttachedServer {
         self.tools.clear();
         self.client.take();
         self.http.take();
-        if let Some(mut child) = self.child.take() {
+        if let Some(child) = self.child.take() {
+            let mut child = child.into_inner().unwrap_or_else(|e| e.into_inner());
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -344,8 +359,14 @@ impl AttachedServer {
                 "MCP catalog invalidated; wait for refresh or reconnect",
             ));
         }
-        if self.tools.iter().any(|info| info.name == tool && !info.supports_direct_call()) {
-            return Err(McpError::message("MCP tool requires task execution, which is not supported"));
+        if self
+            .tools
+            .iter()
+            .any(|info| info.name == tool && !info.supports_direct_call())
+        {
+            return Err(McpError::message(
+                "MCP tool requires task execution, which is not supported",
+            ));
         }
         let response = self.request("tools/call", json!({"name":tool,"arguments":arguments}))?;
         if response.get("error").is_some() {
@@ -538,7 +559,7 @@ fn attach_stdio(name: &str, spec: &ServerSpec) -> Result<AttachedServer, McpErro
         name: name.to_string(),
         transport: "stdio".into(),
         tools,
-        child: Some(child),
+        child: Some(Mutex::new(child)),
         negotiated: client.negotiated.clone(),
         client: Some(client),
         http: None,
@@ -730,7 +751,15 @@ while True:
 
     #[test]
     fn malformed_stdio_envelopes_fail_initialization_discovery_and_calls() {
-        for stage in ["initialize", "tools/list", "tools/call", "refresh", "valid-error", "server-info", "capabilities"] {
+        for stage in [
+            "initialize",
+            "tools/list",
+            "tools/call",
+            "refresh",
+            "valid-error",
+            "server-info",
+            "capabilities",
+        ] {
             let script = r#"
 import sys,json
 stage = 'STAGE'
@@ -749,11 +778,20 @@ for line in sys.stdin:
  print(json.dumps(response),flush=True)
 "#.replace("STAGE", stage);
             let attached = attach_one("fixture", &python_spec(&script));
-            if stage == "initialize" || stage == "tools/list" || stage == "server-info" || stage == "capabilities" {
+            if stage == "initialize"
+                || stage == "tools/list"
+                || stage == "server-info"
+                || stage == "capabilities"
+            {
                 assert!(attached.is_err());
             } else {
                 let mut server = attached.unwrap();
-                let error = if stage == "refresh" { server.refresh(false).unwrap_err() } else { server.call_tool("ping", json!({})).unwrap_err() }.to_string();
+                let error = if stage == "refresh" {
+                    server.refresh(false).unwrap_err()
+                } else {
+                    server.call_tool("ping", json!({})).unwrap_err()
+                }
+                .to_string();
                 assert!(!error.contains("private"));
                 assert_eq!(server.is_healthy(), stage == "valid-error");
                 assert_eq!(server.tools.is_empty(), stage != "valid-error");
@@ -774,7 +812,10 @@ for line in sys.stdin:
         );
         let mut server = attach_one("empty", &spec).unwrap();
         server.refresh(false).unwrap();
-        assert_eq!(server.negotiated.as_ref().unwrap().server_capabilities, json!({"resources":{"subscribe":true},"prompts":{},"tasks":{"list":{}}}));
+        assert_eq!(
+            server.negotiated.as_ref().unwrap().server_capabilities,
+            json!({"resources":{"subscribe":true},"prompts":{},"tasks":{"list":{}}})
+        );
         assert!(server.tools.is_empty());
         assert!(!server.needs_refresh());
         assert!(!server.is_healthy());
@@ -782,7 +823,8 @@ for line in sys.stdin:
 
     #[test]
     fn malformed_notifications_and_ping_params_do_not_stale_stdio_catalog() {
-        let spec = python_spec(r#"
+        let spec = python_spec(
+            r#"
 import sys,json
 for line in sys.stdin:
  m=json.loads(line)
@@ -800,7 +842,8 @@ for line in sys.stdin:
   assert reply['id']=='valid-ping' and reply['result']=={}
   result={'tools':[{'name':'a'}]}
  print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':result}),flush=True)
-"#);
+"#,
+        );
         let server = attach_one("fixture", &spec).unwrap();
         assert!(!server.needs_refresh());
         assert!(server.is_healthy());
@@ -934,12 +977,31 @@ for line in sys.stdin:
         assert_eq!(server.tools[1].name, "new-b");
         assert_eq!(server.routing_status(), RoutingStatus::Ready);
         assert_eq!(server.negotiated.as_ref().unwrap().version, "2024-11-05");
-        assert_eq!(server.negotiated.as_ref().unwrap().server_info.as_ref().unwrap()["version"], "old");
-        assert_eq!(server.negotiated.as_ref().unwrap().server_capabilities["resources"]["subscribe"], false);
-        assert_eq!(server.tools[1].input_schema.as_ref().unwrap()["properties"], json!({"new":{"type":"string"}}));
+        assert_eq!(
+            server
+                .negotiated
+                .as_ref()
+                .unwrap()
+                .server_info
+                .as_ref()
+                .unwrap()["version"],
+            "old"
+        );
+        assert_eq!(
+            server.negotiated.as_ref().unwrap().server_capabilities["resources"]["subscribe"],
+            false
+        );
+        assert_eq!(
+            server.tools[1].input_schema.as_ref().unwrap()["properties"],
+            json!({"new":{"type":"string"}})
+        );
         fs::write(&version, "required").unwrap();
         server.refresh(false).unwrap();
-        assert!(server.call_tool("required-a", json!({})).unwrap_err().to_string().contains("requires task execution"));
+        assert!(server
+            .call_tool("required-a", json!({}))
+            .unwrap_err()
+            .to_string()
+            .contains("requires task execution"));
         assert!(server.is_healthy());
         assert!(!calls.exists(), "task-required call reached the child");
         assert_eq!(server.routing_status(), RoutingStatus::TaskRequired);
@@ -949,8 +1011,20 @@ for line in sys.stdin:
         assert!(!server.is_healthy());
         assert_eq!(server.routing_status(), RoutingStatus::Disconnected);
         assert_eq!(server.negotiated.as_ref().unwrap().version, "2024-11-05");
-        assert_eq!(server.negotiated.as_ref().unwrap().server_info.as_ref().unwrap()["version"], "old");
-        assert_eq!(server.negotiated.as_ref().unwrap().server_capabilities["resources"]["subscribe"], false);
+        assert_eq!(
+            server
+                .negotiated
+                .as_ref()
+                .unwrap()
+                .server_info
+                .as_ref()
+                .unwrap()["version"],
+            "old"
+        );
+        assert_eq!(
+            server.negotiated.as_ref().unwrap().server_capabilities["resources"]["subscribe"],
+            false
+        );
         fs::write(&version, "new").unwrap();
         server.refresh(true).unwrap();
         fs::write(&version, "fail").unwrap();
@@ -961,8 +1035,20 @@ for line in sys.stdin:
         fs::write(&version, "again").unwrap();
         server.refresh(true).unwrap();
         assert_eq!(server.tools[0].name, "again-a");
-        assert_eq!(server.negotiated.as_ref().unwrap().server_info.as_ref().unwrap()["version"], "again");
-        assert_eq!(server.negotiated.as_ref().unwrap().server_capabilities["resources"]["subscribe"], true);
+        assert_eq!(
+            server
+                .negotiated
+                .as_ref()
+                .unwrap()
+                .server_info
+                .as_ref()
+                .unwrap()["version"],
+            "again"
+        );
+        assert_eq!(
+            server.negotiated.as_ref().unwrap().server_capabilities["resources"]["subscribe"],
+            true
+        );
         assert!(server.call_tool("again-a", json!({})).is_err());
         assert!(!server.is_healthy());
         assert_eq!(fs::read_to_string(&calls).unwrap(), "once\n");

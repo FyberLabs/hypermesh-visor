@@ -1,20 +1,22 @@
 //! Linux desktop companion. A bug on the desktop.
 //! Sign-in stores a refresh token in the system keychain, not in the visor vault.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("the desktop companion is Linux only");
 
 mod auth;
 mod automation;
 mod credentials;
 mod draw;
+#[path = "../../src/local_peer.rs"]
+mod local_peer;
 mod mascot;
-mod mcp_trust;
-mod mcp_profiles;
+mod mcp_connections;
 mod mcp_dialog;
+mod mcp_profiles;
 mod mcp_servers;
 mod mcp_status;
-mod mcp_connections;
+mod mcp_trust;
 mod mcp_trust_gui;
 mod pages;
 mod pointer;
@@ -46,11 +48,17 @@ fn main() -> ExitCode {
         },
         Some("--mcp-connections") => match mcp_connections::run() {
             Ok(()) => ExitCode::SUCCESS,
-            Err(err) => { eprintln!("MCP connections: {err}"); ExitCode::from(1) }
+            Err(err) => {
+                eprintln!("MCP connections: {err}");
+                ExitCode::from(1)
+            }
         },
         Some("--mcp-status") => match mcp_status::run() {
             Ok(()) => ExitCode::SUCCESS,
-            Err(err) => { eprintln!("MCP status: {err}"); ExitCode::from(1) }
+            Err(err) => {
+                eprintln!("MCP status: {err}");
+                ExitCode::from(1)
+            }
         },
         Some("--mcp-servers") => match mcp_servers::run() {
             Ok(()) => ExitCode::SUCCESS,

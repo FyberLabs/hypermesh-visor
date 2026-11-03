@@ -15,7 +15,17 @@ macro_rules! accept_bounded {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             match $listener.accept() {
-                Ok(pair) => break pair,
+                Ok(pair) => {
+                    // BSD sockets inherit O_NONBLOCK from the listener.
+                    pair.0.set_nonblocking(false).unwrap();
+                    pair.0
+                        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    pair.0
+                        .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                        .unwrap();
+                    break pair;
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     assert!(
                         std::time::Instant::now() < deadline,

@@ -54,7 +54,11 @@ fn main() -> ExitCode {
             }
         }
     } else {
-        Arc::new(LinuxDesktop::from_process())
+        #[cfg(target_os = "linux")]
+        let desktop = LinuxDesktop::from_process();
+        #[cfg(target_os = "macos")]
+        let desktop = hypermesh_visor::MacDesktop;
+        Arc::new(desktop)
     };
     let config = DoorConfig {
         default_model: resolve_default_model(
