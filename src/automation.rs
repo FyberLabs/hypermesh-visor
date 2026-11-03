@@ -1554,11 +1554,11 @@ mod tests {
         let id = Uuid::new_v4();
         let timeout = Duration::from_millis(100);
         gate.control(Some(id), Control::Start).unwrap();
-        std::thread::sleep(Duration::from_millis(40));
-        let polled = Instant::now();
+        // Exercise the watchdog clock without depending on scheduler latency.
+        let polled = gate.trusted_at.unwrap() + Duration::from_millis(40);
         assert!(!gate.note_poll(polled, timeout));
-        std::thread::sleep(Duration::from_millis(40));
         gate.control(Some(id), Control::Start).unwrap();
+        assert_eq!(gate.trusted_at, Some(polled));
         gate.watchdog(polled + Duration::from_millis(90), timeout);
         assert_eq!(gate.phase(), Phase::Running);
         gate.watchdog(polled + timeout, timeout);

@@ -392,6 +392,8 @@ mod tests {
         loop {
             match listener.accept() {
                 Ok((stream, _)) => {
+                    // BSD accepts inherit the listener nonblocking flag.
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -954,6 +956,7 @@ mod tests {
                     }
                     Err(e) => panic!("{e}"),
                 };
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
