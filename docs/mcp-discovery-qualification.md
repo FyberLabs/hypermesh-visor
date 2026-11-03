@@ -111,7 +111,12 @@ returns. A third session serves a real SSE subscription, changes its catalog,
 closes the first stream, and requires a resumed GET with the observed event ID.
 The daemon must refresh tools in the background, reconcile after reconnection,
 keep the same MCP session, avoid replaying a tool call, and close the resumed
-stream on session deletion. Both source and installed jobs retain `mcp-http.log`.
+stream on session deletion. The resumed stream stays open after DELETE: only
+observed client EOF/reset satisfies cleanup, within 20 seconds covering the
+existing 15-second HTTP read deadline. Fixture teardown is a separate signal and
+cannot satisfy the closure assertion. Both source and installed jobs retain
+`mcp-http.log`. The fixture regression keeps its client open after DELETE to
+verify this negative case, then verifies genuine disconnect and teardown separately.
 
 This qualifies local HTTP interoperability, not TLS, external providers, or guaranteed remote cleanup under queue saturation or
 network failure. HTTP DELETE remains best effort; a server response does not

@@ -34,7 +34,7 @@ also passed.
 | Identity and precedence | PASS: exact executable, same-title collision refusal, app exit/restart, ordered healthy bindings, unavailable target skipped, all selectors required |
 | Stdio lifecycle | PASS: pagination, refresh, failed-call fallback, explicit reconnect without replay, invalid-binding recovery, revocation behavior |
 | HTTP lifecycle | PASS: negotiated version/session headers, connection-owned header replacement, pagination, GET 405/manual refresh, denied-call isolation, redirect refusal, stale catalog clearing, explicit reconnect, no replay, DELETE cleanup with 405/404 responses |
-| HTTP subscriptions | PASS: background list-change refresh, GET resumption with event ID, reconciliation without reinitialization or call replay, stream closure |
+| HTTP subscriptions | PASS: background list-change refresh, GET resumption with event ID, reconciliation without reinitialization or call replay; stream closure was not independently established (see correction below) |
 | Durable trust | PASS: unchanged restoration, changed-source denial, reapproval, revocation across real daemon restarts, private receipt |
 | In-flight daemon crash | PASS: failed delivery, pipe-aware child exit, old session absent after restart, explicit new session, restored trust, no replay |
 | Whole harness and cleanup | PASS: all display scenarios, cross-user denial, physical-input pause through uinput, no remaining harness processes/listeners, unchanged `600 root:root` device permissions |
@@ -43,6 +43,16 @@ HTTP results use an ephemeral loopback fixture, not TLS or an external provider.
 DELETE is best effort; observing it does not prove remote resource destruction.
 Crash cleanup covers a pipe-aware child, not uncooperative/detached descendants.
 X11 identity remains a local routing hint, not authenticated app attestation.
+
+## Stream-closure evidence correction
+
+PR #83 review found that this candidate's fixture ended its own SSE response
+when DELETE arrived. Its retained `stream-closes` PASS text therefore does not
+prove client disconnection. Other assertions are unchanged. The corrected
+fixture holds the resumed stream open after DELETE and requires client EOF/reset
+within 20 seconds, independently of teardown. The corrected scenario passed
+against the real daemon in the isolated local desktop container; new installed
+CI evidence must come from the corrected candidate rather than these old logs.
 
 ## Acceptance disposition
 
