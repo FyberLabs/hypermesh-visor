@@ -1,5 +1,11 @@
 # Assigned Mac native helper qualification
 
+**Superseded for runtime acceptance:** PR #86 security review identified that
+the tested LaunchServices bridge accepted unauthenticated callers. That entry
+point is now disabled. These historical results establish event/capture behavior
+only, not a secure automation channel. The old driver is retained as evidence
+and now refuses execution; do not re-enable the bridge to rerun it.
+
 On 2026-11-02 (America/New_York), tested the installed development helper from
 commit `594c8db` on MACMINI-1, Apple Silicon, macOS 27.2. The user enabled Screen
 Recording, Accessibility and Input Monitoring for the installed app. The helper

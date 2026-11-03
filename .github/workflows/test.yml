@@ -54,6 +54,10 @@ jobs:
         run: |
           mkdir -p target/debug
           swiftc -parse-as-library -O native/macos/Desktop.swift -o target/debug/hypermesh-native-desktop
+      - name: Native event mapping and unauthenticated bridge refusal
+        run: |
+          target/debug/hypermesh-native-desktop --self-test
+          python3 native/macos/test-bridge-refusal.py target/debug/hypermesh-native-desktop
       - name: Native workspace tests
         env:
           TMPDIR: /tmp

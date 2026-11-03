@@ -28,25 +28,34 @@ overwrite an existing bundle. Replacing the development executable can require
 permissions to be granted again. To uninstall, quit the development app and remove
 that bundle; revoke its entries in System Settings if desired.
 
-The installed app is the permission/test helper only, not the finished companion.
-For JSON-line bridge use of its executable, set `HYPERMESH_NATIVE_BRIDGE=1`;
-normal app launch opens setup. Granting permissions to this bundle does not prove
-that a different temporary executable or the future packaged app has permission.
+The installed app is a permission setup app only, not the finished companion.
+**Desktop bridge invocation is disabled**, including `--bridge`, arbitrary
+arguments and the old `HYPERMESH_NATIVE_BRIDGE` environment switch. Granting TCC
+permissions to an app must not turn it into an automation deputy for any process
+that can invoke `open --stdin/--stdout`. An authenticated daemon-owned channel
+is required before capture or input is enabled again. Same UID alone does not
+establish that authority. The daemon receives an unavailable error today.
 
-The daemon finds the helper beside its executable. It uses ScreenCaptureKit for
-screenshots, tagged CoreGraphics events for input, and native process identity.
-The helper requires the relevant OS permissions; it does not bypass denial.
-`--permissions` requests permissions explicitly. Input events are tagged for the
-future native companion monitor. Until that monitor exists, do not treat this
-backend as ready for unattended desktop automation. The existing companion GUI
-still uses X11; compiling it on macOS does not establish native UI support.
+The event construction code uses explicit US ANSI virtual key identities for
+modifier shortcuts; unsupported Unicode shortcuts fail rather than aliasing A.
+Unmodified Unicode text uses Unicode events. Left, right and middle drags select
+both the matching drag event type and button identity. Mapping tests construct
+events without posting input:
+
+```sh
+target/debug/hypermesh-native-desktop --self-test
+python3 native/macos/test-bridge-refusal.py target/debug/hypermesh-native-desktop
+```
+
+`--permissions` requests OS permission explicitly. Native companion monitoring
+and authenticated integration remain unfinished. The companion GUI still uses
+X11; compiling it on macOS does not establish native UI support.
 
 Local Unix socket peer authentication uses `getpeereid` on macOS. MCP process
 liveness uses owned child handles instead of Linux `/proc`. The native suite
 also accounts for BSD sockets inheriting nonblocking mode on accept.
 
-Verified on MACMINI-1 (arm64, macOS 27.2): full workspace tests and native helper
-build pass. With permissions absent, screen capture and keyboard requests return
-permission errors. The observed foreground application was loginwindow; successful
-desktop capture, real input and physical-input pause have not been qualified.
-Linux workspace regression tests also pass. Audio capture is not implemented.
+Verified on MACMINI-1: native event mapping and bridge refusal tests pass.
+The earlier direct helper qualification is historical and does not establish
+secure daemon integration; that unauthenticated entry point has been removed.
+Audio capture is not implemented.

@@ -22,7 +22,6 @@ impl Bridge {
             .map_err(unavailable)?
             .with_file_name("hypermesh-native-desktop");
         let mut child = Command::new(path)
-            .env("HYPERMESH_NATIVE_BRIDGE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

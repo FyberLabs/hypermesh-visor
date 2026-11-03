@@ -17,6 +17,12 @@ func integer(_ value: Any?) throws -> Int {
     guard let number = value as? NSNumber else { throw NativeError.invalid }
     return number.intValue
 }
+func moveEvent(point: CGPoint, buttons: Set<UInt32>) -> CGEvent? {
+    let button = [UInt32(0), 1, 2].first(where: { buttons.contains($0) })
+    let type: CGEventType = button == 0 ? .leftMouseDragged : button == 1 ? .rightMouseDragged : button == 2 ? .otherMouseDragged : .mouseMoved
+    return CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point,
+                   mouseButton: CGMouseButton(rawValue: button ?? 0)!)
+}
 func pointer(_ step: [String: Any]) throws {
     let point = CGEvent(source: nil)?.location ?? .zero
     switch step["kind"] as? String {
@@ -24,9 +30,7 @@ func pointer(_ step: [String: Any]) throws {
         let x = try integer(step["x"]), y = try integer(step["y"])
         let bounds = CGDisplayBounds(CGMainDisplayID())
         guard x >= 0, y >= 0, Double(x) < bounds.width, Double(y) < bounds.height else { throw NativeError.invalid }
-        let type: CGEventType = heldButtons.contains(0) ? .leftMouseDragged : heldButtons.contains(1) ? .rightMouseDragged : .mouseMoved
-        try post(CGEvent(mouseEventSource: source, mouseType: type,
-                         mouseCursorPosition: CGPoint(x: bounds.minX + Double(x), y: bounds.minY + Double(y)), mouseButton: .left))
+        try post(moveEvent(point: CGPoint(x: bounds.minX + Double(x), y: bounds.minY + Double(y)), buttons: heldButtons))
     case "button":
         let button = try integer(step["button"])
         guard (0...2).contains(button), let down = step["down"] as? Bool else { throw NativeError.invalid }
@@ -46,24 +50,45 @@ func pointer(_ step: [String: Any]) throws {
 let namedKeys: [UInt32: CGKeyCode] = [0xff0d:36,0xff09:48,0xff08:51,0xff1b:53,0xff51:123,0xff52:126,0xff53:124,0xff54:125,
     0xffff:117,0xff50:115,0xff57:119,0xff55:116,0xff56:121,0xffe1:56,0xffe3:59,0xffe9:58,0xffeb:55,
     0xffbe:122,0xffbf:120,0xffc0:99,0xffc1:118,0xffc2:96,0xffc3:97,0xffc4:98,0xffc5:100,0xffc6:101,0xffc7:109,0xffc8:103,0xffc9:111]
-let letterCodes: [Character: CGKeyCode] = ["a":0,"s":1,"d":2,"f":3,"h":4,"g":5,"z":6,"x":7,"c":8,"v":9,"b":11,"q":12,"w":13,"e":14,"r":15,"y":16,"t":17,"o":31,"u":32,"i":34,"p":35,"l":37,"j":38,"k":40,"n":45,"m":46]
-func key(_ stroke: [String: Any]) throws {
+let characterCodes: [Character: CGKeyCode] = ["a":0,"s":1,"d":2,"f":3,"h":4,"g":5,"z":6,"x":7,"c":8,"v":9,"b":11,"q":12,"w":13,"e":14,"r":15,"y":16,"t":17,"o":31,"u":32,"i":34,"p":35,"l":37,"j":38,"k":40,"n":45,"m":46]
+let nonletterCodes: [Character: CGKeyCode] = ["1":18,"2":19,"3":20,"4":21,"6":22,"5":23,"=":24,"9":25,"7":26,"-":27,"8":28,"0":29,
+    "]":30,"[":33,"'":39,";":41,"\\":42,",":43,"/":44,".":47,"`":50," ":49]
+let shiftedCharacters: [Character: Character] = ["!":"1","@":"2","#":"3","$":"4","%":"5","^":"6","&":"7","*":"8","(":"9",
+    ")":"0","_":"-","+":"=","{":"[","}":"]",":":";","\"":"'","|":"\\","<":",",">":".","?":"/","~":"`"]
+func physicalKey(_ text: String) throws -> (CGKeyCode, Bool) {
+    guard text.utf8.count == 1, let character = text.first else { throw NativeError.invalid }
+    if let plain = shiftedCharacters[character], let code = nonletterCodes[plain] { return (code, true) }
+    if let code = nonletterCodes[character] { return (code, false) }
+    if let lower = text.lowercased().first, let code = characterCodes[lower] {
+        return (code, text != text.lowercased())
+    }
+    throw NativeError.invalid
+}
+func keyEvent(_ stroke: [String: Any], held: Set<CGKeyCode>) throws -> (CGEvent, Set<CGKeyCode>) {
     let raw = try integer(stroke["keysym"])
     guard raw >= 0, raw <= 0x10ffffff, let down = stroke["down"] as? Bool else { throw NativeError.invalid }
     let keysym = UInt32(raw)
+    let shortcut = !held.isDisjoint(with: [55,56,58,59])
     var code: CGKeyCode
     var text: String? = nil
+    var implicitShift = false
     if let named = namedKeys[keysym] { code = named }
     else {
         let scalarValue = keysym >= 0x01000000 ? keysym & 0x00ffffff : keysym
         guard let scalar = UnicodeScalar(scalarValue), (keysym < 0xff00 || keysym >= 0x01000000) else { throw NativeError.invalid }
-        text = String(scalar)
-        code = text!.lowercased().first.flatMap { letterCodes[$0] } ?? 0
+        let character = String(scalar)
+        if shortcut {
+            // Physical shortcuts use explicit US ANSI key identities, never a Unicode fallback.
+            (code, implicitShift) = try physicalKey(character)
+        } else {
+            text = character
+            code = (try? physicalKey(character).0) ?? 0
+        }
     }
     guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { throw NativeError.unavailable }
+    let next = down ? held.union([code]) : held.subtracting([code])
     var flags: CGEventFlags = []
-    let next = down ? heldKeys.union([code]) : heldKeys.subtracting([code])
-    if next.contains(56) { flags.insert(.maskShift) }
+    if next.contains(56) || implicitShift { flags.insert(.maskShift) }
     if next.contains(59) { flags.insert(.maskControl) }
     if next.contains(58) { flags.insert(.maskAlternate) }
     if next.contains(55) { flags.insert(.maskCommand) }
@@ -72,6 +97,10 @@ func key(_ stroke: [String: Any]) throws {
         let utf16 = Array(text.utf16)
         event.keyboardSetUnicodeString(stringLength: utf16.count, unicodeString: utf16)
     }
+    return (event, next)
+}
+func key(_ stroke: [String: Any]) throws {
+    let (event, next) = try keyEvent(stroke, held: heldKeys)
     try post(event)
     heldKeys = next
 }
@@ -168,26 +197,50 @@ func handle(_ request: [String: Any]) async throws -> [String: Any] {
     controller.show()
     withExtendedLifetime(controller) { app.run() }
 }
+func selfTest() throws {
+    for (button, expected) in [(UInt32(0), CGEventType.leftMouseDragged), (1, .rightMouseDragged), (2, .otherMouseDragged)] {
+        let event = moveEvent(point: .zero, buttons: [button])!
+        precondition(event.type == expected)
+        precondition(event.getIntegerValueField(.mouseEventButtonNumber) == Int64(button))
+    }
+    precondition(moveEvent(point: .zero, buttons: [])!.type == .mouseMoved)
+    for (character, expected) in [("1",18),(" ",49),("-",27),("/",44),(";",41),("a",0)] {
+        let (event, _) = try keyEvent(["keysym":Int(character.unicodeScalars.first!.value),"down":true], held:[55])
+        precondition(event.getIntegerValueField(.keyboardEventKeycode) == expected)
+        precondition(event.flags.contains(.maskCommand))
+    }
+    let (shifted, _) = try keyEvent(["keysym":Int(Character("!").asciiValue!),"down":true], held:[55])
+    precondition(shifted.getIntegerValueField(.keyboardEventKeycode) == 18 && shifted.flags.contains(.maskShift))
+    let emoji = 0x01000000 + 0x1f642
+    let (text, _) = try keyEvent(["keysym":emoji,"down":true], held:[])
+    var count = 0
+    var chars = [UniChar](repeating:0,count:8)
+    text.keyboardGetUnicodeString(maxStringLength:8,actualStringLength:&count,unicodeString:&chars)
+    precondition(String(utf16CodeUnits:chars,count:count) == "🙂")
+    do {
+        _ = try keyEvent(["keysym":emoji,"down":true], held:[55])
+        preconditionFailure("unsupported physical shortcut accepted")
+    } catch NativeError.invalid { }
+    print("PASS native drag button identity, physical shortcuts, Unicode text, unsupported shortcut refusal")
+}
 @main struct NativeDesktop {
     @MainActor static func main() async {
-        if CommandLine.arguments.contains("--setup") || (Bundle.main.bundleIdentifier == "sh.hyperme.visor.development" && isatty(STDIN_FILENO) == 0 && CommandLine.arguments.count == 1 && ProcessInfo.processInfo.environment["HYPERMESH_NATIVE_BRIDGE"] != "1") {
+        let arguments = Array(CommandLine.arguments.dropFirst())
+        if arguments == ["--self-test"] {
+            do { try selfTest() } catch { exit(1) }
+            return
+        }
+        if arguments == ["--setup"] || (arguments.isEmpty && Bundle.main.bundleIdentifier == "sh.hyperme.visor.development") {
             runSetup()
             return
         }
-        if CommandLine.arguments.contains("--permissions") {
+        if arguments == ["--permissions"] {
             _ = CGRequestScreenCaptureAccess(); _ = CGRequestPostEventAccess(); _ = CGRequestListenEventAccess()
             return
         }
-        defer { releaseHeld() }
-        while let line = readLine() {
-            var reply: [String:Any]
-            do {
-                guard line.utf8.count <= 1024*1024, let data = line.data(using:.utf8), let request = try JSONSerialization.jsonObject(with:data) as? [String:Any] else { throw NativeError.invalid }
-                reply = ["result":try await handle(request)]
-            } catch NativeError.denied { releaseHeld(); reply = ["error":"Grant Screen Recording, Accessibility and Input Monitoring as required, then restart Visor."] }
-            catch { releaseHeld(); reply = ["error":"Native desktop operation unavailable or invalid."] }
-            let data = try! JSONSerialization.data(withJSONObject:reply,options:[.sortedKeys])
-            FileHandle.standardOutput.write(data); FileHandle.standardOutput.write(Data([10]))
-        }
+        // Never expose this TCC-authorized app as a generic stdin/stdout deputy.
+        // Restore automation only after an authenticated daemon-owned transport exists.
+        FileHandle.standardOutput.write(Data("{\"error\":\"Native automation disabled pending authenticated daemon integration.\"}\n".utf8))
+        exit(1)
     }
 }

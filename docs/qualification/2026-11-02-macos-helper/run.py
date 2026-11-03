@@ -1,3 +1,4 @@
+raise SystemExit("Historical unauthenticated bridge driver disabled; see README.md")
 import json, pathlib, subprocess, time, struct, base64
 root=pathlib.Path('/tmp/visor-native-qualification')
 app=pathlib.Path.home()/'Applications/Hypermesh Visor Development.app'
