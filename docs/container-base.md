@@ -23,7 +23,10 @@ are retained in [the qualification record](qualification/2026-11-02-container/).
 After application tests, observed writer memory was 247.1 MiB for trixie and
 134.4 MiB for bookworm, under a 2 GiB limit; CPU snapshots were 3.46% and 2.97%.
 These are single observations with different cache histories, not benchmarks.
-Readiness timings in JSON measure wait from the test starting, not cold startup.
+A separate stopped-container start-to-healthy measurement was 5.322 seconds for
+trixie and 5.501 seconds for bookworm (existing homes, one sample each, 5-second
+health-check cadence; see `startup.json`). Readiness timings in the other JSON
+files measure wait from the test starting, not cold startup.
 
 Trixie provides the current stable Debian package baseline and a smaller image
 in this comparison. Bookworm also works but begins with an older package set.

@@ -1,0 +1,10 @@
+{
+  "trixie": {
+    "start_to_healthy_seconds": 5.322,
+    "method": "existing home, stopped container start to Docker healthy; one sample; 5 second health cadence"
+  },
+  "bookworm": {
+    "start_to_healthy_seconds": 5.501,
+    "method": "existing home, stopped container start to Docker healthy; one sample; 5 second health cadence"
+  }
+}
