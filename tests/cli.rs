@@ -63,6 +63,7 @@ fn listens_on_the_control_socket_and_not_tcp() {
     let line = rx
         .recv_timeout(Duration::from_secs(5))
         .expect("control socket line");
+    #[cfg(target_os = "linux")]
     let listening = std::process::Command::new("sh")
         .arg("-c")
         .arg(format!(
@@ -71,6 +72,25 @@ fn listens_on_the_control_socket_and_not_tcp() {
         ))
         .status()
         .unwrap();
+    #[cfg(target_os = "macos")]
+    let listening = Command::new("/usr/sbin/lsof")
+        .args([
+            "-nP",
+            "-a",
+            "-p",
+            &child.id().to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-Fp",
+        ])
+        .output()
+        .unwrap();
+    #[cfg(target_os = "linux")]
+    let no_tcp = listening.success();
+    #[cfg(target_os = "macos")]
+    let no_tcp = listening.status.code() == Some(1)
+        && listening.stdout.is_empty()
+        && listening.stderr.is_empty();
     let exited = child.try_wait().unwrap();
     let _ = child.kill();
     let _ = child.wait();
@@ -81,7 +101,7 @@ fn listens_on_the_control_socket_and_not_tcp() {
         "daemon exited before socket inspection: {exited:?}"
     );
     assert!(
-        listening.success(),
-        "TCP listener inspection failed (listener found or /proc unavailable)"
+        no_tcp,
+        "TCP listener inspection failed (listener found or inspection unavailable)"
     );
 }

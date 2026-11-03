@@ -50,6 +50,7 @@ fn process_id(value: &serde_json::Value) -> Option<u32> {
 
 /// Best-effort local process hint, never a title or command line. A missing,
 /// inaccessible, foreign-user, or deleted process contributes no executable.
+#[cfg(target_os = "linux")]
 pub(super) fn process_executable(pid: u32) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
     let proc = std::path::PathBuf::from(format!("/proc/{pid}"));
@@ -62,6 +63,39 @@ pub(super) fn process_executable(pid: u32) -> Option<String> {
         return None;
     }
     Some(value.to_string())
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn process_executable(pid: u32) -> Option<String> {
+    let pid = i32::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        )
+    };
+    if result != size
+        || info.pbi_uid != unsafe { libc::geteuid() }
+        || info.pbi_status == libc::SZOMB
+    {
+        return None;
+    }
+    let mut buffer = [0u8; 4096];
+    let length =
+        unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        return None;
+    }
+    let end = buffer.iter().position(|byte| *byte == 0)?;
+    let path = std::str::from_utf8(&buffer[..end]).ok()?;
+    std::path::Path::new(path)
+        .is_absolute()
+        .then(|| path.to_string())
 }
 
 fn sway() -> Option<FocusedApp> {

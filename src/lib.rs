@@ -1,7 +1,7 @@
 //! Local Linux daemon the supervisor starts so a caller can see and drive a desktop.
 //! The session verbs are the stable surface. Version one implements them on Linux.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("hypermesh-visor version one is Linux only");
 
 mod api;
@@ -12,6 +12,7 @@ mod companion_sock;
 mod desktop;
 mod harness;
 mod input;
+mod local_peer;
 mod mcp;
 mod orchestrator;
 mod prompt;
@@ -23,9 +24,11 @@ pub use api::{serve, AppState};
 pub use automation::SHUTDOWN_DEADLINE;
 pub use bind::parse_listen;
 pub use companion_sock::{control_socket_file, read_api_token, runtime_dir};
+#[cfg(target_os = "macos")]
+pub use desktop::MacDesktop;
 pub use desktop::{current_euid, Desktop, FixtureDesktop, LinuxDesktop};
-pub use input::SCROLL_MAX_TICKS;
 pub use hypermesh_session::{refresh_token, MemoryStore, SessionStore};
+pub use input::SCROLL_MAX_TICKS;
 pub use prompt::{open_supervisor_door, DoorConfig, PromptDoor, DEFAULT_CATALOG_ID};
 
 #[cfg(test)]

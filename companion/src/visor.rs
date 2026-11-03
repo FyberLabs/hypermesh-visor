@@ -362,10 +362,13 @@ fn exchange_at(path: &Path, request: &str) -> Option<String> {
 pub fn mcp_status_request() -> Result<serde_json::Value, String> {
     let socket = socket_path().ok_or("Companion socket unavailable")?;
     let request = "GET /mcp/status HTTP/1.1\r\nhost: hypermesh\r\nconnection: close\r\n\r\n";
-    let Exchange::Body(response) = exchange_read_timeout(&socket, request, Duration::from_secs(5)) else {
+    let Exchange::Body(response) = exchange_read_timeout(&socket, request, Duration::from_secs(5))
+    else {
         return Err("Cannot read MCP status from visor".into());
     };
-    if !status_ok(&response) { return Err("Visor rejected status request".into()); }
+    if !status_ok(&response) {
+        return Err("Visor rejected status request".into());
+    }
     serde_json::from_str(body_of(&response).ok_or("Invalid status response")?)
         .map_err(|_| "Invalid status response".into())
 }
@@ -373,22 +376,39 @@ pub fn mcp_status_request() -> Result<serde_json::Value, String> {
 pub fn mcp_connection_request(session: &str, server: &str, reconnect: bool) -> Result<(), String> {
     let request = connection_request(session, server, reconnect)?;
     let socket = socket_path().ok_or("Companion socket unavailable")?;
-    let Exchange::Body(response) = exchange_read_timeout(&socket, &request, Duration::from_secs(40)) else {
-        return Err("Connection action outcome unknown. Inspect MCP status before retrying.".into());
+    let Exchange::Body(response) =
+        exchange_read_timeout(&socket, &request, Duration::from_secs(40))
+    else {
+        return Err(
+            "Connection action outcome unknown. Inspect MCP status before retrying.".into(),
+        );
     };
     if !status_ok(&response) {
-        return Err("Connection action failed or was rejected. Inspect MCP status before retrying.".into());
+        return Err(
+            "Connection action failed or was rejected. Inspect MCP status before retrying.".into(),
+        );
     }
     Ok(())
 }
 
 fn connection_request(session: &str, server: &str, reconnect: bool) -> Result<String, String> {
-    if session.len() != 36 || !session.bytes().enumerate().all(|(i,b)| {
-        if [8,13,18,23].contains(&i) { b == b'-' } else { b.is_ascii_hexdigit() }
-    }) || server.is_empty() || server.len() > 512 || server.trim() != server {
+    if session.len() != 36
+        || !session.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+        || server.is_empty()
+        || server.len() > 512
+        || server.trim() != server
+    {
         return Err("Invalid MCP connection target".into());
     }
-    let body = serde_json::json!({"server":server,"action":if reconnect {"reconnect"} else {"refresh"}}).to_string();
+    let body =
+        serde_json::json!({"server":server,"action":if reconnect {"reconnect"} else {"refresh"}})
+            .to_string();
     Ok(format!("POST /session/{session}/mcp/refresh HTTP/1.1\r\nhost: hypermesh\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()))
 }
 
@@ -396,7 +416,10 @@ pub fn trust_request(
     path: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
-    if !matches!(path, "/mcp/trust" | "/mcp/discovery" | "/mcp/sources" | "/mcp/profiles" | "/mcp/servers") {
+    if !matches!(
+        path,
+        "/mcp/trust" | "/mcp/discovery" | "/mcp/sources" | "/mcp/profiles" | "/mcp/servers"
+    ) {
         return Err("Invalid trust endpoint".into());
     }
     let method = if body.is_some() { "POST" } else { "GET" };
@@ -410,9 +433,18 @@ pub fn trust_request(
     if !status_ok(&response) {
         let message = body_of(&response)
             .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-            .and_then(|value| value.get("error").and_then(|v| v.as_str()).map(str::to_string))
+            .and_then(|value| {
+                value
+                    .get("error")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
             .unwrap_or_else(|| "Review rejected; review again".into());
-        let message: String = message.chars().take(200).flat_map(char::escape_default).collect();
+        let message: String = message
+            .chars()
+            .take(200)
+            .flat_map(char::escape_default)
+            .collect();
         return Err(format!("MCP review failed: {message}"));
     }
     let body = body_of(&response).ok_or("Invalid visor response")?;
@@ -430,9 +462,7 @@ fn exchange_read_timeout(path: &Path, request: &str, timeout: Duration) -> Excha
         Ok(stream) => stream,
         Err(_) => return Exchange::Failed,
     };
-    if stream
-        .set_read_timeout(Some(timeout))
-        .is_err()
+    if stream.set_read_timeout(Some(timeout)).is_err()
         || stream
             .set_write_timeout(Some(Duration::from_millis(200)))
             .is_err()
@@ -498,22 +528,7 @@ fn note_foreign_peer() {
 }
 
 fn peer_uid(fd: &impl AsRawFd) -> Option<u32> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut libc::ucred as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        None
-    } else {
-        Some(cred.uid)
-    }
+    crate::local_peer::uid(fd).ok()
 }
 
 fn current_uid() -> u32 {
@@ -546,7 +561,7 @@ pub fn runtime_dir_from(
         );
     };
     let socket = dir.join("companion.sock");
-    if socket.as_os_str().len() >= 108 {
+    if socket.as_os_str().len() >= crate::local_peer::SUN_PATH_MAX {
         return Err("companion socket path does not fit in sun_path");
     }
     Ok(dir)
@@ -624,8 +639,12 @@ mod tests {
     fn connection_posts_validate_paths_and_encode_exact_server_ids() {
         let id = "12345678-1234-1234-1234-123456789abc";
         let request = connection_request(id, "quote\"\nserver", true).unwrap();
-        let body: serde_json::Value = serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
-        assert_eq!(body, serde_json::json!({"server":"quote\"\nserver","action":"reconnect"}));
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"server":"quote\"\nserver","action":"reconnect"})
+        );
         assert!(connection_request("../companion", "server", false).is_err());
         assert!(connection_request(id, " server ", false).is_err());
     }

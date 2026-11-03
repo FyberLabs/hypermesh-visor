@@ -31,7 +31,7 @@ pub const CONTROL_SOCKET_NAME: &str = "control.sock";
 pub const API_TOKEN_NAME: &str = "api.token";
 
 /// `sun_path` holds 108 bytes including the trailing NUL.
-const SUN_PATH_MAX: usize = 108;
+const SUN_PATH_MAX: usize = crate::local_peer::SUN_PATH_MAX;
 
 pub fn runtime_dir() -> io::Result<PathBuf> {
     runtime_dir_from(
@@ -173,21 +173,7 @@ pub fn current_uid() -> u32 {
 }
 
 pub fn peer_uid(fd: &impl AsRawFd) -> io::Result<u32> {
-    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-    let rc = unsafe {
-        libc::getsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_PEERCRED,
-            &mut cred as *mut libc::ucred as *mut libc::c_void,
-            &mut len,
-        )
-    };
-    if rc != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(cred.uid)
+    crate::local_peer::uid(fd)
 }
 
 pub fn peer_is_current_user(fd: &impl AsRawFd) -> bool {

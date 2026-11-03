@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "screen_recording": true,
+    "accessibility": true,
+    "input_monitoring": true
+  },
+  "checks": [
+    "foreground-owned-fixture",
+    "unicode-keyboard-roundtrip",
+    "pointer-move-and-click",
+    "native-screen-capture-png"
+  ],
+  "image_dimensions": [
+    1920,
+    1080
+  ],
+  "image_bytes": 2402077,
+  "context": "installed development app launched via LaunchServices; direct helper, not daemon or companion acceptance"
+}

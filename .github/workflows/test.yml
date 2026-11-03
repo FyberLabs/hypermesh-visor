@@ -45,3 +45,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Test shared discovery code on the native filesystem
         run: cargo test --locked --manifest-path ci/mcp-discovery/Cargo.toml
+
+  native-macos-workspace:
+    name: Native macOS workspace
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build native helper
+        run: |
+          mkdir -p target/debug
+          swiftc -parse-as-library -O native/macos/Desktop.swift -o target/debug/hypermesh-native-desktop
+      - name: Native event mapping and unauthenticated bridge refusal
+        run: |
+          target/debug/hypermesh-native-desktop --self-test
+          python3 native/macos/test-bridge-refusal.py target/debug/hypermesh-native-desktop
+      - name: Native workspace tests
+        env:
+          TMPDIR: /tmp
+        run: cargo test --locked --workspace

@@ -1,3 +1,7 @@
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::MacDesktop;
 mod audio;
 mod fixture;
 mod focus;
