@@ -1,0 +1,42 @@
+name: container desktop
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  qualify:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - name: Build pinned private desktop
+        run: docker build -f container/Dockerfile -t visor-container:qualification .
+      - name: Start independent bots
+        env:
+          VISOR_IMAGE: visor-container:qualification
+        run: docker compose -p visor-qualification -f container/compose.yaml up -d
+      - name: Qualify isolation and MCP
+        run: python3 ci/container/qualify.py visor-qualification --image visor-container:qualification --output container-results
+      - name: Qualify real applications
+        run: |
+          set -euo pipefail
+          docker cp ci/container/apps.py visor-qualification-writer-1:/home/bot/qualification/apps.py
+          docker exec visor-qualification-writer-1 python3 /home/bot/qualification/apps.py | tee container-results/apps.txt
+      - name: Collect logs and stop containers
+        if: always()
+        env:
+          VISOR_IMAGE: visor-container:qualification
+        run: |
+          mkdir -p container-results
+          docker compose -p visor-qualification -f container/compose.yaml logs > container-results/containers.log 2>&1
+          docker compose -p visor-qualification -f container/compose.yaml down
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: container-${{ matrix.runner }}
+          path: container-results

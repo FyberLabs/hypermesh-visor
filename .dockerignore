@@ -1,0 +1,9 @@
+.git
+.codex
+.agents
+.aws
+target
+dist
+display-logs
+**/__pycache__
+**/*.pyc
